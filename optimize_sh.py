@@ -53,17 +53,31 @@ def sh_basis(n: torch.Tensor) -> torch.Tensor:
     Y : [H, W, 9]
     """
     nx, ny, nz = n[..., 0], n[..., 1], n[..., 2]
+    # from niessner paper
+    # return torch.stack([
+    #     torch.ones_like(nx),           # l=0  m= 0
+    #     ny,                            # l=1  m=-1
+    #     nz,                            # l=1  m= 0
+    #     nx,                            # l=1  m= 1
+    #     nx * ny,                       # l=2  m=-2
+    #     ny * nz,                       # l=2  m=-1
+    #     (3.0 * nz ** 2 - 1.0) / 2.0,  # l=2  m= 0
+    #     nx * nz,                       # l=2  m= 1
+    #     (nx ** 2 - ny ** 2) / 2.0,    # l=2  m= 2
+    # ], dim=-1)  # [H, W, 9]
+
+    # from dataset gen
     return torch.stack([
-        torch.ones_like(nx),           # l=0  m= 0
-        ny,                            # l=1  m=-1
-        nz,                            # l=1  m= 0
-        nx,                            # l=1  m= 1
-        nx * ny,                       # l=2  m=-2
-        ny * nz,                       # l=2  m=-1
-        (3.0 * nz ** 2 - 1.0) / 2.0,  # l=2  m= 0
-        nx * nz,                       # l=2  m= 1
-        (nx ** 2 - ny ** 2) / 2.0,    # l=2  m= 2
-    ], dim=-1)  # [H, W, 9]
+        0.282095 * torch.ones_like(nx),
+        0.488603 * ny,
+        0.488603 * nz,
+        0.488603 * nx,
+        1.092548 * nx * ny,
+        1.092548 * ny * nz,
+        0.315392 * (3.0 * nz ** 2 - 1.0),
+        1.092548 * nx * nz,
+        0.546274 * (nx ** 2 - ny ** 2),
+    ], dim=-1)
 
 
 def render_shading(Y: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
@@ -95,7 +109,7 @@ def _tv(x: torch.Tensor) -> torch.Tensor:
 
 def load_normals(path: str, target_hw: tuple) -> torch.Tensor:
     """
-    Load a Marigold normal map, decode to unit normals, resize to target_hw.
+    Load normal map, decode to unit normals, resize to target_hw.
 
     Marigold encodes normals as  n_color = (n_world + 1) / 2 ∈ [0, 1]³,
     so we invert:  n = n_color * 2 − 1  and re-normalise.
@@ -113,7 +127,8 @@ def load_normals(path: str, target_hw: tuple) -> torch.Tensor:
     if img is None:
         raise FileNotFoundError(path)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    n = img.astype(np.float32) / 255.0 if img.dtype == np.uint8 else img.astype(np.float32)
+    n = img.astype(np.float32) / \
+        255.0 if img.dtype == np.uint8 else img.astype(np.float32)
 
     H, W = target_hw
     if n.shape[:2] != (H, W):
@@ -162,18 +177,21 @@ def decompose(images_np, normals_path="marigold/normals.png",
 
     # ── Images ───────────────────────────────────────────────────────────────
     imgs = [
-        torch.from_numpy(img.astype("float32") / 255.0).to(device)
+        # torch.from_numpy(img.astype("float32") / 255.0).to(device)
+        torch.from_numpy(img.astype("float32")).to(device)
         for img in images_np
     ]  # each [H, W, 3]
 
     # ── Learnable parameters ─────────────────────────────────────────────────
     # Albedo: initialise as mean of input images (reasonable starting point)
-    albedo_init = sum(imgs) / N
-    log_albedo  = torch.log(albedo_init.clamp(eps)).requires_grad_(True)
+    # albedo_init = sum(imgs) / N
+    albedo_init = (sum(imgs) / N).clamp(0.05, 0.95)
+    log_albedo = torch.log(albedo_init).requires_grad_(True)
 
     # SH coefficients per image: initialise to a gentle ambient (c[0] ≈ 1, rest 0)
-    sh_init  = torch.zeros(N, 9, 3, device=device)
-    sh_init[:, 0, :] = 0.5                         # ambient term
+    sh_init = torch.zeros(N, 9, 3, device=device)
+    # sh_init[:, 0, :] = 0.5                         # ambient term
+    sh_init[:, 0, :] = 1.5
     sh_coeffs = sh_init.clone().requires_grad_(True)
 
     optimizer = torch.optim.Adam([log_albedo, sh_coeffs], lr=lr)
@@ -190,13 +208,14 @@ def decompose(images_np, normals_path="marigold/normals.png",
         loss_data = torch.tensor(0.0, device=device)
         for k in range(N):
             shading_k = render_shading(Y, sh_coeffs[k])   # [H, W, 3]
-            recon_k   = albedo * shading_k
+            recon_k = albedo * shading_k
             loss_data = loss_data + ((recon_k - imgs[k]) ** 2).mean()
 
-        loss_sparse = lambda_sparse  * _tv(to_chw(log_albedo))
-        loss_white  = lambda_white   * ((albedo.mean() - 0.5) ** 2)
+        loss_sparse = lambda_sparse * _tv(to_chw(log_albedo))
+        loss_white = lambda_white * ((albedo.mean() - 0.5) ** 2)
 
         loss = loss_data + loss_sparse + loss_white
+        # loss = loss_data
         loss.backward()
         optimizer.step()
 
@@ -211,7 +230,7 @@ def decompose(images_np, normals_path="marigold/normals.png",
         return t.detach().cpu().numpy()
 
     albedo_out = to_np(torch.exp(log_albedo).clamp(0, 1))
-    shadings   = [
+    shadings = [
         to_np(render_shading(Y, sh_coeffs[k]).clamp(0))
         for k in range(N)
     ]
