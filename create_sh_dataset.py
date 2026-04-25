@@ -23,6 +23,7 @@ def main():
     out_dir = "synthetic_pytorch3d_dataset"
     os.makedirs(out_dir, exist_ok=True)
 
+    # there's no cube primitive in pytorch3d :\
     def make_cube(device="cuda"):
         verts = torch.tensor([[
             [-1, -1, -1],
@@ -78,7 +79,7 @@ def main():
             mesh, albedo = apply_random_albedo(mesh)
 
             # random xy translation so objects don't fully overlap
-            verts = mesh.verts_padded()
+            verts = mesh.verts_padded() # padded: adds zero entries if handling multiple meshes of different V count
             translation = torch.tensor(
                 [[
                     random.uniform(-0.9, 0.9),
@@ -89,7 +90,7 @@ def main():
                 dtype=verts.dtype,
             )
 
-            verts = verts + translation[:, None, :]
+            verts = verts + translation[:, None, :] # verts is (1,V,3)
             mesh = mesh.update_padded(verts)
 
             objects.append(mesh)
@@ -155,10 +156,12 @@ def main():
             y = normals[..., 1]
             z = normals[..., 2]
 
+            # real spherical harmonics: https://en.wikipedia.org/wiki/Table_of_spherical_harmonics
+            # constants could be absorbed for sh decomposition
             return torch.stack([
-                0.282095 * torch.ones_like(x),
-                0.488603 * y,
-                0.488603 * z,
+                0.282095 * torch.ones_like(x), # ~ sqrt(1/4pi)
+                0.488603 * y, # ~ sqrt(3/4pi)
+                0.488603 * z, # ...
                 0.488603 * x,
                 1.092548 * x * y,
                 1.092548 * y * z,
@@ -173,6 +176,7 @@ def main():
             faces = meshes.faces_packed()
             verts = meshes.verts_packed()
 
+            # get corners of every (triangular) face
             v0 = verts[faces[:, 0]]
             v1 = verts[faces[:, 1]]
             v2 = verts[faces[:, 2]]
@@ -182,8 +186,8 @@ def main():
                 dim=1,
             )
 
-            pix_to_face = fragments.pix_to_face
-            mask = pix_to_face >= 0
+            pix_to_face = fragments.pix_to_face # for each px in img get index of the mesh face that was rasterized here
+            mask = pix_to_face >= 0 # index is -1 if no geometry is hit
 
             pixel_normals = torch.zeros(
                 *pix_to_face.shape,
@@ -192,13 +196,15 @@ def main():
                 dtype=verts.dtype,
             )
 
+            # normal map (world space)
             pixel_normals[mask] = face_normals[pix_to_face[mask]]
 
             basis = self.sh_basis(pixel_normals)
-            lighting = torch.einsum("...b,bc->...c", basis, sh_coeffs)
+            # lighting = torch.einsum("...b,bc->...c", basis, sh_coeffs)
+            lighting = basis @ sh_coeffs
             lighting = torch.clamp(lighting, min=0.0)
 
-            albedo = meshes.sample_textures(fragments)
+            albedo = meshes.sample_textures(fragments) # would interpolate albedo color, but here it's flat anyways
             colors = albedo * lighting
             colors[~mask] = 0.0
 
@@ -243,7 +249,6 @@ def main():
             normals[mask] = face_normals[pix_to_face[mask]]
 
             if cameras is not None:
-                # Use only the rotation matrix — no built-in axis flips
                 R = cameras.R  # (1, 3, 3)  world-to-cam rotation
                 normals_flat = normals.reshape(-1, 3)
                 # R in PyTorch3D is row-major: v_cam = v_world @ R
@@ -254,14 +259,13 @@ def main():
                 normals = normals_flat.reshape_as(normals)
                 normals = torch.nn.functional.normalize(normals, dim=-1)
 
-            # Remap [-1, 1] -> [0, 1] for visualization
-            colors = 0.5 * normals + 0.5
+            colors = 0.5 * normals + 0.5 # Remap [-1, 1] -> [0, 1]
             colors[~mask] = 0.0
 
             return hard_rgb_blend(colors, fragments, self.blend_params)
         
         
-    R, T = look_at_view_transform(2.7, 10, 20)
+    R, T = look_at_view_transform(dist=2.7, elev=10, azim=20)
     cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
 
     raster_settings = RasterizationSettings(
