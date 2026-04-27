@@ -236,3 +236,227 @@ def decompose(images_np, normals_path="marigold/normals.png",
     ]
 
     return albedo_out, shadings, history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PyTorch3D renderer variant — same pipeline as create_sh_dataset.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Pt3dSHShader(torch.nn.Module):
+    """
+    Flat-face-normal SH shader, identical to HardSHShader in create_sh_dataset.py.
+    Pass sh_coeffs=[9, 3] as a keyword argument when calling the renderer.
+    """
+
+    def __init__(self, device="cuda", blend_params=None):
+        super().__init__()
+        from pytorch3d.renderer import BlendParams
+        self.blend_params = blend_params or BlendParams(
+            background_color=(0, 0, 0))
+
+    def forward(self, fragments, meshes, **kwargs):
+        from pytorch3d.renderer import hard_rgb_blend
+        coeffs = kwargs["sh_coeffs"]  # [9, 3]
+
+        faces = meshes.faces_packed()
+        verts = meshes.verts_packed()
+        v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+        face_normals = F.normalize(
+            torch.cross(v1 - v0, v2 - v0, dim=1), dim=1
+        )
+
+        pix_to_face = fragments.pix_to_face   # [N, H, W, K]
+        mask = pix_to_face >= 0
+        pixel_normals = torch.zeros(
+            *pix_to_face.shape, 3, device=verts.device, dtype=verts.dtype
+        )
+        pixel_normals[mask] = face_normals[pix_to_face[mask]]
+
+        basis = sh_basis(pixel_normals)                    # [..., 9]
+        lighting = (basis @ coeffs).clamp(min=0.0)        # [..., 3]
+
+        albedo = meshes.sample_textures(fragments)
+        colors = albedo * lighting
+        colors[~mask] = 0.0
+
+        return hard_rgb_blend(colors, fragments, self.blend_params)
+
+
+class Pt3dAlbedoShader(torch.nn.Module):
+    """Renders raw vertex-color albedo without any lighting."""
+
+    def __init__(self, blend_params=None):
+        super().__init__()
+        from pytorch3d.renderer import BlendParams
+        self.blend_params = blend_params or BlendParams(
+            background_color=(0, 0, 0))
+
+    def forward(self, fragments, meshes, **kwargs):
+        from pytorch3d.renderer import hard_rgb_blend
+        albedo = meshes.sample_textures(fragments)
+        return hard_rgb_blend(albedo, fragments, self.blend_params)
+
+
+def decompose_pytorch3d(images_np, mesh, cameras, raster_settings=None,
+                        n_iter=2000, lr=5e-3, lambda_white=0.0,
+                        alternating=False):
+    """
+    Physics-based SH decomposition using the pytorch3d renderer pipeline from
+    create_sh_dataset.py.
+
+    Instead of loading a pre-baked normal map PNG, this function rasterizes the
+    provided mesh once to obtain per-pixel face normals, then optimises vertex
+    albedo and per-image SH coefficients so that
+
+        albedo(p) * relu( Y(n(p)) @ c_k )  ≈  I_k(p)
+
+    where n(p) comes from the mesh geometry (flat face normals, same as the
+    dataset renderer) rather than a Marigold image.
+
+    Parameters
+    ----------
+    images_np       : list of ndarray [H, W, 3] float32 in [0, 1]
+    mesh            : pytorch3d Meshes (geometry only; texture is ignored)
+    cameras         : pytorch3d camera object
+    raster_settings : RasterizationSettings; defaults to image_size=H
+    n_iter          : Adam iterations
+    lr              : learning rate
+    lambda_white    : ‖mean(albedo)−0.5‖² weight
+    alternating     : if True, alternate between optimising albedo (odd steps)
+                      and SH coefficients (even steps) instead of joint updates
+
+    Returns
+    -------
+    albedo_image : ndarray [H, W, 3]  float in [0, 1]
+    shadings     : list of ndarray [H, W, 3]
+    history      : list of scalar losses (every 200 iters)
+    """
+    from pytorch3d.renderer import RasterizationSettings, MeshRasterizer, TexturesVertex
+    from pytorch3d.ops import interpolate_face_attributes
+    from pytorch3d.structures import Meshes
+
+    device = mesh.verts_packed().device
+    N = len(images_np)
+    H, W = images_np[0].shape[:2]
+
+    if raster_settings is None:
+        raster_settings = RasterizationSettings(
+            image_size=H, blur_radius=0.0, faces_per_pixel=1
+        )
+
+    imgs = [torch.from_numpy(img.astype("float32")).to(device)
+            for img in images_np]
+
+    # ── Precompute geometry — rasterize once, normals & SH basis are constant ─
+    V = mesh.verts_packed().shape[0]
+    geom_mesh = Meshes(
+        verts=mesh.verts_list(),
+        faces=mesh.faces_list(),
+        textures=TexturesVertex(
+            verts_features=torch.zeros(1, V, 3, device=device)),
+    )
+    rasterizer = MeshRasterizer(
+        cameras=cameras, raster_settings=raster_settings)
+    fragments = rasterizer(geom_mesh)
+
+    pix_to_face = fragments.pix_to_face        # [1, H, W, 1]
+    bary_coords = fragments.bary_coords       # [1, H, W, 1, 3]
+    mask_hw = (pix_to_face[0, :, :, 0] >= 0).unsqueeze(-1)  # [H, W, 1]
+
+    faces_idx = mesh.faces_packed()            # [F, 3]
+    verts_pos = mesh.verts_packed()            # [V, 3]
+    v0, v1, v2 = verts_pos[faces_idx[:, 0]
+                           ], verts_pos[faces_idx[:, 1]], verts_pos[faces_idx[:, 2]]
+    face_normals = F.normalize(torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)
+
+    safe_idx = pix_to_face[0, :, :, 0].clamp(min=0)      # [H, W]
+    pixel_normals = face_normals[safe_idx] * mask_hw      # [H, W, 3]
+    Y = sh_basis(pixel_normals)                           # [H, W, 9]
+
+    # ── Learnable parameters ─────────────────────────────────────────────────
+    log_verts_rgb = torch.log(
+        torch.full((V, 3), 0.5, device=device)
+    ).requires_grad_(True)
+    # verts_rgb = torch.full((V, 3), 0.5, device=device).requires_grad_(True)
+
+    # sh_init = torch.zeros(N, 9, 3, device=device)
+    # sh_init[:, 0, :] = 1.5
+    sh_higher = torch.zeros(N, 8, 3, device=device).requires_grad_(True)  # bands 1-8 only
+    # sh_coeffs = sh_init.clone().requires_grad_(True)
+
+    if alternating:
+        opt_albedo = torch.optim.Adam([log_verts_rgb], lr=lr)
+        # opt_albedo = torch.optim.Adam([verts_rgb], lr=lr)
+        # opt_sh = torch.optim.Adam([sh_coeffs],     lr=lr)
+        opt_sh = torch.optim.Adam([sh_higher],     lr=lr)
+    else:
+        # optimizer = torch.optim.Adam([verts_rgb, sh_higher], lr=lr)
+        optimizer = torch.optim.Adam([log_verts_rgb, sh_higher], lr=lr)
+        # optimizer = torch.optim.Adam([log_verts_rgb, sh_coeffs], lr=lr)
+
+    def _forward():
+        verts_rgb = torch.exp(log_verts_rgb)
+        # verts_rgb = torch.exp(log_verts_rgb).clamp(0, 1)
+
+        face_verts_rgb = verts_rgb[faces_idx]
+        pixel_albedo = interpolate_face_attributes(
+            pix_to_face, bary_coords, face_verts_rgb
+        )[0, :, :, 0, :] * mask_hw
+        loss_data = torch.tensor(0.0, device=device)
+        
+        band0 = torch.ones(N, 1, 3, device=device)*3          # fixed, no grad
+        sh_full = torch.cat([band0, sh_higher], dim=1)       # [N, 9, 3]
+        for k in range(N):            
+            recon_k = pixel_albedo * (Y @ sh_full[k]).clamp(min=0.0)
+            # recon_k = pixel_albedo * (Y @ sh_full[k])
+            loss_data = loss_data + ((recon_k - imgs[k]) ** 2).mean()
+        # Per-channel anchor: fixes each of the 3 independent scale d.o.f.
+        # A scalar mean would only pin one linear combination of λ_R, λ_G, λ_B.
+        masked_albedo = pixel_albedo[mask_hw.expand_as(pixel_albedo)]  # only mesh pixels
+        loss_white = lambda_white * ((masked_albedo.mean() - 0.5) ** 2)
+        # print(f"loss_white: {loss_white} for lambda_white: {lambda_white} as mean is {verts_rgb.mean(dim=0)}")
+        return loss_data + loss_white, loss_data, loss_white
+
+    history = []
+    for i in range(n_iter):
+        if alternating:
+            # even steps: fix albedo, update SH
+            opt_sh.zero_grad()
+            loss, loss_data, loss_white = _forward()
+            loss.backward()
+            opt_sh.step()
+            # odd steps: fix SH, update albedo
+            opt_albedo.zero_grad()
+            loss, loss_data, loss_white = _forward()
+            loss.backward()
+            opt_albedo.step()
+        else:
+            optimizer.zero_grad()
+            loss, loss_data, loss_white = _forward()
+            loss.backward()
+            optimizer.step()
+
+        if i % 200 == 0:
+            history.append(loss.item())
+            print(f"[{i:4d}] total={loss.item():.5f}  "
+                  f"data={loss_data.item():.5f}  "
+                  f"white={loss_white.item():.5f}")
+
+    # ── Outputs ───────────────────────────────────────────────────────────────
+    verts_rgb_final = torch.exp(log_verts_rgb).clamp(0, 1).detach()
+    # verts_rgb_final = verts_rgb.clamp(0, 1).detach()
+    pixel_albedo_out = interpolate_face_attributes(
+        pix_to_face, bary_coords, verts_rgb_final[faces_idx]
+    )[0, :, :, 0, :] * mask_hw
+    albedo_out = pixel_albedo_out.cpu().numpy()
+    
+    band0 = torch.ones(N, 1, 3, device=device) *3          # fixed, no grad
+    sh_full = torch.cat([band0, sh_higher], dim=1)       # [N, 9, 3]
+
+    shadings = [
+        (F.relu(Y @ sh_full[k].detach()) * mask_hw).cpu().numpy()
+        # (F.relu(Y @ sh_coeffs[k].detach()) * mask_hw).cpu().numpy()
+        for k in range(N)
+    ]
+
+    return albedo_out, shadings, history
