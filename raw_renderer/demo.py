@@ -14,6 +14,7 @@ Output (all 512×512 unless noted) in renders/:
     ct_envmap.png     — Cook-Torrance + env map IBL  (256×256)
 """
 
+import matplotlib.pyplot as plt
 import os
 
 import numpy as np
@@ -33,7 +34,7 @@ from raw_renderer import (
 
 mesh = generate_mesh("sphere")
 cam = Camera(
-    position=np.array([1.5, 1.5, 3.0], dtype=np.float32),
+    position=np.array([0.0, 0.0, 3.0], dtype=np.float32),
     target=np.array([0.0, 0.0, 0.0], dtype=np.float32),
 )
 
@@ -41,17 +42,26 @@ cam = Camera(
 # Lights
 # ---------------------------------------------------------------------------
 pt_light = PointLight(
-    position=np.array([3.0, 5.0, 3.0], dtype=np.float32),
+    position=np.array([3.0, 0.0, 3.0], dtype=np.float32),
     color=np.array([1.0, 0.95, 0.9], dtype=np.float32),
 )
 
-sh_light = SHLighting.directional(
-    direction=np.array([0.5, 1.0, 0.3], dtype=np.float32),
+# sh_light = SHLighting.directional(
+#     direction=np.array([0.5, 1.0, 0.3], dtype=np.float32),
+#     color=np.array([1.0, 0.9, 0.8], dtype=np.float32),
+#     intensity=2.0,
+# )
+
+sh_light = SHLighting.point_like(
+    elevation_deg=0, azimuth_deg=90,
     color=np.array([1.0, 0.9, 0.8], dtype=np.float32),
     intensity=2.0,
 )
 
-env_map = EnvMap.sky_ground(sky=(0.4, 0.6, 1.0), ground=(0.2, 0.15, 0.1))
+# env_map = EnvMap.sky_ground(sky=(0.4, 0.6, 1.0), ground=(0.2, 0.15, 0.1))
+env_map = EnvMap.from_sh(sh_light)
+plt.imshow(env_map.image)
+plt.show()
 
 out = "render/"
 os.makedirs(out, exist_ok=True)
@@ -62,16 +72,20 @@ os.makedirs(out, exist_ok=True)
 phong_mat = PhongMaterial(
     base_color=np.array([0.5, 0.6, 0.9], dtype=np.float32),
     shininess=64.0,
+    # shininess=256.0,
+    # shininess=1.0,
+    # ka=1, kd=1,  ks=1
 )
 
-render(mesh, cam,
-       lambda p, n, c: phong_shader(p, n, c, phong_mat, pt_light),
-       #    smooth=True,
-       output_path=out + "phong_point.png")
+# render(mesh, cam,
+#        lambda p, n, c: phong_shader(p, n, c, phong_mat, pt_light),
+#        smooth=True,
+#        output_path=out + "phong_point.png")
 
-render(mesh, cam,
-       lambda p, n, c: phong_shader(p, n, c, phong_mat, sh_light),
-       output_path=out + "phong_sh.png")
+# render(mesh, cam,
+#        lambda p, n, c: phong_shader(p, n, c, phong_mat, sh_light),
+#        smooth=True,
+#        output_path=out + "phong_sh.png")
 
 render(mesh, cam,
        lambda p, n, c: phong_shader(p, n, c, phong_mat, env_map),
@@ -87,16 +101,15 @@ pbr_mat = PBRMaterial(
     metallic=0.0,
 )
 
-render(mesh, cam,
-       lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, pt_light),
-       output_path=out + "ct_point.png")
+# render(mesh, cam,
+#        lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, pt_light),
+#        output_path=out + "ct_point.png")
 
-render(mesh, cam,
-       lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, sh_light),
-       output_path=out + "ct_sh.png")
+# render(mesh, cam,
+#        lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, sh_light),
+#        output_path=out + "ct_sh.png")
 
-render(mesh, cam,
-       lambda p, n, c: cook_torrance_shader(
-           p, n, c, pbr_mat, env_map, n_env_samples=16),
-       width=256, height=256,
-       output_path=out + "ct_envmap.png")
+# render(mesh, cam,
+#        lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, env_map),
+#        width=256, height=256,
+#        output_path=out + "ct_envmap.png")

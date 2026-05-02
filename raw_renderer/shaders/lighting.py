@@ -5,6 +5,18 @@ PointLight  — a single point emitter in world space
 EnvMap      — equirectangular (lat-long) image-based lighting
 SHLighting  — order-2 spherical-harmonics irradiance (9 coeffs, RGB)
               Based on Ramamoorthi & Hanrahan 2001.
+
+Unified interface
+-----------------
+Every light type exposes:
+
+    samples(frag_pos) -> (dirs, radiance, weights) | None
+
+  dirs:     (N, 3) unit vectors pointing FROM surface TO light
+  radiance: (N, 3) incoming radiance per sample
+  weights:  (N,)   integration weights (solid angle dω or 1.0)
+
+SHLighting returns None — shaders fall back to light.irradiance(normal).
 """
 
 import numpy as np
@@ -18,8 +30,15 @@ from PIL import Image
 
 @dataclass
 class PointLight:
-    position: np.ndarray = field(default_factory=lambda: np.array([2, 4, 2], dtype=np.float32))
-    color:    np.ndarray = field(default_factory=lambda: np.array([1, 1, 1], dtype=np.float32))
+    position: np.ndarray = field(
+        default_factory=lambda: np.array([2, 4, 2], dtype=np.float32))
+    color:    np.ndarray = field(
+        default_factory=lambda: np.array([1, 1, 1], dtype=np.float32))
+
+    def samples(self, frag_pos: np.ndarray):
+        L = self.position - frag_pos
+        L = (L / (np.linalg.norm(L) + 1e-8)).astype(np.float32)
+        return (L[None], self.color[None].copy(), np.ones(1, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -38,18 +57,88 @@ class EnvMap:
         """image: (H, W, 3) float32, linear-light values in [0, ∞)."""
         self.image = image.astype(np.float32)
         self.H, self.W = self.image.shape[:2]
+        self._precompute()
+
+    def _precompute(self) -> None:
+        """
+        Build a flat list of directions and solid-angle weights for every pixel,
+        used by diffuse_irradiance and cook_torrance_shader for Riemann sums.
+
+        Equirectangular mapping (pixel centres):
+            theta[i] = π * (i + 0.5) / H        — polar angle  [0, π]
+            phi[j]   = 2π * (j + 0.5) / W - π   — azimuth      [-π, π]
+            dω       = sin(theta) * dtheta * dphi
+        """
+        theta = np.pi * (np.arange(self.H) + 0.5) / self.H   # (H,)
+        phi = 2*np.pi * (np.arange(self.W) + 0.5) / self.W - np.pi  # (W,)
+
+        sin_t = np.sin(theta)[:, None]   # (H, 1)
+        cos_t = np.cos(theta)[:, None]   # (H, 1)
+        cos_p = np.cos(phi)[None, :]     # (1, W)
+        sin_p = np.sin(phi)[None, :]     # (1, W)
+
+        dirs_x = sin_t * cos_p                                    # (H, W)
+        dirs_y = np.broadcast_to(cos_t, (self.H, self.W)).copy()  # (H, W)
+        dirs_z = sin_t * sin_p                                    # (H, W)
+
+        # (P, 3) and (P,) — P = H*W
+        self._dirs = np.stack([dirs_x, dirs_y, dirs_z],
+                              axis=-1).reshape(-1, 3).astype(np.float32)
+        self._solid_angles = (sin_t * (np.pi / self.H) * (2*np.pi / self.W)
+                              * np.ones((1, self.W))).reshape(-1).astype(np.float32)
+        self._image_flat = self.image.reshape(-1, 3)
 
     @classmethod
     def from_file(cls, path: str) -> "EnvMap":
         """Load an LDR image and normalise to [0, 1]."""
-        img = np.array(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+        img = np.array(Image.open(path).convert(
+            "RGB"), dtype=np.float32) / 255.0
         return cls(img)
 
     @classmethod
     def constant(cls, color: tuple = (0.5, 0.5, 0.5), resolution: int = 128) -> "EnvMap":
         """Uniform-colour env map — useful as a placeholder."""
-        img = np.full((resolution // 2, resolution, 3), color, dtype=np.float32)
+        img = np.full((resolution // 2, resolution, 3),
+                      color, dtype=np.float32)
         return cls(img)
+
+    @classmethod
+    def from_sh(cls, sh: "SHLighting", resolution: int = 64) -> "EnvMap":
+        """
+        Bake an SHLighting's irradiance field into an equirectangular image.
+
+        Each pixel stores sh.irradiance(d) for the pixel's direction d,
+        giving a smooth (band-limited) representation of the lighting.
+        Useful for visualising SH coefficients and for compositing SH with
+        env-map-based workflows.
+        """
+        H, W = resolution // 2, resolution
+        theta = np.pi * (np.arange(H, dtype=np.float32) + 0.5) / H   # (H,)
+        phi = 2*np.pi * (np.arange(W, dtype=np.float32) +
+                         0.5) / W - np.pi  # (W,)
+
+        sin_t = np.sin(theta)[:, None]   # (H, 1)
+        x3 = (sin_t * np.cos(phi)[None, :])[...,
+                                            # (H, W, 1)
+                                            None]
+        y3 = np.broadcast_to(np.cos(theta)[:, None, None], (H, W, 1)).copy()
+        z3 = (sin_t * np.sin(phi)[None, :])[...,
+                                            # (H, W, 1)
+                                            None]
+
+        L = sh.coeffs   # (9, 3)
+        c1, c2, c3, c4, c5 = sh._C1, sh._C2, sh._C3, sh._C4, sh._C5
+
+        irr = (
+            c4 * L[0]
+            + 2*c2 * (L[1]*y3 + L[2]*z3 + L[3]*x3)
+            + 2*c1 * (L[4]*x3*y3 + L[5]*y3*z3 + L[7]*x3*z3)
+            + c3 * L[6] * z3**2
+            - c5 * L[6]
+            + c1 * L[8] * (x3**2 - y3**2)
+        )   # (H, W, 3)
+
+        return cls(np.maximum(irr, 0.0).astype(np.float32))
 
     @classmethod
     def sky_ground(
@@ -66,9 +155,10 @@ class EnvMap:
         H, W = resolution // 2, resolution
         # v ∈ [0,1] maps theta ∈ [0, π]: 0 = straight up, 1 = straight down
         v = np.linspace(0.0, 1.0, H, dtype=np.float32)[:, None, None]
-        sky_arr    = np.array(sky,    dtype=np.float32)
+        sky_arr = np.array(sky,    dtype=np.float32)
         ground_arr = np.array(ground, dtype=np.float32)
-        img = (1.0 - v) * sky_arr + v * ground_arr   # (H, 1, 3) broadcast to (H, W, 3)
+        # (H, 1, 3) broadcast to (H, W, 3)
+        img = (1.0 - v) * sky_arr + v * ground_arr
         img = np.broadcast_to(img, (H, W, 3)).copy()
         return cls(img)
 
@@ -79,7 +169,7 @@ class EnvMap:
         Equirectangular: phi ∈ [-π, π], theta ∈ [0, π].
         """
         x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
-        phi   = np.arctan2(x, z)                             # [-π, π]
+        phi = np.arctan2(x, z)                             # [-π, π]
         theta = np.arccos(np.clip(y, -1.0, 1.0))            # [0, π]
         u = (phi / (2 * np.pi) + 0.5).clip(0, 1)
         v = (theta / np.pi).clip(0, 1)
@@ -87,28 +177,21 @@ class EnvMap:
         py = (v * (self.H - 1)).astype(int)
         return self.image[py, px]
 
-    def diffuse_irradiance(self, normal: np.ndarray, n_samples: int = 128) -> np.ndarray:
-        """
-        Cosine-weighted hemisphere Monte Carlo integral of incoming radiance
-        (the Lambertian irradiance) at surface normal `normal`.
-        Returns RGB in [0, ∞).
-        """
-        n = normal / (np.linalg.norm(normal) + 1e-8)
-        up = np.array([0, 1, 0], dtype=np.float32)
-        if abs(float(np.dot(n, up))) > 0.99:
-            up = np.array([1, 0, 0], dtype=np.float32)
-        t = np.cross(up, n); t /= np.linalg.norm(t)
-        b = np.cross(n, t)
+    def samples(self, _frag_pos: np.ndarray):
+        return (self._dirs, self._image_flat, self._solid_angles)
 
-        rng = np.random.default_rng(0)
-        # Cosine-weighted sampling: pdf = cos_theta / π
-        cos_t = np.sqrt(rng.random(n_samples)).astype(np.float32)
-        phi   = rng.uniform(0, 2 * np.pi, n_samples).astype(np.float32)
-        sin_t = np.sqrt(1 - cos_t ** 2)
-        lx, ly, lz = sin_t * np.cos(phi), cos_t, sin_t * np.sin(phi)
-        dirs = lx[:, None] * t + ly[:, None] * n + lz[:, None] * b  # (N, 3)
-        # E[f/pdf] = E[π * radiance] — cosine and pdf cancel
-        return np.pi * self.sample(dirs).mean(axis=0)
+    def diffuse_irradiance(self, normal: np.ndarray) -> np.ndarray:
+        """
+        Lambertian irradiance E(N) = ∫ L(ω)·max(N·ω, 0) dω
+
+        Computed as a deterministic Riemann sum over all env-map pixels:
+            E ≈ Σ_k  L_k · max(N·d_k, 0) · dω_k
+        where dω_k = sin(θ_k) · dθ · dφ is the solid angle of pixel k.
+        No noise, no sample count to tune.
+        """
+        cos_theta = self._dirs @ normal                            # (P,)
+        weights = np.maximum(cos_theta, 0.0) * self._solid_angles  # (P,)
+        return (self._image_flat * weights[:, None]).sum(axis=0)   # (3,)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +219,8 @@ class SHLighting:
     def __init__(self, coeffs: np.ndarray):
         """coeffs: (9, 3) float32 — one SH coefficient vector per RGB channel."""
         if coeffs.shape != (9, 3):
-            raise ValueError(f"Expected (9, 3) coefficients, got {coeffs.shape}")
+            raise ValueError(
+                f"Expected (9, 3) coefficients, got {coeffs.shape}")
         self.coeffs = coeffs.astype(np.float32)
 
     # --- Constructors -------------------------------------------------------
@@ -145,14 +229,14 @@ class SHLighting:
     def from_env_map(cls, env: EnvMap, n_samples: int = 50_000) -> "SHLighting":
         """Monte Carlo projection of an env map onto the order-2 SH basis."""
         rng = np.random.default_rng(42)
-        phi   = rng.uniform(0, 2 * np.pi, n_samples).astype(np.float32)
+        phi = rng.uniform(0, 2 * np.pi, n_samples).astype(np.float32)
         cos_t = rng.uniform(-1, 1, n_samples).astype(np.float32)
         sin_t = np.sqrt(1 - cos_t ** 2)
         x = sin_t * np.cos(phi)
         y = cos_t
         z = sin_t * np.sin(phi)
         dirs = np.stack([x, y, z], axis=1)       # (N, 3)
-        L    = env.sample(dirs)                   # (N, 3)
+        L = env.sample(dirs)                   # (N, 3)
 
         # Real SH basis evaluated at each sample direction
         Y = np.stack([
@@ -168,7 +252,8 @@ class SHLighting:
         ], axis=1)  # (N, 9)
 
         # L_lm ≈ (4π/N) Σ_i L(d_i) * Y_lm(d_i)
-        coeffs = (4 * np.pi / n_samples) * np.einsum("ni,nj->ij", Y, L)  # (9, 3)
+        coeffs = (4 * np.pi / n_samples) * \
+            np.einsum("ni,nj->ij", Y, L)  # (9, 3)
         return cls(coeffs)
 
     @classmethod
@@ -216,14 +301,43 @@ class SHLighting:
         coeffs = Y_at_d[:, None] * c[None, :]  # (9, 3)
         return cls(coeffs)
 
+    @classmethod
+    def point_like(
+        cls,
+        azimuth_deg:   float,
+        elevation_deg: float,
+        color:         np.ndarray = None,   # type: ignore[assignment]
+        intensity:     float = 2.0,
+    ) -> "SHLighting":
+        """
+        Convenience constructor: specify the light direction by two angles in degrees.
+
+        azimuth_deg:   rotation around Y axis (0° = +Z, 90° = +X, 180° = −Z, …)
+        elevation_deg: angle above the XZ plane (0° = horizon, 90° = straight up)
+
+        Produces the same result as directional() but avoids computing the
+        direction vector by hand.
+        """
+        if color is None:
+            color = np.ones(3, dtype=np.float32)
+        az = np.radians(float(azimuth_deg))
+        el = np.radians(float(elevation_deg))
+        direction = np.array([
+            np.cos(el) * np.sin(az),
+            np.sin(el),
+            np.cos(el) * np.cos(az),
+        ], dtype=np.float32)
+        return cls.directional(direction, color, intensity)
+
+    def samples(self, _frag_pos: np.ndarray):
+        return None
+
     # --- Evaluation ---------------------------------------------------------
 
     def irradiance(self, normal: np.ndarray) -> np.ndarray:
         """
         Analytically evaluate Lambertian irradiance at unit surface `normal`.
-        Returns RGB in [0, ∞).
-
-        Formula: Ramamoorthi & Hanrahan 2001, Eq. 12.
+        Returns RGB in [0, ∞).        
         """
         L = self.coeffs
         x, y, z = float(normal[0]), float(normal[1]), float(normal[2])
@@ -231,7 +345,7 @@ class SHLighting:
 
         irr = (
             c4 * L[0]
-            + 2 * c2 * (L[1] * y  + L[2] * z  + L[3] * x)
+            + 2 * c2 * (L[1] * y + L[2] * z + L[3] * x)
             + 2 * c1 * (L[4] * x*y + L[5] * y*z + L[7] * x*z)
             + c3 * L[6] * z ** 2
             - c5 * L[6]

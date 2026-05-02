@@ -1,10 +1,9 @@
 """
 Phong illumination model.
 
-Supports three light source types:
-  PointLight  — classic per-fragment diffuse + specular
-  EnvMap      — diffuse from hemisphere MC integral, specular from reflection ray
-  SHLighting  — diffuse from SH irradiance (no high-freq specular)
+Supports all light source types via the unified samples() interface:
+  PointLight / EnvMap  — per-sample integration over (dirs, radiance, weights)
+  SHLighting           — analytical irradiance; specular omitted (too low-freq)
 """
 
 import numpy as np
@@ -37,36 +36,61 @@ def phong_shader(
     """
     Compute RGB colour in [0, 1] using the Phong model.
 
-    I = ambient + diffuse + specular
+    For sampled lights (PointLight, EnvMap):
+        diffuse  = kd * Σ (N·L) * radiance * base_color/π * dω
+        specular = ks * Σ (R·V)^shininess * radiance * dω
+        ambient  = ka * mean(radiance) * base_color
 
-    ambient  = ka * light_color * base_color
-    diffuse  = kd * max(N·L, 0) * light_color * base_color
-    specular = ks * max(R·V, 0)^shininess * light_color
+    For SHLighting (samples() returns None):
+        diffuse  = kd * irradiance(N) * base_color/π
+        specular = 0  (SH too low-frequency for glossy highlights)
     """
     N = normal / (np.linalg.norm(normal) + 1e-8)
-    V = cam_pos - frag_pos;  V /= np.linalg.norm(V) + 1e-8
+    # view direction from cam to fragment in world space
+    V = cam_pos - frag_pos
+    V /= np.linalg.norm(V) + 1e-8
 
-    if isinstance(light, PointLight):
-        L = light.position - frag_pos;  L /= np.linalg.norm(L) + 1e-8
-        R = 2 * np.dot(N, L) * N - L
+    samps = light.samples(frag_pos)
+    if samps is not None:
+        dirs, rad, dw = samps
+        # hemisphere above face normal
+        valid = (dirs @ N) > 1e-4
+        dirs_v = dirs[valid]                       # (V, 3)
+        rad_v = rad[valid]                        # (V, 3)
+        dw_v = dw[valid]                         # (V,)
+        NdL_v = dirs_v @ N                        # (V,)
 
-        ambient  = mat.ka * light.color * mat.base_color
-        diffuse  = mat.kd * max(float(np.dot(N, L)), 0.0) * light.color * mat.base_color
-        specular = mat.ks * max(float(np.dot(R, V)), 0.0) ** mat.shininess * light.color
+        if len(dirs_v) == 0:
+            return np.zeros(3, dtype=np.float32)
 
-    elif isinstance(light, EnvMap):
-        irr     = light.diffuse_irradiance(N)
-        R_dir   = 2 * np.dot(N, V) * N - V           # perfect mirror reflection of V
-        spec_c  = light.sample(R_dir[None, :])[0]     # look up env at reflection direction
+        diffuse = mat.kd * (rad_v * (NdL_v * dw_v)
+                            [:, None]).sum(0) * mat.base_color / np.pi
 
-        ambient  = np.zeros(3, dtype=np.float32)
-        diffuse  = mat.kd * irr * mat.base_color / np.pi
-        specular = mat.ks * spec_c
+        # reflection direction for specular
+        R_v = 2 * NdL_v[:, None] * N[None] - \
+            dirs_v   # (V, 3) reflection directions
+        RdV = np.clip(R_v @ V, 0.0, 1.0)               # (V,)
+        specular = mat.ks * ((RdV ** mat.shininess)
+                             [:, None] * rad_v * dw_v[:, None]).sum(0)
 
-    else:  # SHLighting — analytical diffuse, no high-frequency specular
+        ambient = mat.ka * rad.mean(0) * mat.base_color
+    else:
+        # type: ignore[union-attr]  — only SHLighting returns None from samples()
         irr = light.irradiance(N)
-        ambient  = np.zeros(3, dtype=np.float32)
-        diffuse  = mat.kd * irr * mat.base_color / np.pi
-        specular = np.zeros(3, dtype=np.float32)
+        diffuse = mat.kd * irr * mat.base_color / np.pi
+        # specular = np.zeros(3, dtype=np.float32)
+        NdV = np.dot(N, V)
+
+        if NdV <= 0.0:
+            specular = np.zeros(3, dtype=np.float32)
+        else:
+            R = 2 * NdV * N - V
+            R /= np.linalg.norm(R) + 1e-8
+            RdV = np.clip(R @ V, 0.0, 1.0)
+
+            L_R = np.maximum(light.irradiance(R), 0.0)
+            specular = mat.ks * (RdV ** mat.shininess) * L_R
+
+        ambient = np.zeros(3, dtype=np.float32)
 
     return np.clip(ambient + diffuse + specular, 0.0, 1.0)

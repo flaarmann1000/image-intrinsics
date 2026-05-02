@@ -1,6 +1,4 @@
 """
-Software rasterizer.
-
 render() projects a Mesh through a Camera and calls a user-supplied
 shader_fn for every visible fragment. The shader is a plain callable:
 
@@ -41,10 +39,11 @@ def _project_vertices(
     Return (V, 3) array of screen-space positions.
     Channel 0/1 = pixel x/y (origin top-left), channel 2 = NDC depth in [-1,1].
     """
-    homo = np.hstack([mesh.vertices, np.ones((len(mesh.vertices), 1), dtype=np.float32)])
+    homo = np.hstack([mesh.vertices, np.ones(
+        (len(mesh.vertices), 1), dtype=np.float32)])
     clip = homo @ (proj @ view).T            # (V, 4)
-    w    = clip[:, 3:4]
-    ndc  = clip[:, :3] / w                  # (V, 3)
+    w = clip[:, 3:4]
+    ndc = clip[:, :3] / w                  # (V, 3)
     screen = np.empty_like(ndc)
     screen[:, 0] = (ndc[:, 0] + 1) * 0.5 * W   # x: left→right
     screen[:, 1] = (1 - ndc[:, 1]) * 0.5 * H   # y: top→bottom (flip Y)
@@ -62,11 +61,14 @@ def _barycentric(s0, s1, s2, px, py):
     with respect to triangle (s0, s1, s2) in screen space.
     Returns (None, None, None) for degenerate triangles.
     """
-    denom = (s1[1] - s2[1]) * (s0[0] - s2[0]) + (s2[0] - s1[0]) * (s0[1] - s2[1])
+    denom = (s1[1] - s2[1]) * (s0[0] - s2[0]) + \
+        (s2[0] - s1[0]) * (s0[1] - s2[1])
     if abs(denom) < 1e-6:
         return None, None, None
-    w0 = ((s1[1] - s2[1]) * (px - s2[0]) + (s2[0] - s1[0]) * (py - s2[1])) / denom
-    w1 = ((s2[1] - s0[1]) * (px - s2[0]) + (s0[0] - s2[0]) * (py - s2[1])) / denom
+    w0 = ((s1[1] - s2[1]) * (px - s2[0]) +
+          (s2[0] - s1[0]) * (py - s2[1])) / denom
+    w1 = ((s2[1] - s0[1]) * (px - s2[0]) +
+          (s0[0] - s2[0]) * (py - s2[1])) / denom
     w2 = 1 - w0 - w1
     return w0, w1, w2
 
@@ -92,11 +94,11 @@ def render(
     smooth=True   — Phong interpolation: vertex normals blended barycentrically
                     (smooth silhouette, good for curved surfaces like spheres)
     """
-    view   = look_at(camera.position, camera.target, camera.up)
-    proj   = perspective(camera.fov_deg, width / height)
+    view = look_at(camera.position, camera.target, camera.up)
+    proj = perspective(camera.fov_deg, width / height)
     sverts = _project_vertices(mesh, view, proj, width, height)
 
-    fb   = np.zeros((height, width, 3), dtype=np.float32)
+    fb = np.zeros((height, width, 3), dtype=np.float32)
     zbuf = np.full((height, width), np.inf, dtype=np.float32)
 
     for fi, face in enumerate(mesh.faces):
@@ -105,49 +107,59 @@ def render(
 
         # Screen-space bounding box (clamped to image)
         x_min = max(0,         int(np.floor(min(s0[0], s1[0], s2[0]))))
-        x_max = min(width - 1, int(np.ceil( max(s0[0], s1[0], s2[0]))))
+        x_max = min(width - 1, int(np.ceil(max(s0[0], s1[0], s2[0]))))
         y_min = max(0,         int(np.floor(min(s0[1], s1[1], s2[1]))))
-        y_max = min(height- 1, int(np.ceil( max(s0[1], s1[1], s2[1]))))
+        y_max = min(height - 1, int(np.ceil(max(s0[1], s1[1], s2[1]))))
 
         if x_max < x_min or y_max < y_min:
             continue
 
         # Pixel grid (sample at pixel centres)
+        # px.shape = px.shape = (ny, nx)
         px, py = np.meshgrid(
             np.arange(x_min, x_max + 1, dtype=np.float32) + 0.5,
             np.arange(y_min, y_max + 1, dtype=np.float32) + 0.5,
         )
 
+        # w0.shape = ... = w2.shape = (ny,nx)
+        # barycentric → each px,py expressed as P = λ₁s0 + λ₂s1 + λ₃s2
         w0, w1, w2 = _barycentric(s0, s1, s2, px, py)
         if w0 is None:
             continue
         assert w0 is not None and w1 is not None and w2 is not None
 
+        # position along meshgrid inside triangle?
         inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
-        z      = w0 * s0[2] + w1 * s1[2] + w2 * s2[2]
+        # z.shape = (ny,nx)
+        z = w0 * s0[2] + w1 * s1[2] + w2 * s2[2]
 
-        tile_z  = zbuf[y_min:y_max+1, x_min:x_max+1]
+        tile_z = zbuf[y_min:y_max+1, x_min:x_max+1]
+        # overlayed by something else along z?
         visible = inside & (z < tile_z)
 
+        # world space
         p0, p1, p2 = mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2]
         flat_normal = mesh.normals[fi]
+        # Average surrounding face normals at each vertex
         vn0 = mesh.vertex_normals[i0]
         vn1 = mesh.vertex_normals[i1]
         vn2 = mesh.vertex_normals[i2]
 
+        # get indices of visible positions within mesh grid
         ys, xs = np.where(visible)
         for k in range(len(ys)):
-            row, col      = ys[k] + y_min, xs[k] + x_min
-            bw0, bw1, bw2 = w0[ys[k], xs[k]], w1[ys[k], xs[k]], w2[ys[k], xs[k]]
-            frag_pos      = bw0 * p0 + bw1 * p1 + bw2 * p2
+            row, col = ys[k] + y_min, xs[k] + x_min
+            bw0, bw1, bw2 = w0[ys[k], xs[k]
+                               ], w1[ys[k], xs[k]], w2[ys[k], xs[k]]
+            frag_pos = bw0 * p0 + bw1 * p1 + bw2 * p2  # world space
 
             if smooth:
-                raw_n  = bw0 * vn0 + bw1 * vn1 + bw2 * vn2
+                raw_n = bw0 * vn0 + bw1 * vn1 + bw2 * vn2
                 normal = raw_n / (np.linalg.norm(raw_n) + 1e-8)
             else:
                 normal = flat_normal
 
-            fb[row, col]   = shader_fn(frag_pos, normal, camera.position)
+            fb[row, col] = shader_fn(frag_pos, normal, camera.position)
             zbuf[row, col] = z[ys[k], xs[k]]
 
     img_u8 = (fb * 255).clip(0, 255).astype(np.uint8)
