@@ -105,40 +105,70 @@ class EnvMap:
     @classmethod
     def from_sh(cls, sh: "SHLighting", resolution: int = 64) -> "EnvMap":
         """
-        Bake an SHLighting's irradiance field into an equirectangular image.
+        Bake an SHLighting into an equirectangular env map.
 
-        Each pixel stores sh.irradiance(d) for the pixel's direction d,
-        giving a smooth (band-limited) representation of the lighting.
-        Useful for visualising SH coefficients and for compositing SH with
-        env-map-based workflows.
+        Uses the raw SH reconstruction Σ L_lm · Y_lm(d) — no cosine-lobe
+        convolution — so point_like() produces the smallest spot that
+        order-2 SH can represent.
         """
         H, W = resolution // 2, resolution
-        theta = np.pi * (np.arange(H, dtype=np.float32) + 0.5) / H   # (H,)
-        phi = 2*np.pi * (np.arange(W, dtype=np.float32) +
-                         0.5) / W - np.pi  # (W,)
+        theta = np.pi * (np.arange(H, dtype=np.float32) + 0.5) / H
+        phi = 2*np.pi * (np.arange(W, dtype=np.float32) + 0.5) / W - np.pi
 
-        sin_t = np.sin(theta)[:, None]   # (H, 1)
+        sin_t = np.sin(theta)[:, None]
         x3 = (sin_t * np.cos(phi)[None, :])[...,
                                             # (H, W, 1)
                                             None]
-        y3 = np.broadcast_to(np.cos(theta)[:, None, None], (H, W, 1)).copy()
+        y3 = np.broadcast_to(
+            np.cos(theta)[:, None, None], (H, W, 1)).copy()  # (H, W, 1)
         z3 = (sin_t * np.sin(phi)[None, :])[...,
                                             # (H, W, 1)
                                             None]
 
         L = sh.coeffs   # (9, 3)
-        c1, c2, c3, c4, c5 = sh._C1, sh._C2, sh._C3, sh._C4, sh._C5
-
-        irr = (
-            c4 * L[0]
-            + 2*c2 * (L[1]*y3 + L[2]*z3 + L[3]*x3)
-            + 2*c1 * (L[4]*x3*y3 + L[5]*y3*z3 + L[7]*x3*z3)
-            + c3 * L[6] * z3**2
-            - c5 * L[6]
-            + c1 * L[8] * (x3**2 - y3**2)
+        raw = (
+            L[0] * 0.282095
+            + L[1] * (0.488603 * y3)
+            + L[2] * (0.488603 * z3)
+            + L[3] * (0.488603 * x3)
+            + L[4] * (1.092548 * x3 * y3)
+            + L[5] * (1.092548 * y3 * z3)
+            + L[6] * (0.315392 * (3*z3**2 - 1))
+            + L[7] * (1.092548 * x3 * z3)
+            + L[8] * (0.546274 * (x3**2 - y3**2))
         )   # (H, W, 3)
 
-        return cls(np.maximum(irr, 0.0).astype(np.float32))
+        return cls(np.maximum(raw, 0.0).astype(np.float32))
+
+    @classmethod
+    def point_like(
+        cls,
+        direction: np.ndarray,
+        color: tuple = (1.0, 1.0, 1.0),
+        resolution: int = 64,
+    ) -> "EnvMap":
+        """
+        Env map with a single pixel lit at `direction` — a perfectly sharp
+        directional light with no SH bandlimiting.
+
+        The inverse of _precompute's mapping:
+            y = cos(θ)  →  θ = arccos(y)
+            x = sin(θ)·cos(φ), z = sin(θ)·sin(φ)  →  φ = arctan2(z, x)
+        """
+        H, W = resolution // 2, resolution
+        d = np.asarray(direction, dtype=np.float32)
+        d = d / (np.linalg.norm(d) + 1e-8)
+        x, y, z = float(d[0]), float(d[1]), float(d[2])
+
+        theta = float(np.arccos(np.clip(y, -1.0, 1.0)))
+        phi = float(np.arctan2(z, x))
+
+        i = int(np.clip(round(theta * H / np.pi - 0.5), 0, H - 1))
+        j = int(round((phi + np.pi) * W / (2 * np.pi) - 0.5)) % W
+
+        img = np.zeros((H, W, 3), dtype=np.float32)
+        img[i, j] = np.asarray(color, dtype=np.float32)
+        return cls(img)
 
     @classmethod
     def sky_ground(
@@ -210,11 +240,11 @@ class SHLighting:
 
     # Real SH basis weights at direction (x, y, z)
     # Ordering: Y_0^0, Y_1^-1, Y_1^0, Y_1^1, Y_2^-2, Y_2^-1, Y_2^0, Y_2^1, Y_2^2
-    _BASIS_SCALE = np.array(
-        [0.282095, 0.488603, 0.488603, 0.488603,
-         1.092548, 1.092548, 0.315392, 1.092548, 0.546274],
-        dtype=np.float32,
-    )
+    # _BASIS_SCALE = np.array(
+    #     [0.282095, 0.488603, 0.488603, 0.488603,
+    #      1.092548, 1.092548, 0.315392, 1.092548, 0.546274],
+    #     dtype=np.float32,
+    # )
 
     def __init__(self, coeffs: np.ndarray):
         """coeffs: (9, 3) float32 — one SH coefficient vector per RGB channel."""
@@ -301,34 +331,6 @@ class SHLighting:
         coeffs = Y_at_d[:, None] * c[None, :]  # (9, 3)
         return cls(coeffs)
 
-    @classmethod
-    def point_like(
-        cls,
-        azimuth_deg:   float,
-        elevation_deg: float,
-        color:         np.ndarray = None,   # type: ignore[assignment]
-        intensity:     float = 2.0,
-    ) -> "SHLighting":
-        """
-        Convenience constructor: specify the light direction by two angles in degrees.
-
-        azimuth_deg:   rotation around Y axis (0° = +Z, 90° = +X, 180° = −Z, …)
-        elevation_deg: angle above the XZ plane (0° = horizon, 90° = straight up)
-
-        Produces the same result as directional() but avoids computing the
-        direction vector by hand.
-        """
-        if color is None:
-            color = np.ones(3, dtype=np.float32)
-        az = np.radians(float(azimuth_deg))
-        el = np.radians(float(elevation_deg))
-        direction = np.array([
-            np.cos(el) * np.sin(az),
-            np.sin(el),
-            np.cos(el) * np.cos(az),
-        ], dtype=np.float32)
-        return cls.directional(direction, color, intensity)
-
     def samples(self, _frag_pos: np.ndarray):
         return None
 
@@ -352,3 +354,18 @@ class SHLighting:
             + c1 * L[8] * (x ** 2 - y ** 2)
         )
         return np.maximum(irr, 0.0)
+
+    def radiance(self, direction: np.ndarray) -> np.ndarray:
+        x, y, z = float(direction[0]), float(direction[1]), float(direction[2])
+        Y = np.array([
+            0.282095,
+            0.488603 * y,
+            0.488603 * z,
+            0.488603 * x,
+            1.092548 * x * y,
+            1.092548 * y * z,
+            0.315392 * (3 * z**2 - 1),
+            1.092548 * x * z,
+            0.546274 * (x**2 - y**2),
+        ], dtype=np.float32)
+        return Y @ self.coeffs  # (9,) · (9, 3) → (3,)

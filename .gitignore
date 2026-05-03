@@ -10,3 +10,4 @@ study output/
 /pycache/*
 
 render/
+render_gpu/

@@ -13,3 +13,7 @@ raw_renderer/shaders/__init__.py
 raw_renderer/shaders/cook_torrance.py
 raw_renderer/shaders/lighting.py
 raw_renderer/shaders/phong.py
+raw_renderer_gpu/__init__.py
+raw_renderer_gpu/_ext.py
+raw_renderer_gpu/demo.py
+raw_renderer_gpu/rasterizer.py

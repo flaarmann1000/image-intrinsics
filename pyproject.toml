@@ -9,4 +9,4 @@ requires-python = ">=3.9"
 dependencies = ["numpy", "Pillow"]
 
 [tool.setuptools.packages.find]
-include = ["raw_renderer*"]
+include = ["raw_renderer*", "raw_renderer_gpu*"]

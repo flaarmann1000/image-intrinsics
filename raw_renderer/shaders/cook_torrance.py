@@ -89,11 +89,12 @@ def cook_torrance_shader(
         diff = k_d · albedo/π · irradiance(N)
         spec = 0
     """
-    N   = normal / (np.linalg.norm(normal) + 1e-8)
-    V   = cam_pos - frag_pos;  V /= np.linalg.norm(V) + 1e-8
+    N = normal / (np.linalg.norm(normal) + 1e-8)
+    V = cam_pos - frag_pos
+    V /= np.linalg.norm(V) + 1e-8
     NdV = max(float(np.dot(N, V)), 1e-4)
-    F0  = _f0(mat.albedo, mat.metallic)
-    alpha  = mat.roughness ** 2
+    F0 = _f0(mat.albedo, mat.metallic)
+    alpha = mat.roughness ** 2
     alpha2 = alpha ** 2
 
     samps = light.samples(frag_pos)
@@ -104,17 +105,17 @@ def cook_torrance_shader(
         k = alpha2 / 2.0 if len(dw) > 1 else (mat.roughness + 1) ** 2 / 8
 
         NdL_all = dirs @ N
-        valid   = NdL_all > 1e-4
-        dirs_v  = dirs[valid]             # (V, 3)
-        NdL_v   = NdL_all[valid]          # (V,)
-        dw_v    = dw[valid]               # (V,)
-        rad_v   = rad[valid]              # (V, 3)
+        valid = NdL_all > 1e-4
+        dirs_v = dirs[valid]             # (V, 3)
+        NdL_v = NdL_all[valid]          # (V,)
+        dw_v = dw[valid]               # (V,)
+        rad_v = rad[valid]              # (V, 3)
 
         if not np.any(valid):
             return np.zeros(3, dtype=np.float32)
 
-        HL    = dirs_v + V[None]
-        H_v   = HL / (np.linalg.norm(HL, axis=1, keepdims=True) + 1e-8)
+        HL = dirs_v + V[None]
+        H_v = HL / (np.linalg.norm(HL, axis=1, keepdims=True) + 1e-8)
         NdH_v = np.clip(H_v @ N, 0.0, 1.0)    # (V,)
         VdH_v = np.clip(H_v @ V, 0.0, 1.0)    # (V,)
 
@@ -123,19 +124,21 @@ def cook_torrance_shader(
         G_val = _G_v(NdV, NdL_v, k)           # (V,)
 
         # Rendering equation: Σ f_r · L_i · NdL · dω
-        # BRDF denominator 4·NdV·NdL cancels with NdL in numerator
+
         weight = D_val * G_val * dw_v / (4.0 * NdV + 1e-7)   # (V,)
-        spec   = (F_val * weight[:, None] * rad_v).sum(0)     # (3,)
+        spec = (F_val * weight[:, None] * rad_v).sum(0)     # (3,)
 
         diff_irr = (rad_v * NdL_v[:, None] * dw_v[:, None]).sum(0)   # (3,)
-        k_d      = (1.0 - F_val.mean(0)) * (1.0 - mat.metallic)
-        diff     = k_d * mat.albedo / np.pi * diff_irr
+        k_d = (1.0 - F_val.mean(0)) * (1.0 - mat.metallic)
+        diff = k_d * mat.albedo / np.pi * diff_irr
 
     else:
-        irr    = light.irradiance(N)  # type: ignore[union-attr]  — only SHLighting returns None
+        # type: ignore[union-attr]  — only SHLighting returns None
+        irr = light.irradiance(N)
         F_approx = _F_scalar(NdV, F0)
-        k_d    = (1.0 - F_approx) * (1.0 - mat.metallic)
-        diff   = k_d * mat.albedo / np.pi * irr
-        spec   = np.zeros(3, dtype=np.float32)
+        k_d = (1.0 - F_approx) * (1.0 - mat.metallic)
+        diff = k_d * mat.albedo / np.pi * irr
+        spec = np.zeros(3, dtype=np.float32)
 
+    # return np.clip((diff + spec)*100, 0.0, 1.0)
     return np.clip(diff + spec, 0.0, 1.0)
