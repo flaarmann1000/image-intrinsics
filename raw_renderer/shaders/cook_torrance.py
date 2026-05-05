@@ -135,8 +135,9 @@ def cook_torrance_shader(
     else:
         # type: ignore[union-attr]  — only SHLighting returns None
         irr = light.irradiance(N)
-        F_approx = _F_scalar(NdV, F0)
-        k_d = (1.0 - F_approx) * (1.0 - mat.metallic)
+        # F_approx = _F_scalar(NdV, F0)
+        # k_d = (1.0 - F_approx) * (1.0 - mat.metallic)
+        k_d = 1.0 - mat.metallic
         diff = k_d * mat.albedo / np.pi * irr
         spec = np.zeros(3, dtype=np.float32)
 
