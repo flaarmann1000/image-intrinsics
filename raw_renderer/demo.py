@@ -77,7 +77,7 @@ phong_mat = PhongMaterial(
     # shininess=256.0,
     # shininess=1.0,
     # ka=0.05, kd=0.8,  ks=0.3
-    ka=0.5, kd=80,  ks=0
+    ka=0.00, kd=0.8,  ks=0.3
 )
 
 # render(mesh, cam,
@@ -103,21 +103,21 @@ phong_mat = PhongMaterial(
 # ---------------------------------------------------------------------------
 pbr_mat = PBRMaterial(
     albedo=np.array([0.5, 0.6, 0.9], dtype=np.float32),
-    roughness=0.2,
+    roughness=0.25,
     metallic=0.0,
 )
 
-# render(mesh, cam,
-#        lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, pt_light),
-#        smooth=True,
-#        width=256, height=256,
-#        output_path=out + "ct_point.png")
+render(mesh, cam,
+       lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, pt_light),
+       smooth=True,
+       width=256, height=256,
+       output_path=out + "ct_point.png")
 
-# render(mesh, cam,
-#        lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, sh_light),
-#        smooth=True,
-#        width=256, height=256,
-#        output_path=out + "ct_sh.png")
+render(mesh, cam,
+       lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, sh_light),
+       smooth=True,
+       width=256, height=256,
+       output_path=out + "ct_sh.png")
 
 render(mesh, cam,
        lambda p, n, c: cook_torrance_shader(p, n, c, pbr_mat, env_map),

@@ -10,6 +10,19 @@ render_tiny()             – shade the tiny maps with CT + SH (metallic=0, roug
 
 Run all four with:
     python dataset.py
+
+Mask encoding
+-------------
+mask.png uses per-object colour IDs from _OBJECT_COLORS.
+Background pixels are black [0, 0, 0].
+Each object i is painted with _OBJECT_COLORS[i].
+params.json stores "mask_color": [R, G, B] per object for look-up.
+
+SH lighting
+-----------
+Random order-2 SH coefficients (9 × 3 RGB) are stored directly in params.json
+under "sh": {"coeffs": [...]}. This avoids the directional-light sign bug and
+gives richer environment-like lighting.
 """
 
 import json
@@ -36,35 +49,105 @@ _CAM   = Camera(
     target  =np.array([0.0, 0.0, 0.0], dtype=np.float32),
 )
 
+# Unique per-object mask colours (background = [0, 0, 0])
+_OBJECT_COLORS = [
+    [255,   0,   0],   # object 0 → red
+    [  0, 255,   0],   # object 1 → green
+    [  0,   0, 255],   # object 2 → blue
+    [255, 255,   0],   # object 3 → yellow
+    [  0, 255, 255],   # object 4 → cyan
+    [255,   0, 255],   # object 5 → magenta
+]
 
-# ── private helpers ───────────────────────────────────────────────────────────
+
+# ── mesh helpers ──────────────────────────────────────────────────────────────
 
 def _sphere_mesh(radius: float, position: np.ndarray, n_lat=24, n_lon=48) -> Mesh:
     base = generate_mesh("sphere", n_lat=n_lat, n_lon=n_lon)
     return Mesh(
         vertices      = base.vertices * radius + position,
         faces         = base.faces,
-        normals       = base.normals,          # unit normals invariant under uniform scale
+        normals       = base.normals,
         vertex_normals= base.vertex_normals,
     )
 
 
+def _merge_meshes(meshes: list) -> Mesh:
+    """Concatenate multiple Mesh objects into one (with correct face index offsets)."""
+    V_offset = 0
+    all_verts, all_faces, all_normals, all_vn = [], [], [], []
+    for m in meshes:
+        all_verts.append(m.vertices)
+        all_faces.append(m.faces + V_offset)
+        all_normals.append(m.normals)
+        all_vn.append(m.vertex_normals)
+        V_offset += len(m.vertices)
+    return Mesh(
+        vertices      = np.concatenate(all_verts),
+        faces         = np.concatenate(all_faces),
+        normals       = np.concatenate(all_normals),
+        vertex_normals= np.concatenate(all_vn),
+    )
+
+
+# ── dispatch shaders (position-based material assignment) ─────────────────────
+
+def _make_albedo_shader(positions: list, albedos: list):
+    pos_arr = [np.asarray(p, dtype=np.float32) for p in positions]
+    alb_arr = [np.asarray(a, dtype=np.float32) for a in albedos]
+    def shader(frag_pos, normal, cam_pos):
+        idx = int(np.argmin([np.linalg.norm(frag_pos - p) for p in pos_arr]))
+        return alb_arr[idx]
+    return shader
+
+
+def _make_object_id_shader(positions: list, mask_colors: list):
+    """Returns the object's mask colour (normalised to [0,1]) per fragment."""
+    pos_arr    = [np.asarray(p, dtype=np.float32) for p in positions]
+    colors_f   = [np.array(c, dtype=np.float32) / 255.0 for c in mask_colors]
+    def shader(frag_pos, normal, cam_pos):
+        idx = int(np.argmin([np.linalg.norm(frag_pos - p) for p in pos_arr]))
+        return colors_f[idx]
+    return shader
+
+
+def _make_multi_shader(positions: list, mats: list, light, shader_type: str):
+    pos_arr  = [np.asarray(p, dtype=np.float32) for p in positions]
+    shade_fn = phong_shader if shader_type == "phong" else cook_torrance_shader
+    def shader(frag_pos, normal, cam_pos):
+        idx = int(np.argmin([np.linalg.norm(frag_pos - p) for p in pos_arr]))
+        return shade_fn(frag_pos, normal, cam_pos, mats[idx], light)
+    return shader
+
+
+# ── random parameter generators ───────────────────────────────────────────────
+
 def _rand_light_dir(rng) -> np.ndarray:
-    """Random unit vector on upper hemisphere (y ≥ 0)."""
     d = rng.standard_normal(3).astype(np.float32)
     d[1] = abs(d[1])
     return d / (np.linalg.norm(d) + 1e-8)
 
 
 def _rand_surface_normal(rng) -> np.ndarray:
-    """Random unit normal loosely facing the camera (+z)."""
     d = rng.standard_normal(3).astype(np.float32)
     d[2] = abs(d[2])
     return d / (np.linalg.norm(d) + 1e-8)
 
 
+def _rand_distinct_albedos(rng, min_dist: float = 0.5) -> tuple:
+    """
+    Return two albedo colours (each [3] float32 in [0,1]) whose L2 distance
+    is at least min_dist.  Falls back to complementary colours after 200 tries.
+    """
+    a = rng.random(3).astype(np.float32)
+    for _ in range(200):
+        b = rng.random(3).astype(np.float32)
+        if np.linalg.norm(a - b) >= min_dist:
+            return a, b
+    return a, (1.0 - a).astype(np.float32)
+
+
 def _rand_color(rng) -> np.ndarray:
-    """Warm- or cool-tinted white."""
     c = rng.uniform(0.7, 1.0, 3).astype(np.float32)
     if rng.random() > 0.5:
         c[0] = min(1.0, c[0] * 1.15)   # warm
@@ -73,26 +156,42 @@ def _rand_color(rng) -> np.ndarray:
     return c
 
 
-def _rand_phong_params(rng, albedo: np.ndarray) -> dict:
+def _rand_sh_coeffs(rng) -> np.ndarray:
+    """
+    Random order-2 SH coefficients (9, 3) for plausible diffuse lighting.
+
+    Band 0 (ambient): per-channel positive value → always-visible base irradiance.
+    Bands 1–2: random directional / quadratic variation, bounded so irradiance
+               stays positive on front-facing surfaces.
+    """
+    coeffs = np.zeros((9, 3), dtype=np.float32)
+    color     = _rand_color(rng)
+    intensity = float(rng.uniform(0.5, 2.0))
+    coeffs[0] = color * intensity                                    # ambient
+    scale1    = 0.5 * intensity
+    scale2    = 0.3 * intensity
+    coeffs[1:4] = rng.uniform(-scale1, scale1, (3, 3)).astype(np.float32)
+    coeffs[4:9] = rng.uniform(-scale2, scale2, (5, 3)).astype(np.float32)
+    return coeffs
+
+
+def _rand_phong_params(rng) -> dict:
     return {
-        "base_color": albedo.tolist(),
-        "ka":         float(rng.uniform(0.02, 0.10)),
-        "kd":         float(rng.uniform(0.40, 1.00)),
-        "ks":         float(rng.uniform(0.10, 0.60)),
-        "shininess":  float(rng.choice([8, 16, 32, 64, 128, 256])),
+        "ka":        float(rng.uniform(0.02, 0.10)),
+        "kd":        float(rng.uniform(0.40, 1.00)),
+        "ks":        float(rng.uniform(0.10, 0.60)),
+        "shininess": float(rng.choice([8, 16, 32, 64, 128, 256])),
     }
 
 
-def _rand_ct_params(rng, albedo: np.ndarray) -> dict:
+def _rand_ct_params(rng) -> dict:
     return {
-        "albedo":    albedo.tolist(),
         "metallic":  float(rng.uniform(0.0, 1.0)),
         "roughness": float(rng.uniform(0.05, 1.0)),
     }
 
 
 def _rand_lighting_config(rng) -> dict:
-    """One lighting config carrying point / SH / envmap variants."""
     color = _rand_color(rng)
     return {
         "point": {
@@ -100,9 +199,9 @@ def _rand_lighting_config(rng) -> dict:
             "color":    color.tolist(),
         },
         "sh": {
-            "direction": _rand_light_dir(rng).tolist(),
-            "color":     color.tolist(),
-            "intensity": float(rng.uniform(0.5, 2.0)),
+            # Full 9×3 RGB SH coefficients stored directly — avoids the
+            # directional-light sign ambiguity in SHLighting.directional().
+            "coeffs": _rand_sh_coeffs(rng).tolist(),
         },
         "envmap": {
             "direction": _rand_light_dir(rng).tolist(),
@@ -119,12 +218,7 @@ def _build_light(cfg: dict, light_type: str):
             color   =np.array(p["color"],    dtype=np.float32),
         )
     if light_type == "sh":
-        s = cfg["sh"]
-        return SHLighting.directional(
-            direction=np.array(s["direction"], dtype=np.float32),
-            color    =np.array(s["color"],     dtype=np.float32),
-            intensity=s["intensity"],
-        )
+        return SHLighting(np.array(cfg["sh"]["coeffs"], dtype=np.float32))
     if light_type == "envmap":
         e = cfg["envmap"]
         return EnvMap.point_like(
@@ -134,17 +228,18 @@ def _build_light(cfg: dict, light_type: str):
     raise ValueError(f"Unknown light type: {light_type!r}")
 
 
-def _build_material(cfg: dict, shader: str):
+def _build_material(obj: dict, shader: str):
+    albedo = np.array(obj["albedo"], dtype=np.float32)
     if shader == "phong":
-        p = cfg["phong"]
+        p = obj["phong"]
         return PhongMaterial(
-            base_color=np.array(p["base_color"], dtype=np.float32),
+            base_color=albedo,
             ka=p["ka"], kd=p["kd"], ks=p["ks"], shininess=p["shininess"],
         )
     if shader == "ct":
-        c = cfg["ct"]
+        c = obj["ct"]
         return PBRMaterial(
-            albedo   =np.array(c["albedo"], dtype=np.float32),
+            albedo   =albedo,
             metallic =c["metallic"],
             roughness=c["roughness"],
         )
@@ -155,13 +250,14 @@ def _build_material(cfg: dict, shader: str):
 
 def create_scenes(n_scenes: int = 1, seed: int = 42) -> None:
     """
-    Render ground-truth maps and generate param JSONs for n_scenes spheres.
+    Render ground-truth maps and generate param JSONs for n_scenes.
+    Each scene contains two spheres with distinct albedo colours.
 
     Per scene output (raw_dataset/raw/<scene_id>/):
-        normal_map.png   — world normals, encoded (N*0.5+0.5)*255
-        albedo_map.png   — flat sphere albedo
-        mask.png         — white on sphere, black elsewhere
-        params.json      — sphere geometry, Phong/CT material, 10 lighting configs
+        normal_map.png   — world normals encoded (N*0.5+0.5)*255
+        albedo_map.png   — per-pixel albedo (different colour per sphere)
+        mask.png         — colour-ID mask: object i painted with _OBJECT_COLORS[i]
+        params.json      — objects list + 10 lighting configs
     """
     rng = np.random.default_rng(seed)
 
@@ -170,42 +266,58 @@ def create_scenes(n_scenes: int = 1, seed: int = 42) -> None:
         out_dir  = os.path.join(_ROOT, "raw", scene_id)
         os.makedirs(out_dir, exist_ok=True)
 
-        radius   = float(rng.uniform(0.3, 0.7))
-        position = np.array([
-            rng.uniform(-0.3, 0.3),
-            rng.uniform(-0.3, 0.3),
-            0.0,
-        ], dtype=np.float32)
-        albedo = rng.random(3).astype(np.float32)
-        mesh   = _sphere_mesh(radius, position)
+        albedo_a, albedo_b = _rand_distinct_albedos(rng)
+        objs = []
+        for side_idx, (side, albedo) in enumerate(zip((-1, +1), (albedo_a, albedo_b))):
+            radius   = float(rng.uniform(0.15, 0.30))
+            offset_x = float(rng.uniform(0.35, 0.50))
+            position = np.array([
+                side * offset_x + rng.uniform(-0.05, 0.05),
+                rng.uniform(-0.20, 0.20),
+                0.0,
+            ], dtype=np.float32)
+            objs.append({
+                "mask_color": _OBJECT_COLORS[side_idx],
+                "radius":     radius,
+                "position":   position.tolist(),
+                "albedo":     albedo.tolist(),
+                "phong":      _rand_phong_params(rng),
+                "ct":         _rand_ct_params(rng),
+            })
 
-        render(mesh, _CAM,
+        meshes       = [_sphere_mesh(o["radius"], np.array(o["position"], dtype=np.float32)) for o in objs]
+        combined     = _merge_meshes(meshes)
+        positions_3d = [np.array(o["position"],   dtype=np.float32) for o in objs]
+        albedos_3d   = [np.array(o["albedo"],      dtype=np.float32) for o in objs]
+        mask_colors  = [o["mask_color"] for o in objs]
+
+        render(combined, _CAM,
                lambda p, n, c: (n * 0.5 + 0.5).astype(np.float32),
                smooth=True, width=_W, height=_H,
                output_path=os.path.join(out_dir, "normal_map.png"))
 
-        alb = albedo.copy()
-        render(mesh, _CAM,
-               lambda p, n, c, a=alb: a,
+        render(combined, _CAM,
+               _make_albedo_shader(positions_3d, albedos_3d),
                smooth=True, width=_W, height=_H,
                output_path=os.path.join(out_dir, "albedo_map.png"))
 
-        render(mesh, _CAM,
-               lambda p, n, c: np.ones(3, dtype=np.float32),
+        render(combined, _CAM,
+               _make_object_id_shader(positions_3d, mask_colors),
                smooth=True, width=_W, height=_H,
                output_path=os.path.join(out_dir, "mask.png"))
 
         params = {
             "scene_id": scene_id,
-            "sphere":   {"radius": radius, "position": position.tolist(), "albedo": albedo.tolist()},
-            "phong":    _rand_phong_params(rng, albedo),
-            "ct":       _rand_ct_params(rng, albedo),
+            "objects":  objs,
             "lighting": [_rand_lighting_config(rng) for _ in range(10)],
         }
         with open(os.path.join(out_dir, "params.json"), "w") as f:
             json.dump(params, f, indent=2)
 
-        print(f"[{scene_id}]  r={radius:.2f}  pos={position[:2].round(2)}  albedo={albedo.round(2)}")
+        for oi, o in enumerate(objs):
+            print(f"  [{scene_id}] obj{oi}: r={o['radius']:.2f}  "
+                  f"pos={np.array(o['position'])[:2].round(2)}  "
+                  f"albedo={np.array(o['albedo']).round(2)}")
 
 
 # ── Function 2 ────────────────────────────────────────────────────────────────
@@ -217,7 +329,7 @@ def render_scenes() -> None:
 
     Output: raw_dataset/rendered/<shader>/<lighting>/<scene_id>/variant_<k>.png
     """
-    raw_root = os.path.join(_ROOT, "raw")
+    raw_root  = os.path.join(_ROOT, "raw")
     scene_ids = sorted(
         d for d in os.listdir(raw_root)
         if os.path.isdir(os.path.join(raw_root, d))
@@ -227,12 +339,13 @@ def render_scenes() -> None:
         with open(os.path.join(raw_root, scene_id, "params.json")) as f:
             cfg = json.load(f)
 
-        radius   = cfg["sphere"]["radius"]
-        position = np.array(cfg["sphere"]["position"], dtype=np.float32)
-        mesh     = _sphere_mesh(radius, position)
+        objs         = cfg["objects"]
+        meshes       = [_sphere_mesh(o["radius"], np.array(o["position"], dtype=np.float32)) for o in objs]
+        combined     = _merge_meshes(meshes)
+        positions_3d = [np.array(o["position"], dtype=np.float32) for o in objs]
 
         for shader in ("phong", "ct"):
-            mat = _build_material(cfg, shader)
+            mats = [_build_material(o, shader) for o in objs]
 
             for light_type in ("point", "sh", "envmap"):
                 out_dir = os.path.join(_ROOT, "rendered", shader, light_type, scene_id)
@@ -240,13 +353,9 @@ def render_scenes() -> None:
 
                 for k, light_cfg in enumerate(cfg["lighting"]):
                     light = _build_light(light_cfg, light_type)
+                    fn    = _make_multi_shader(positions_3d, mats, light, shader)
 
-                    if shader == "phong":
-                        fn = lambda p, n, c, _m=mat, _l=light: phong_shader(p, n, c, _m, _l)
-                    else:
-                        fn = lambda p, n, c, _m=mat, _l=light: cook_torrance_shader(p, n, c, _m, _l)
-
-                    render(mesh, _CAM, fn,
+                    render(combined, _CAM, fn,
                            smooth=True, width=_W, height=_H,
                            output_path=os.path.join(out_dir, f"variant_{k:02d}.png"))
 
@@ -269,20 +378,18 @@ def create_tiny_raw(seed: int = 0) -> None:
     out_dir = os.path.join(_ROOT, "raw_tiny")
     os.makedirs(out_dir, exist_ok=True)
 
-    # 18 unique albedo colors
     albedo_flat = rng.random((18, 3)).astype(np.float32)
     Image.fromarray(
         (albedo_flat.reshape(3, 6, 3) * 255).astype(np.uint8)
     ).save(os.path.join(out_dir, "albedo_tiny.png"))
 
     def _make_normal_img(n_unique: int) -> np.ndarray:
-        unique = np.stack([_rand_surface_normal(rng) for _ in range(n_unique)])  # (U, 3)
+        unique = np.stack([_rand_surface_normal(rng) for _ in range(n_unique)])
         assign = rng.integers(0, n_unique, size=18)
-        # guarantee every unique normal appears at least once
         for j in range(n_unique):
             if j not in assign:
                 assign[rng.integers(0, 18)] = j
-        normals = unique[assign]                                       # (18, 3)
+        normals = unique[assign]
         encoded = ((normals * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
         return encoded.reshape(3, 6, 3)
 
@@ -308,41 +415,26 @@ def render_tiny(seed: int = 0) -> None:
 
     albedo_flat = (
         np.array(Image.open(os.path.join(raw_dir, "albedo_tiny.png")), dtype=np.float32) / 255.0
-    ).reshape(18, 3)                                               # (18, 3)
+    ).reshape(18, 3)
 
-    # 10 random SH lights
-    lights = [
-        SHLighting.directional(
-            direction=_rand_light_dir(rng),
-            color    =_rand_color(rng),
-            intensity=float(rng.uniform(0.5, 2.0)),
-        )
-        for _ in range(10)
-    ]
+    lights = [SHLighting(_rand_sh_coeffs(rng)) for _ in range(10)]
 
-    frag_pos = np.zeros(3, dtype=np.float32)   # all patches at origin
+    frag_pos = np.zeros(3, dtype=np.float32)
     cam_pos  = _CAM.position
 
     for normal_name in ("normals_a", "normals_b"):
         normals_raw = (
             np.array(Image.open(os.path.join(raw_dir, f"{normal_name}.png")), dtype=np.float32) / 255.0
-        ).reshape(18, 3) * 2.0 - 1.0                              # decode → (18, 3)
+        ).reshape(18, 3) * 2.0 - 1.0
 
-        # re-normalise (encoding round-trips lose precision)
         lengths = np.linalg.norm(normals_raw, axis=1, keepdims=True)
         normals = normals_raw / np.maximum(lengths, 1e-8)
 
         for k, light in enumerate(lights):
             pixels = np.zeros((18, 3), dtype=np.float32)
             for idx in range(18):
-                mat = PBRMaterial(
-                    albedo   =albedo_flat[idx],
-                    metallic =0.0,
-                    roughness=0.0,
-                )
-                pixels[idx] = cook_torrance_shader(
-                    frag_pos, normals[idx], cam_pos, mat, light
-                )
+                mat = PBRMaterial(albedo=albedo_flat[idx], metallic=0.0, roughness=0.0)
+                pixels[idx] = cook_torrance_shader(frag_pos, normals[idx], cam_pos, mat, light)
 
             out_path = os.path.join(out_dir, f"{normal_name}_variant_{k:02d}.png")
             Image.fromarray(

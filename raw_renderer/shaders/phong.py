@@ -89,32 +89,12 @@ def phong_shader(
             specular = np.zeros(3, dtype=np.float32)
 
         else:
+
             R = 2 * NdV * N - V  # reflection of view about normal
             R /= np.linalg.norm(R) + 1e-8
+            L_R = light.phong_filtered_radiance(R, mat.shininess)
 
-            # R is the direction a perfect mirror would sample —
-            # look up how much radiance comes from there
-            L_R = np.maximum(light.radiance(R), 0.0)
-
-            # (R·V) is always 1.0 at the specular peak by construction,
-            # so use the radiance magnitude to modulate, but still need
-            # a directional falloff term. Extract dominant light dir from SH:
-            # L_band1 coeffs (indices 1,2,3) encode the mean light direction.
-            dominant_L = np.array([
-                light.coeffs[3, :].mean(),  # x  (L[3] = 0.488603 * x)
-                light.coeffs[1, :].mean(),  # y
-                light.coeffs[2, :].mean(),  # z
-            ])
-            dom_norm = np.linalg.norm(dominant_L)
-            if dom_norm > 1e-6:
-                dominant_L /= dom_norm
-                NdL = np.clip(dominant_L @ N, 0.0, 1.0)
-                # standard Phong: reflect L about N, dot with V
-                RdV = np.clip(R @ dominant_L, 0.0, 1.0)
-                # but R is already refl(V), so RdV = dot(refl(V), L) = dot(V, refl(L)) ✓
-                specular = mat.ks * (RdV ** mat.shininess) * L_R * NdL
-            else:
-                specular = np.zeros(3, dtype=np.float32)
+            specular = mat.ks * L_R
 
         ambient = np.zeros(3, dtype=np.float32)
 

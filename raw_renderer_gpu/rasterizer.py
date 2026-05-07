@@ -10,6 +10,7 @@ over all hit pixels at once.
 import numpy as np
 import torch
 from PIL import Image
+from typing import Union
 
 from raw_renderer.mesh   import Mesh
 from raw_renderer.camera import Camera, look_at, perspective
@@ -115,34 +116,44 @@ def _interp(verts, fn, vn, faces, face_ids, bary, hit, smooth):
 # ─────────────────────────────────────────── SH helpers ──────────────────────
 
 def _sh_basis(d):
-    """d: (M, 3) → (M, 9)"""
-    x, y, z = d[:, 0], d[:, 1], d[:, 2]
+    """d: (..., 3) → (..., 9)"""
+    x, y, z = d[..., 0], d[..., 1], d[..., 2]
     return torch.stack([
         torch.ones_like(x) * 0.282095,
         0.488603*y, 0.488603*z, 0.488603*x,
         1.092548*x*y, 1.092548*y*z,
         0.315392*(3*z**2 - 1),
         1.092548*x*z, 0.546274*(x**2 - y**2),
-    ], dim=1)                                      # (M, 9)
+    ], dim=-1)                                     # (..., 9)
 
 
 def _sh_radiance(coeffs_t, dirs):
-    """coeffs_t: (9,3) cuda; dirs: (M,3) → (M,3)"""
+    """coeffs_t: (9,3) cuda; dirs: (...,3) → (...,3)"""
     return _sh_basis(dirs) @ coeffs_t
 
 
 def _sh_irradiance(coeffs_t, N):
-    """Ramamoorthi & Hanrahan 2001 — coeffs_t: (9,3); N: (M,3) → (M,3)"""
-    c1, c2, c3, c4, c5 = 0.429043, 0.511664, 0.743125, 0.886227, 0.247708
-    L = coeffs_t
-    x, y, z = N[:,0:1], N[:,1:2], N[:,2:3]
-    return (
-        c4*L[0]
-        + 2*c2*(L[1]*y + L[2]*z + L[3]*x)
-        + 2*c1*(L[4]*x*y + L[5]*y*z + L[7]*x*z)
-        + c3*L[6]*z**2 - c5*L[6]
-        + c1*L[8]*(x**2 - y**2)
-    ).clamp(min=0)                                 # (M, 3)
+    """ZH band-limiting weights for diffuse — coeffs_t: (9,3); N: (...,3) → (...,3)"""
+    Y = _sh_basis(N)                               # (..., 9)
+    A = N.new_tensor([
+        torch.pi,
+        2*torch.pi/3, 2*torch.pi/3, 2*torch.pi/3,
+        torch.pi/4,   torch.pi/4,   torch.pi/4, torch.pi/4, torch.pi/4,
+    ])
+    return ((A * Y) @ coeffs_t).clamp(min=0)       # (..., 3)
+
+
+def _sh_phong_filtered_radiance(coeffs_t, dirs, shininess):
+    """Phong-lobe SH filter — coeffs_t: (9,3); dirs: (...,3) → (...,3)"""
+    Y   = _sh_basis(dirs)
+    B_0 = 2 * torch.pi / (shininess + 1)
+    B_1 = 2 * torch.pi / (shininess + 2)
+    B_2 = torch.pi * (3.0 / (shininess + 3) - 1.0 / (shininess + 1))
+    norm = (shininess + 2) / (2 * torch.pi)
+    B = Y.new_tensor([B_0,
+                      B_1, B_1, B_1,
+                      B_2, B_2, B_2, B_2, B_2]) * norm
+    return ((B * Y) @ coeffs_t).clamp(min=0)       # (..., 3)
 
 
 # ─────────────────────────────────────────── CT micro-terms ──────────────────
@@ -227,15 +238,8 @@ def _phong_sh(frag_pos, N, cam_pos, mat, light):
     V    = _norm(cam_pos - frag_pos)
     NdV  = (N*V).sum(1, keepdim=True).clamp(min=0)
     R    = _norm(2*NdV*N - V)
-    L_R  = _sh_radiance(coeffs, R).clamp(min=0)
-
-    dom  = torch.stack([coeffs[3].mean(), coeffs[1].mean(), coeffs[2].mean()])
-    spec = frag_pos.new_zeros(frag_pos.shape)
-    if dom.norm() > 1e-6:
-        dom  = _norm(dom.unsqueeze(0)).squeeze(0)
-        NdL  = (N @ dom).clamp(0, 1)[:, None]
-        RdV  = (R @ dom).clamp(0, 1)[:, None]
-        spec = mat.ks * RdV**mat.shininess * L_R * NdL
+    L_R  = _sh_phong_filtered_radiance(coeffs, R, mat.shininess)
+    spec = mat.ks * L_R
 
     return (diff + spec).clamp(0, 1)
 
@@ -313,7 +317,7 @@ def _ct_envmap(frag_pos, N, cam_pos, mat, light, sbatch=64):
         # Exact NdH, VdH without materialising (M, B, 3)
         H_len = (2.0 + 2.0*LdV).clamp(min=1e-8).sqrt()
         NdH   = ((NdL + NdV_e) / H_len).clamp(0, 1)   # (M, B)
-        VdH   = ((LdV + NdV_e) / H_len).clamp(0, 1)   # (M, B) using V·H=(LdV+1)/|L+V|
+        VdH   = ((LdV + 1.0) / H_len).clamp(0, 1)        # (M, B)  V·H = (LdV+1)/|L+V|
 
         D = _ggx_D(NdH, alpha2)                   # (M, B)
         F = _schlick_F(VdH, F0)                   # (M, B, 3)
@@ -335,14 +339,82 @@ def _ct_sh(frag_pos, N, cam_pos, mat, light):
     dev    = frag_pos.device
     albedo = _cuda(mat.albedo, dev)
     coeffs = _cuda(light.coeffs, dev)
-    F0     = _f0_mat(albedo, mat.metallic)
 
-    V    = _norm(cam_pos - frag_pos)
-    NdV  = (N*V).sum(1).clamp(min=1e-4)
-    irr  = _sh_irradiance(coeffs, N)
-    F_ap = _schlick_F(NdV, F0)
-    k_d  = (1 - F_ap) * (1 - mat.metallic)
+    irr = _sh_irradiance(coeffs, N)
+    k_d = 1.0 - mat.metallic
     return (k_d * albedo / torch.pi * irr).clamp(0, 1)
+
+
+# ─────────────────────────────────────────── public shading API ──────────────
+
+def shade_ct_sh(
+    albedo:    torch.Tensor,                    # [..., 3] per-pixel albedo in [0, 1]
+    normals:   torch.Tensor,                    # [..., 3] unit normals
+    sh_coeffs: torch.Tensor,                    # [9, 3]  SH lighting coefficients
+    metallic: Union[float, torch.Tensor] = 0.0,  # scalar or Tensor broadcastable to [..., 1]
+) -> torch.Tensor:
+    """
+    Differentiable Cook-Torrance + SH irradiance shading.
+
+    Works on any leading batch dimensions (e.g. flat (M,3) or spatial (H,W,3)).
+    All tensors must reside on the same device.
+
+    Returns RGB in [0, 1] with the same leading shape as albedo.
+    """
+    k_d = 1.0 - metallic
+    irr = _sh_irradiance(sh_coeffs, normals)
+    return (k_d * albedo / torch.pi * irr).clamp(0.0, 1.0)
+
+
+# ─────────────────────────────────────────── geometry extraction ─────────────
+
+def rasterize_geometry(
+    mesh:   Mesh,
+    camera: Camera,
+    width:  int  = 512,
+    height: int  = 512,
+    smooth: bool = False,
+    device: str  = "cuda",
+) -> tuple:
+    """
+    Rasterise mesh and return per-pixel geometry tensors without shading.
+
+    Returns
+    -------
+    normals  : Tensor [H, W, 3]  float32 – unit normals (zero on background)
+    frag_pos : Tensor [H, W, 3]  float32 – world-space fragment positions
+    mask     : Tensor [H, W]     bool    – True on foreground pixels
+    cam_pos  : Tensor [3]        float32 – camera position
+    """
+    W, H = width, height
+
+    verts  = _cuda(mesh.vertices,       device)
+    faces  = _cuda(mesh.faces,          device, dtype=torch.long)
+    fn     = _cuda(mesh.normals,        device)
+    vn     = _cuda(mesh.vertex_normals, device)
+    cam_t  = _cuda(camera.position.astype(np.float32), device)
+    MVP    = _cuda((perspective(camera.fov_deg, W/H) @
+                    look_at(camera.position, camera.target, camera.up)
+                   ).astype(np.float32), device)
+
+    sverts           = _project(verts, MVP, W, H)
+    face_ids, bary   = _rasterize(sverts, faces, W, H)
+
+    hit          = face_ids >= 0                          # (H*W,)
+    normals_flat = verts.new_zeros(H * W, 3)
+    frag_flat    = verts.new_zeros(H * W, 3)
+
+    if hit.any():
+        fp, N          = _interp(verts, fn, vn, faces, face_ids, bary, hit, smooth)
+        normals_flat[hit] = N
+        frag_flat[hit]    = fp
+
+    return (
+        normals_flat.reshape(H, W, 3),
+        frag_flat.reshape(H, W, 3),
+        hit.reshape(H, W),
+        cam_t,
+    )
 
 
 # ─────────────────────────────────────────── main render ─────────────────────

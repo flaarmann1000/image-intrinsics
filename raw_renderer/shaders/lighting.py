@@ -24,9 +24,46 @@ from dataclasses import dataclass, field
 from PIL import Image
 
 
+def build_SH_basis(dirs: np.ndarray) -> np.ndarray:
+    """
+    Evaluate order-2 real SH basis.
+
+    Input:
+        dirs: (..., 3)
+
+    Output:
+        Y: (..., 9)
+
+    Ordering:
+        Y_0^0,
+        Y_1^-1, Y_1^0, Y_1^1,
+        Y_2^-2, Y_2^-1, Y_2^0, Y_2^1, Y_2^2
+    """
+    dirs = np.asarray(dirs, dtype=np.float32)
+
+    if dirs.shape[-1] != 3:
+        raise ValueError(f"Expected dirs shape (..., 3), got {dirs.shape}")
+
+    x = dirs[..., 0]
+    y = dirs[..., 1]
+    z = dirs[..., 2]
+
+    return np.stack([
+        np.full_like(x, 0.282095),
+        0.488603 * y,
+        0.488603 * z,
+        0.488603 * x,
+        1.092548 * x * y,
+        1.092548 * y * z,
+        0.315392 * (3.0 * z * z - 1.0),
+        1.092548 * x * z,
+        0.546274 * (x * x - y * y),
+    ], axis=-1).astype(np.float32)
+
 # ---------------------------------------------------------------------------
 # Point light
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class PointLight:
@@ -126,17 +163,8 @@ class EnvMap:
                                             None]
 
         L = sh.coeffs   # (9, 3)
-        raw = (
-            L[0] * 0.282095
-            + L[1] * (0.488603 * y3)
-            + L[2] * (0.488603 * z3)
-            + L[3] * (0.488603 * x3)
-            + L[4] * (1.092548 * x3 * y3)
-            + L[5] * (1.092548 * y3 * z3)
-            + L[6] * (0.315392 * (3*z3**2 - 1))
-            + L[7] * (1.092548 * x3 * z3)
-            + L[8] * (0.546274 * (x3**2 - y3**2))
-        )   # (H, W, 3)
+        Y = build_SH_basis(np.concatenate([x3, y3, z3], axis=-1))
+        raw = Y @ L
 
         return cls(np.maximum(raw, 0.0).astype(np.float32))
 
@@ -199,7 +227,7 @@ class EnvMap:
         Equirectangular: phi ∈ [-π, π], theta ∈ [0, π].
         """
         x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
-        phi = np.arctan2(x, z)                             # [-π, π]
+        phi = np.arctan2(z, x)                             # [-π, π]
         theta = np.arccos(np.clip(y, -1.0, 1.0))            # [0, π]
         u = (phi / (2 * np.pi) + 0.5).clip(0, 1)
         v = (theta / np.pi).clip(0, 1)
@@ -235,17 +263,6 @@ class SHLighting:
     Irradiance is evaluated analytically at any surface normal in O(1).
     """
 
-    # Ramamoorthi & Hanrahan 2001, Table 1
-    _C1, _C2, _C3, _C4, _C5 = 0.429043, 0.511664, 0.743125, 0.886227, 0.247708
-
-    # Real SH basis weights at direction (x, y, z)
-    # Ordering: Y_0^0, Y_1^-1, Y_1^0, Y_1^1, Y_2^-2, Y_2^-1, Y_2^0, Y_2^1, Y_2^2
-    # _BASIS_SCALE = np.array(
-    #     [0.282095, 0.488603, 0.488603, 0.488603,
-    #      1.092548, 1.092548, 0.315392, 1.092548, 0.546274],
-    #     dtype=np.float32,
-    # )
-
     def __init__(self, coeffs: np.ndarray):
         """coeffs: (9, 3) float32 — one SH coefficient vector per RGB channel."""
         if coeffs.shape != (9, 3):
@@ -269,17 +286,7 @@ class SHLighting:
         L = env.sample(dirs)                   # (N, 3)
 
         # Real SH basis evaluated at each sample direction
-        Y = np.stack([
-            np.ones(n_samples) * 0.282095,   # Y_0^0
-            0.488603 * y,                     # Y_1^-1
-            0.488603 * z,                     # Y_1^0
-            0.488603 * x,                     # Y_1^1
-            1.092548 * x * y,                # Y_2^-2
-            1.092548 * y * z,                # Y_2^-1
-            0.315392 * (3 * z ** 2 - 1),     # Y_2^0
-            1.092548 * x * z,                # Y_2^1
-            0.546274 * (x ** 2 - y ** 2),    # Y_2^2
-        ], axis=1)  # (N, 9)
+        Y = build_SH_basis(dirs)
 
         # L_lm ≈ (4π/N) Σ_i L(d_i) * Y_lm(d_i)
         coeffs = (4 * np.pi / n_samples) * \
@@ -294,7 +301,10 @@ class SHLighting:
         """
         coeffs = np.zeros((9, 3), dtype=np.float32)
         # c4 * L00 = π·intensity  →  L00 = π·intensity / c4
-        coeffs[0] = float(np.pi * intensity / cls._C4)
+        # Ramamoorthi & Hanrahan 2001, Table 1
+        # _C1, _C2, _C3, _C4, _C5 = 0.429043, 0.511664, 0.743125, 0.886227, 0.247708
+        _C4 = 0.886227
+        coeffs[0] = float(np.pi * intensity / _C4)
         return cls(coeffs)
 
     @classmethod
@@ -311,20 +321,9 @@ class SHLighting:
         """
         d = np.asarray(direction, dtype=np.float32)
         d /= np.linalg.norm(d)
-        x, y, z = float(d[0]), float(d[1]), float(d[2])
         c = np.asarray(color, dtype=np.float32) * intensity
 
-        Y_at_d = np.array([
-            0.282095,
-            0.488603 * y,
-            0.488603 * z,
-            0.488603 * x,
-            1.092548 * x * y,
-            1.092548 * y * z,
-            0.315392 * (3 * z ** 2 - 1),
-            1.092548 * x * z,
-            0.546274 * (x ** 2 - y ** 2),
-        ], dtype=np.float32)
+        Y_at_d = build_SH_basis(d)
 
         # For a delta function: c_lm = ∫ I·δ(ω-d)·Y_lm(ω) dω = I·Y_lm(d)
         # No 4π factor here — that belongs only to the MC estimator in from_env_map.
@@ -342,30 +341,24 @@ class SHLighting:
         Returns RGB in [0, ∞).        
         """
         L = self.coeffs
-        x, y, z = float(normal[0]), float(normal[1]), float(normal[2])
-        c1, c2, c3, c4, c5 = self._C1, self._C2, self._C3, self._C4, self._C5
+        Y = build_SH_basis(normal)
 
-        irr = (
-            c4 * L[0]
-            + 2 * c2 * (L[1] * y + L[2] * z + L[3] * x)
-            + 2 * c1 * (L[4] * x*y + L[5] * y*z + L[7] * x*z)
-            + c3 * L[6] * z ** 2
-            - c5 * L[6]
-            + c1 * L[8] * (x ** 2 - y ** 2)
-        )
-        return np.maximum(irr, 0.0)
-
-    def radiance(self, direction: np.ndarray) -> np.ndarray:
-        x, y, z = float(direction[0]), float(direction[1]), float(direction[2])
-        Y = np.array([
-            0.282095,
-            0.488603 * y,
-            0.488603 * z,
-            0.488603 * x,
-            1.092548 * x * y,
-            1.092548 * y * z,
-            0.315392 * (3 * z**2 - 1),
-            1.092548 * x * z,
-            0.546274 * (x**2 - y**2),
+        A = np.array([
+            np.pi,
+            2*np.pi/3, 2*np.pi/3, 2*np.pi/3,
+            np.pi/4, np.pi/4, np.pi/4, np.pi/4, np.pi/4,
         ], dtype=np.float32)
-        return Y @ self.coeffs  # (9,) · (9, 3) → (3,)
+
+        return np.maximum((A * Y) @ L, 0.0)
+
+    def phong_filtered_radiance(self, direction: np.ndarray, shininess: float) -> np.ndarray:
+        L = self.coeffs
+        Y = build_SH_basis(direction)
+        B_0 = 2 * np.pi / (shininess + 1)
+        B_1 = 2 * np.pi / (shininess + 2)
+        B_2 = np.pi * (3/(shininess + 3)-1/(shininess + 1))
+        norm = (shininess + 2) / (2 * np.pi)
+        B = np.array([B_0,
+                      B_1, B_1, B_1,
+                      B_2, B_2, B_2, B_2, B_2]) * norm
+        return np.maximum((B * Y) @ L, 0.0)

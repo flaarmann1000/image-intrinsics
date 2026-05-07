@@ -18,20 +18,20 @@ from raw_renderer import (
 from raw_renderer_gpu import render
 
 mesh = generate_mesh("sphere")
-cam  = Camera(
+cam = Camera(
     position=np.array([0.0, 0.0, 3.0], dtype=np.float32),
-    target  =np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    target=np.array([0.0, 0.0, 0.0], dtype=np.float32),
 )
 
 # ── Lights ────────────────────────────────────────────────────────────────────
 pt_light = PointLight(
     position=np.array([2.0, 0.0, 2.0], dtype=np.float32),
-    color   =np.array([1.0, 0.9, 0.8], dtype=np.float32),
+    color=np.array([1.0, 0.9, 0.8], dtype=np.float32),
 )
 
 sh_light = SHLighting.directional(
     direction=np.array([1.0, 0.0, 1.0]),
-    color    =np.array([1.0, 0.9, 0.8], dtype=np.float32),
+    color=np.array([1.0, 0.9, 0.8], dtype=np.float32),
     intensity=1.0,
 )
 
@@ -48,18 +48,18 @@ Image.fromarray(
 # ── Phong ─────────────────────────────────────────────────────────────────────
 phong_mat = PhongMaterial(
     base_color=np.array([0.5, 0.6, 0.9], dtype=np.float32),
-    shininess=64.0, ka=0.05, kd=0.8, ks=0.3,
+    shininess=64.0, ka=0.00, kd=0.8, ks=0.3,
 )
 
 t0 = time.perf_counter()
 render(mesh, cam, phong_mat, pt_light,
-       smooth=True, width=512, height=512,
+       smooth=True, width=256, height=256,
        output_path=out + "phong_point.png")
 print(f"  phong+point  : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
 t0 = time.perf_counter()
 render(mesh, cam, phong_mat, sh_light,
-       smooth=True, width=512, height=512,
+       smooth=True, width=256, height=256,
        output_path=out + "phong_sh.png")
 print(f"  phong+sh     : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
@@ -71,20 +71,20 @@ print(f"  phong+envmap : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
 # ── Cook-Torrance ─────────────────────────────────────────────────────────────
 pbr_mat = PBRMaterial(
-    albedo   =np.array([0.5, 0.6, 0.9], dtype=np.float32),
-    roughness=0.2,
-    metallic =0.0,
+    albedo=np.array([0.5, 0.6, 0.9], dtype=np.float32),
+    roughness=0.25,
+    metallic=0.0,
 )
 
 t0 = time.perf_counter()
 render(mesh, cam, pbr_mat, pt_light,
-       smooth=True, width=512, height=512,
+       smooth=True, width=256, height=256,
        output_path=out + "ct_point.png")
 print(f"  CT+point     : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
 t0 = time.perf_counter()
 render(mesh, cam, pbr_mat, sh_light,
-       smooth=True, width=512, height=512,
+       smooth=True, width=256, height=256,
        output_path=out + "ct_sh.png")
 print(f"  CT+sh        : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
