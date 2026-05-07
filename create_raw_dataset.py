@@ -36,7 +36,7 @@ from raw_renderer import (
     PointLight, SHLighting, generate_mesh, render,
 )
 from raw_renderer.mesh import Mesh
-from raw_renderer.shaders.phong         import phong_shader
+from raw_renderer.shaders.phong import phong_shader
 from raw_renderer.shaders.cook_torrance import cook_torrance_shader
 
 
@@ -44,18 +44,18 @@ from raw_renderer.shaders.cook_torrance import cook_torrance_shader
 
 _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw_dataset")
 _W, _H = 200, 200
-_CAM   = Camera(
+_CAM = Camera(
     position=np.array([0.0, 0.0, 3.0], dtype=np.float32),
-    target  =np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    target=np.array([0.0, 0.0, 0.0], dtype=np.float32),
 )
 
 # Unique per-object mask colours (background = [0, 0, 0])
 _OBJECT_COLORS = [
     [255,   0,   0],   # object 0 → red
-    [  0, 255,   0],   # object 1 → green
-    [  0,   0, 255],   # object 2 → blue
+    [0, 255,   0],   # object 1 → green
+    [0,   0, 255],   # object 2 → blue
     [255, 255,   0],   # object 3 → yellow
-    [  0, 255, 255],   # object 4 → cyan
+    [0, 255, 255],   # object 4 → cyan
     [255,   0, 255],   # object 5 → magenta
 ]
 
@@ -65,10 +65,10 @@ _OBJECT_COLORS = [
 def _sphere_mesh(radius: float, position: np.ndarray, n_lat=24, n_lon=48) -> Mesh:
     base = generate_mesh("sphere", n_lat=n_lat, n_lon=n_lon)
     return Mesh(
-        vertices      = base.vertices * radius + position,
-        faces         = base.faces,
-        normals       = base.normals,
-        vertex_normals= base.vertex_normals,
+        vertices=base.vertices * radius + position,
+        faces=base.faces,
+        normals=base.normals,
+        vertex_normals=base.vertex_normals,
     )
 
 
@@ -83,10 +83,10 @@ def _merge_meshes(meshes: list) -> Mesh:
         all_vn.append(m.vertex_normals)
         V_offset += len(m.vertices)
     return Mesh(
-        vertices      = np.concatenate(all_verts),
-        faces         = np.concatenate(all_faces),
-        normals       = np.concatenate(all_normals),
-        vertex_normals= np.concatenate(all_vn),
+        vertices=np.concatenate(all_verts),
+        faces=np.concatenate(all_faces),
+        normals=np.concatenate(all_normals),
+        vertex_normals=np.concatenate(all_vn),
     )
 
 
@@ -95,6 +95,7 @@ def _merge_meshes(meshes: list) -> Mesh:
 def _make_albedo_shader(positions: list, albedos: list):
     pos_arr = [np.asarray(p, dtype=np.float32) for p in positions]
     alb_arr = [np.asarray(a, dtype=np.float32) for a in albedos]
+
     def shader(frag_pos, normal, cam_pos):
         idx = int(np.argmin([np.linalg.norm(frag_pos - p) for p in pos_arr]))
         return alb_arr[idx]
@@ -103,8 +104,9 @@ def _make_albedo_shader(positions: list, albedos: list):
 
 def _make_object_id_shader(positions: list, mask_colors: list):
     """Returns the object's mask colour (normalised to [0,1]) per fragment."""
-    pos_arr    = [np.asarray(p, dtype=np.float32) for p in positions]
-    colors_f   = [np.array(c, dtype=np.float32) / 255.0 for c in mask_colors]
+    pos_arr = [np.asarray(p, dtype=np.float32) for p in positions]
+    colors_f = [np.array(c, dtype=np.float32) / 255.0 for c in mask_colors]
+
     def shader(frag_pos, normal, cam_pos):
         idx = int(np.argmin([np.linalg.norm(frag_pos - p) for p in pos_arr]))
         return colors_f[idx]
@@ -112,8 +114,9 @@ def _make_object_id_shader(positions: list, mask_colors: list):
 
 
 def _make_multi_shader(positions: list, mats: list, light, shader_type: str):
-    pos_arr  = [np.asarray(p, dtype=np.float32) for p in positions]
+    pos_arr = [np.asarray(p, dtype=np.float32) for p in positions]
     shade_fn = phong_shader if shader_type == "phong" else cook_torrance_shader
+
     def shader(frag_pos, normal, cam_pos):
         idx = int(np.argmin([np.linalg.norm(frag_pos - p) for p in pos_arr]))
         return shade_fn(frag_pos, normal, cam_pos, mats[idx], light)
@@ -165,11 +168,11 @@ def _rand_sh_coeffs(rng) -> np.ndarray:
                stays positive on front-facing surfaces.
     """
     coeffs = np.zeros((9, 3), dtype=np.float32)
-    color     = _rand_color(rng)
+    color = _rand_color(rng)
     intensity = float(rng.uniform(0.5, 2.0))
     coeffs[0] = color * intensity                                    # ambient
-    scale1    = 0.5 * intensity
-    scale2    = 0.3 * intensity
+    scale1 = 0.5 * intensity
+    scale2 = 0.3 * intensity
     coeffs[1:4] = rng.uniform(-scale1, scale1, (3, 3)).astype(np.float32)
     coeffs[4:9] = rng.uniform(-scale2, scale2, (5, 3)).astype(np.float32)
     return coeffs
@@ -215,7 +218,7 @@ def _build_light(cfg: dict, light_type: str):
         p = cfg["point"]
         return PointLight(
             position=np.array(p["position"], dtype=np.float32),
-            color   =np.array(p["color"],    dtype=np.float32),
+            color=np.array(p["color"],    dtype=np.float32),
         )
     if light_type == "sh":
         return SHLighting(np.array(cfg["sh"]["coeffs"], dtype=np.float32))
@@ -223,7 +226,7 @@ def _build_light(cfg: dict, light_type: str):
         e = cfg["envmap"]
         return EnvMap.point_like(
             direction=np.array(e["direction"], dtype=np.float32),
-            color    =tuple(e["color"]),
+            color=tuple(e["color"]),
         )
     raise ValueError(f"Unknown light type: {light_type!r}")
 
@@ -239,8 +242,8 @@ def _build_material(obj: dict, shader: str):
     if shader == "ct":
         c = obj["ct"]
         return PBRMaterial(
-            albedo   =albedo,
-            metallic =c["metallic"],
+            albedo=albedo,
+            metallic=c["metallic"],
             roughness=c["roughness"],
         )
     raise ValueError(f"Unknown shader: {shader!r}")
@@ -263,13 +266,13 @@ def create_scenes(n_scenes: int = 1, seed: int = 42) -> None:
 
     for i in range(n_scenes):
         scene_id = f"scene_{i:04d}"
-        out_dir  = os.path.join(_ROOT, "raw", scene_id)
+        out_dir = os.path.join(_ROOT, "raw", scene_id)
         os.makedirs(out_dir, exist_ok=True)
 
         albedo_a, albedo_b = _rand_distinct_albedos(rng)
         objs = []
         for side_idx, (side, albedo) in enumerate(zip((-1, +1), (albedo_a, albedo_b))):
-            radius   = float(rng.uniform(0.15, 0.30))
+            radius = float(rng.uniform(0.4, 0.80))
             offset_x = float(rng.uniform(0.35, 0.50))
             position = np.array([
                 side * offset_x + rng.uniform(-0.05, 0.05),
@@ -285,11 +288,14 @@ def create_scenes(n_scenes: int = 1, seed: int = 42) -> None:
                 "ct":         _rand_ct_params(rng),
             })
 
-        meshes       = [_sphere_mesh(o["radius"], np.array(o["position"], dtype=np.float32)) for o in objs]
-        combined     = _merge_meshes(meshes)
-        positions_3d = [np.array(o["position"],   dtype=np.float32) for o in objs]
-        albedos_3d   = [np.array(o["albedo"],      dtype=np.float32) for o in objs]
-        mask_colors  = [o["mask_color"] for o in objs]
+        meshes = [_sphere_mesh(o["radius"], np.array(
+            o["position"], dtype=np.float32)) for o in objs]
+        combined = _merge_meshes(meshes)
+        positions_3d = [np.array(o["position"],   dtype=np.float32)
+                        for o in objs]
+        albedos_3d = [np.array(o["albedo"],      dtype=np.float32)
+                      for o in objs]
+        mask_colors = [o["mask_color"] for o in objs]
 
         render(combined, _CAM,
                lambda p, n, c: (n * 0.5 + 0.5).astype(np.float32),
@@ -329,7 +335,7 @@ def render_scenes() -> None:
 
     Output: raw_dataset/rendered/<shader>/<lighting>/<scene_id>/variant_<k>.png
     """
-    raw_root  = os.path.join(_ROOT, "raw")
+    raw_root = os.path.join(_ROOT, "raw")
     scene_ids = sorted(
         d for d in os.listdir(raw_root)
         if os.path.isdir(os.path.join(raw_root, d))
@@ -339,21 +345,24 @@ def render_scenes() -> None:
         with open(os.path.join(raw_root, scene_id, "params.json")) as f:
             cfg = json.load(f)
 
-        objs         = cfg["objects"]
-        meshes       = [_sphere_mesh(o["radius"], np.array(o["position"], dtype=np.float32)) for o in objs]
-        combined     = _merge_meshes(meshes)
-        positions_3d = [np.array(o["position"], dtype=np.float32) for o in objs]
+        objs = cfg["objects"]
+        meshes = [_sphere_mesh(o["radius"], np.array(
+            o["position"], dtype=np.float32)) for o in objs]
+        combined = _merge_meshes(meshes)
+        positions_3d = [np.array(o["position"], dtype=np.float32)
+                        for o in objs]
 
         for shader in ("phong", "ct"):
             mats = [_build_material(o, shader) for o in objs]
 
             for light_type in ("point", "sh", "envmap"):
-                out_dir = os.path.join(_ROOT, "rendered", shader, light_type, scene_id)
+                out_dir = os.path.join(
+                    _ROOT, "rendered", shader, light_type, scene_id)
                 os.makedirs(out_dir, exist_ok=True)
 
                 for k, light_cfg in enumerate(cfg["lighting"]):
                     light = _build_light(light_cfg, light_type)
-                    fn    = _make_multi_shader(positions_3d, mats, light, shader)
+                    fn = _make_multi_shader(positions_3d, mats, light, shader)
 
                     render(combined, _CAM, fn,
                            smooth=True, width=_W, height=_H,
@@ -374,7 +383,7 @@ def create_tiny_raw(seed: int = 0) -> None:
         albedo_tiny.png — 18 pixels, 18 unique random albedo colors
     Normals encoded as (N*0.5+0.5)*255 uint8.
     """
-    rng     = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed)
     out_dir = os.path.join(_ROOT, "raw_tiny")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -393,8 +402,10 @@ def create_tiny_raw(seed: int = 0) -> None:
         encoded = ((normals * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
         return encoded.reshape(3, 6, 3)
 
-    Image.fromarray(_make_normal_img(8)).save(os.path.join(out_dir, "normals_a.png"))
-    Image.fromarray(_make_normal_img(9)).save(os.path.join(out_dir, "normals_b.png"))
+    Image.fromarray(_make_normal_img(8)).save(
+        os.path.join(out_dir, "normals_a.png"))
+    Image.fromarray(_make_normal_img(9)).save(
+        os.path.join(out_dir, "normals_b.png"))
     print(f"Tiny raw data → {out_dir}")
 
 
@@ -408,23 +419,25 @@ def render_tiny(seed: int = 0) -> None:
 
     Output: raw_dataset/rendered_tiny/<normals_a|b>_variant_<k>.png
     """
-    rng     = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed)
     raw_dir = os.path.join(_ROOT, "raw_tiny")
     out_dir = os.path.join(_ROOT, "rendered_tiny")
     os.makedirs(out_dir, exist_ok=True)
 
     albedo_flat = (
-        np.array(Image.open(os.path.join(raw_dir, "albedo_tiny.png")), dtype=np.float32) / 255.0
+        np.array(Image.open(os.path.join(raw_dir, "albedo_tiny.png")),
+                 dtype=np.float32) / 255.0
     ).reshape(18, 3)
 
     lights = [SHLighting(_rand_sh_coeffs(rng)) for _ in range(10)]
 
     frag_pos = np.zeros(3, dtype=np.float32)
-    cam_pos  = _CAM.position
+    cam_pos = _CAM.position
 
     for normal_name in ("normals_a", "normals_b"):
         normals_raw = (
-            np.array(Image.open(os.path.join(raw_dir, f"{normal_name}.png")), dtype=np.float32) / 255.0
+            np.array(Image.open(os.path.join(
+                raw_dir, f"{normal_name}.png")), dtype=np.float32) / 255.0
         ).reshape(18, 3) * 2.0 - 1.0
 
         lengths = np.linalg.norm(normals_raw, axis=1, keepdims=True)
@@ -433,10 +446,13 @@ def render_tiny(seed: int = 0) -> None:
         for k, light in enumerate(lights):
             pixels = np.zeros((18, 3), dtype=np.float32)
             for idx in range(18):
-                mat = PBRMaterial(albedo=albedo_flat[idx], metallic=0.0, roughness=0.0)
-                pixels[idx] = cook_torrance_shader(frag_pos, normals[idx], cam_pos, mat, light)
+                mat = PBRMaterial(
+                    albedo=albedo_flat[idx], metallic=0.0, roughness=0.0)
+                pixels[idx] = cook_torrance_shader(
+                    frag_pos, normals[idx], cam_pos, mat, light)
 
-            out_path = os.path.join(out_dir, f"{normal_name}_variant_{k:02d}.png")
+            out_path = os.path.join(
+                out_dir, f"{normal_name}_variant_{k:02d}.png")
             Image.fromarray(
                 (pixels.reshape(3, 6, 3) * 255).clip(0, 255).astype(np.uint8)
             ).save(out_path)
@@ -446,7 +462,11 @@ def render_tiny(seed: int = 0) -> None:
 # ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== create_scenes ===");  create_scenes(n_scenes=1)
-    print("=== render_scenes ===");  render_scenes()
-    print("=== create_tiny_raw ==="); create_tiny_raw()
-    print("=== render_tiny ===");    render_tiny()
+    print("=== create_scenes ===")
+    create_scenes(n_scenes=1)
+    print("=== render_scenes ===")
+    render_scenes()
+    print("=== create_tiny_raw ===")
+    create_tiny_raw()
+    print("=== render_tiny ===")
+    render_tiny()

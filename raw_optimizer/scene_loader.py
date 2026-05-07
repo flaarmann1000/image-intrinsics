@@ -30,7 +30,7 @@ _DATASET_ROOT = os.path.join(
 
 _DEFAULT_CAM = Camera(
     position=np.array([0.0, 0.0, 3.0], dtype=np.float32),
-    target  =np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    target=np.array([0.0, 0.0, 0.0], dtype=np.float32),
 )
 
 
@@ -52,10 +52,10 @@ def _sphere_mesh(radius: float, position: np.ndarray,
                  n_lat: int = 24, n_lon: int = 48) -> Mesh:
     base = generate_mesh("sphere", n_lat=n_lat, n_lon=n_lon)
     return Mesh(
-        vertices      = base.vertices * radius + position,
-        faces         = base.faces,
-        normals       = base.normals,
-        vertex_normals= base.vertex_normals,
+        vertices=base.vertices * radius + position,
+        faces=base.faces,
+        normals=base.normals,
+        vertex_normals=base.vertex_normals,
     )
 
 
@@ -69,10 +69,10 @@ def _merge_meshes(meshes: list) -> Mesh:
         all_vn.append(m.vertex_normals)
         V_offset += len(m.vertices)
     return Mesh(
-        vertices      = np.concatenate(all_verts),
-        faces         = np.concatenate(all_faces),
-        normals       = np.concatenate(all_normals),
-        vertex_normals= np.concatenate(all_vn),
+        vertices=np.concatenate(all_verts),
+        faces=np.concatenate(all_faces),
+        normals=np.concatenate(all_normals),
+        vertex_normals=np.concatenate(all_vn),
     )
 
 
@@ -88,7 +88,7 @@ def _decode_object_mask(mask_img: np.ndarray, objects: list) -> np.ndarray:
     obj_mask = np.full((H, W), -1, dtype=np.int8)
     for i, obj in enumerate(objects):
         color = np.array(obj["mask_color"], dtype=np.uint8)
-        hit   = np.all(mask_img == color[None, None, :], axis=-1)
+        hit = np.all(mask_img == color[None, None, :], axis=-1)
         obj_mask[hit] = i
     return obj_mask
 
@@ -145,7 +145,8 @@ def load_scene(
 
     # ── Rendered input images ─────────────────────────────────────────────────
     rendered_dir = os.path.join(
-        _DATASET_ROOT, "rendered", shader, light_type, scene_id
+        # _DATASET_ROOT, "rendered", shader, light_type, scene_id
+        _DATASET_ROOT, "rendered_gpu", shader, light_type, scene_id
     )
     images = [
         _load_png_float(os.path.join(rendered_dir, f"variant_{k:02d}.png"))
@@ -153,7 +154,7 @@ def load_scene(
     ]
 
     # ── Geometry ──────────────────────────────────────────────────────────────
-    objs   = params["objects"]
+    objs = params["objects"]
     meshes = [
         _sphere_mesh(o["radius"], np.array(o["position"], dtype=np.float32))
         for o in objs
@@ -169,17 +170,18 @@ def load_scene(
         normals_img = np.array(
             Image.open(os.path.join(raw_dir, "normal_map.png")).convert("RGB")
         )
-        normals  = _decode_normals(normals_img)
+        normals = _decode_normals(normals_img)
         mask_raw = np.array(
             Image.open(os.path.join(raw_dir, "mask.png")).convert("RGB")
         )
         # Foreground = any non-black pixel
-        mask     = np.any(mask_raw > 0, axis=-1)
+        mask = np.any(mask_raw > 0, axis=-1)
         frag_pos = None
-        cam_pos  = None
+        cam_pos = None
 
     # ── Colour-ID mask ────────────────────────────────────────────────────────
-    mask_img    = np.array(Image.open(os.path.join(raw_dir, "mask.png")).convert("RGB"))
+    mask_img = np.array(Image.open(
+        os.path.join(raw_dir, "mask.png")).convert("RGB"))
     object_mask = _decode_object_mask(mask_img, objs)   # [H,W] int8, -1=bg
 
     # Binary foreground mask (used by optimizer)
@@ -190,7 +192,8 @@ def load_scene(
         mask = object_mask >= 0   # ndarray bool
 
     # ── Ground-truth maps ─────────────────────────────────────────────────────
-    gt_albedo = _load_png_float(os.path.join(raw_dir, "albedo_map.png"))  # [H,W,3]
+    gt_albedo = _load_png_float(os.path.join(
+        raw_dir, "albedo_map.png"))  # [H,W,3]
 
     # ── Ground-truth SH coefficients ─────────────────────────────────────────
     gt_sh_coeffs = [
@@ -199,14 +202,14 @@ def load_scene(
     ]
 
     return dict(
-        images       = images,
-        normals      = normals,
-        frag_pos     = frag_pos,
-        cam_pos      = cam_pos,
-        mask         = mask,
-        object_mask  = object_mask,
-        gt_albedo    = gt_albedo,
-        gt_sh_coeffs = gt_sh_coeffs,
-        scene_id     = scene_id,
-        params       = params,
+        images=images,
+        normals=normals,
+        frag_pos=frag_pos,
+        cam_pos=cam_pos,
+        mask=mask,
+        object_mask=object_mask,
+        gt_albedo=gt_albedo,
+        gt_sh_coeffs=gt_sh_coeffs,
+        scene_id=scene_id,
+        params=params,
     )
