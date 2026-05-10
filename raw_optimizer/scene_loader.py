@@ -48,6 +48,11 @@ def _load_png_float(path: str) -> np.ndarray:
     return np.array(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
 
 
+def _load_png_int(path: str) -> np.ndarray:
+    """Load PNG [H,W,3] in [0,255]."""
+    return np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
+
+
 def _sphere_mesh(radius: float, position: np.ndarray,
                  n_lat: int = 24, n_lon: int = 48) -> Mesh:
     base = generate_mesh("sphere", n_lat=n_lat, n_lon=n_lon)
@@ -192,7 +197,7 @@ def load_scene(
         mask = object_mask >= 0   # ndarray bool
 
     # ── Ground-truth maps ─────────────────────────────────────────────────────
-    gt_albedo = _load_png_float(os.path.join(
+    gt_albedo = _load_png_int(os.path.join(
         raw_dir, "albedo_map.png"))  # [H,W,3]
 
     # ── Ground-truth SH coefficients ─────────────────────────────────────────

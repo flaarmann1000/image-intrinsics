@@ -15,12 +15,12 @@ import os
 import numpy as np
 from PIL import Image
 
-from .scene_loader import list_scenes, load_scene
-from .optimizer import optimize, optimize_tiny
+from scene_loader import list_scenes, load_scene
+from optimizer import optimize, optimize_tiny
 
 # ── Mode ─────────────────────────────────────────────────────────────────────
 
-MODE = "tiny"   # "scenes" | "tiny"
+MODE = "scenes"   # "scenes" | "tiny"
 
 # ── Scene dataset selection ───────────────────────────────────────────────────
 
@@ -46,7 +46,7 @@ TINY_N_VARIANTS = None                          # None → all 10
 CONFIGS = [
     {
         "name":           "no reg",
-        "n_iter":         2000,
+        "n_iter":         20000,
         "lr":             5e-3,
         "lambda_sparse":  0.0,
         "lambda_white":   0.0,
@@ -66,20 +66,27 @@ def _save_img(arr: np.ndarray, path: str) -> None:
     Image.fromarray((arr.clip(0, 1) * 255).astype(np.uint8)).save(path)
 
 
+def _save_img_u8(arr: np.ndarray, path: str) -> None:
+    """Save uint8 [H,W,3] in [0,255] as uint8 PNG."""
+    Image.fromarray(arr).save(path)
+
+
 def _albedo_rmse(est: np.ndarray, gt: np.ndarray,
-                 mask: np.ndarray, normalize_scale: bool = True) -> float:
+                 mask: np.ndarray, normalize_scale: bool = True) -> tuple[float, float]:
     """
     RMSE between estimated and GT albedo over foreground pixels.
 
-    est, gt : [H, W, 3] float32
+    est     : [H, W, 3] float32
+    gt      : [H, W, 3] uint8
     mask    : [H, W] bool
     normalize_scale : if True, rescale each channel of est by (mean_gt / mean_est)
         before computing RMSE, removing the per-channel scale ambiguity that arises
         when lambda_white = 0 (SH and albedo can only be recovered up to scale).
     """
     fg_mask = mask if isinstance(mask, np.ndarray) else mask.cpu().numpy()
-    fg_est = est[fg_mask]          # [N, 3]
+    fg_est = est[fg_mask] * 255   # [N, 3]
     fg_gt = gt[fg_mask]           # [N, 3]
+    scale = 1.0
 
     if normalize_scale:
         # scale = fg_gt.mean(0) / (fg_est.mean(0) + 1e-8)   # [3] per-channel
@@ -90,7 +97,9 @@ def _albedo_rmse(est: np.ndarray, gt: np.ndarray,
 
         print(f"normalized by scale: {scale}")
 
-    return float(np.sqrt(((fg_est - fg_gt) ** 2).mean()))
+    fg_est = (fg_est.clip(0, 1) * 255).astype(np.uint8)
+
+    return float(np.sqrt((((fg_est - fg_gt)/255) ** 2).mean())), scale
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -125,6 +134,8 @@ def run() -> None:
             print(f"  obj{oi}: albedo={np.array(o['albedo']).round(3)}  "
                   f"metallic={o['ct']['metallic']:.3f}  roughness={o['ct']['roughness']:.3f}")
         print(f"  images    : {len(scene['images'])} × {WIDTH}×{HEIGHT}")
+        print(
+            f"  mask ratio: {(scene['mask'].sum() / scene['mask'].size):.2%}")
 
         all_metrics[scene_id] = {}
 
@@ -149,11 +160,11 @@ def run() -> None:
             )
 
             # ── Metrics ───────────────────────────────────────────────────────
-            rmse = _albedo_rmse(albedo, scene["gt_albedo"], scene["mask"],
-                                normalize_scale=NORMALIZE_SCALE)
+            rmse, scale = _albedo_rmse(albedo, scene["gt_albedo"], scene["mask"],
+                                       normalize_scale=NORMALIZE_SCALE)
             print(
-                f"  albedo RMSE vs GT: {rmse:.4f}  (scale-norm={NORMALIZE_SCALE})")
-            print(f"  final loss: {history[-1]:.5f}")
+                f"  albedo RMSE vs GT: {rmse:.3e}  (scale-norm={NORMALIZE_SCALE})")
+            print(f"  final loss: {history[-1]:.3e}")
 
             all_metrics[scene_id][cfg_name] = {
                 "albedo_rmse":    rmse,
@@ -166,8 +177,8 @@ def run() -> None:
             out_dir = os.path.join(OUTPUT_DIR, scene_id, cfg_name)
             os.makedirs(out_dir, exist_ok=True)
 
-            _save_img(albedo, os.path.join(out_dir, "albedo_est.png"))
-            _save_img(scene["gt_albedo"], os.path.join(
+            _save_img(albedo*scale, os.path.join(out_dir, "albedo_est.png"))
+            _save_img_u8(scene["gt_albedo"], os.path.join(
                 out_dir, "albedo_gt.png"))
 
             np.save(os.path.join(out_dir, "sh_coeffs_est.npy"), sh_coeffs_out)

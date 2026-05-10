@@ -9,13 +9,14 @@ Run:
 import os
 import time
 import numpy as np
+import torch
 from PIL import Image
 
-from raw_renderer import (
-    Camera, EnvMap, PhongMaterial, PBRMaterial, PointLight, SHLighting,
-    generate_mesh,
+from raw_renderer import Camera, EnvMap, SHLighting, generate_mesh
+from raw_renderer_gpu import (
+    render,
+    SHLight, PBRMat, PhongMat, PointLightGPU, EnvMapLightGPU,
 )
-from raw_renderer_gpu import render
 
 mesh = generate_mesh("sphere")
 cam = Camera(
@@ -24,30 +25,36 @@ cam = Camera(
 )
 
 # ── Lights ────────────────────────────────────────────────────────────────────
-pt_light = PointLight(
-    position=np.array([2.0, 0.0, 2.0], dtype=np.float32),
-    color=np.array([1.0, 0.9, 0.8], dtype=np.float32),
+pt_light = PointLightGPU(
+    position=torch.tensor([2.0, 0.0, 2.0]),
+    color=torch.tensor([1.0, 0.9, 0.8]),
 )
 
-sh_light = SHLighting.directional(
+sh_raw = SHLighting.directional(
     direction=np.array([1.0, 0.0, 1.0]),
     color=np.array([1.0, 0.9, 0.8], dtype=np.float32),
     intensity=1.0,
 )
+sh_light = SHLight(coeffs=torch.from_numpy(sh_raw.coeffs))
 
-env_map = EnvMap.from_sh(sh_light)
+env_raw = EnvMap.from_sh(sh_raw)
+env_light = EnvMapLightGPU(
+    dirs=torch.from_numpy(env_raw._dirs),
+    image_flat=torch.from_numpy(env_raw._image_flat),
+    solid_angles=torch.from_numpy(env_raw._solid_angles),
+)
 
 out = "render_gpu/"
 os.makedirs(out, exist_ok=True)
 
 # Save the env map for reference
 Image.fromarray(
-    (env_map.image * 255).clip(0, 255).astype(np.uint8)
+    (env_raw.image * 255).clip(0, 255).astype(np.uint8)
 ).save(out + "env_map.png")
 
 # ── Phong ─────────────────────────────────────────────────────────────────────
-phong_mat = PhongMaterial(
-    base_color=np.array([0.5, 0.6, 0.9], dtype=np.float32),
+phong_mat = PhongMat(
+    base_color=torch.tensor([0.5, 0.6, 0.9]),
     shininess=64.0, ka=0.00, kd=0.8, ks=0.3,
 )
 
@@ -64,14 +71,14 @@ render(mesh, cam, phong_mat, sh_light,
 print(f"  phong+sh     : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
 t0 = time.perf_counter()
-render(mesh, cam, phong_mat, env_map,
+render(mesh, cam, phong_mat, env_light,
        smooth=True, width=256, height=256,
        output_path=out + "phong_envmap.png")
 print(f"  phong+envmap : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
 # ── Cook-Torrance ─────────────────────────────────────────────────────────────
-pbr_mat = PBRMaterial(
-    albedo=np.array([0.5, 0.6, 0.9], dtype=np.float32),
+pbr_mat = PBRMat(
+    albedo=torch.tensor([0.5, 0.6, 0.9]),
     roughness=0.25,
     metallic=0.0,
 )
@@ -89,7 +96,7 @@ render(mesh, cam, pbr_mat, sh_light,
 print(f"  CT+sh        : {(time.perf_counter()-t0)*1e3:.1f} ms")
 
 t0 = time.perf_counter()
-render(mesh, cam, pbr_mat, env_map,
+render(mesh, cam, pbr_mat, env_light,
        smooth=True, width=256, height=256,
        output_path=out + "ct_envmap.png")
 print(f"  CT+envmap    : {(time.perf_counter()-t0)*1e3:.1f} ms")
