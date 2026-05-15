@@ -1,4 +1,4 @@
-from raw_renderer_gpu import shade_ct_sh
+from raw_renderer_gpu import shade_phong_sh, shade_ct_sh
 import numpy as np
 from PIL import Image
 import torch
@@ -9,203 +9,253 @@ import wandb
 from copy import deepcopy
 from itertools import product
 
+from helper import _albedo_err_map, _albedo_rmse, _grad_to_img, _make_structured_normal_img, _mse, _rand_color, _rand_sh_coeffs, _shininess_to_img, _to_img, _uint8_compression
+
 DEFAULT_CFG = dict(
+    name="default",
+    device="cpu",
+    optimizer="LBFGS",
+    lr=1.0,
+    n_iter=3000,
+    log_every=500,
+    seed=1,
     N_imgs=10,
     H=3,
     W=6,
+    loss="L2",
     N_unique_normals=9,
-    use_sh0=True,
+    uint8_comp=False,
     z_min=0.0,
     z_max=1.0,
-    metallic=0.0,
     albedo_min=[1, 0, 0],
     albedo_max=[0, 0, 1],
-    loss="L2",
-    lr=5e-3,
-    name="default",
-    n_iter=100000,
-    log_every=10000,
-    seed=1,
+    lambda_white=0,
+    use_sh0=True,
+    lambda_SH0_0=0,
+    lambda_SH0_energy=0,
+    lambda_SH_energy=0,
+    exclude_sh0_0=False,
+    single_shininess=False,
+    # shader
+    shader="Phong",
+    # Phong
+    shininess_range=(16, 64),
+    opt_ks=False,
+    ka=0.00,
+    kd=1.00,
+    ks=0.00,
+    # Cook Torrance
+    metallic=0.0,
 )
 
 
 OVERRIDES = [
-    {"N_imgs": 2, "name": "2 images"},
-    {"H": 6, "W": 12, "name": "6x12 image"},
-    {"N_unique_normals": 8, "name": "8 unique normals"},
-    {"use_sh0": False, "name": "exclude SH0"},
-    {"z_min": 0.0, "z_max": 0.1, "name": "normals with z [0.0, 0.1]"},
-    {"z_min": 0.9, "z_max": 1.0, "name": "normals with z [0.9, 1.0]"},
-    {"albedo_min": [0.5, 0, 0], "albedo_max": [
-        0, 0, 0.5], "name": "reduced albedo range"},
-    {"loss": "L1", "name": "L1 loss"},
+    # {"name": "default (LBFGS-sw)"},
+    # {"optimizer": "ADAM", "lr": 5e-3, "n_iter": 100000,
+    #     "log_every": 10000, "name": "ADAM"},
+    # {"optimizer": "ADAM", "lr": 5e-3, "n_iter": 1000,
+    #     "log_every": 500, "kd": 0.8, "ks": 0.3,
+    #     "name": "opt specularity (ADAM)"},
+    # {"N_imgs": 2, "name": "2 images"},
+    # {"N_imgs": 20, "name": "20 images"},
+    # {"use_sh0": False, "name": "exclude SH0"},
+    # {"lambda_white": 0.1, "name": "regularize albedo"},
+    # {"lambda_SH_energy": 0.1, "name": "regularize SH"},
+    # {"loss": "L1", "name": "L1 loss"},
+    # {"H": 6, "W": 12, "name": "6x12 image"},
+    # {"N_unique_normals": 8, "name": "8 unique normals"},
+    # {"exclude_sh0_0": True, "name": "fix img0 SH0 to 1"},
+    # {"N_unique_normals": 4, "name": "4 unique normals"},
+    # {"N_unique_normals": 18, "name": "18 unique normals"},
+    # {"z_min": 0.0, "z_max": 0.1, "name": "normals with z [0.0, 0.1]"},
+    # {"z_min": 0.9, "z_max": 1.0, "name": "normals with z [0.9, 1.0]"},
+    # {"albedo_min": [0.5, 0, 0], "albedo_max": [
+    #     0, 0, 0.5], "name": "reduced albedo range"},
+    # {"uint8_comp": True, "name": "simulate uint8 compression"},
+    # {"lambda_SH0_energy": 0.1, "name": "regularize SH0"},
+    # {"lambda_SH0_0": 0.1, "name": "regularize 1st SH0 to 1"},
+    {"kd": 0.8, "ks": 0.3, "opt_ks": False,
+        "name": "opt specularity w/o ks"},
+    {"kd": 0.8, "ks": 0.3, "opt_ks": True,
+        "name": "opt specularity incl. ks"},
+    # {"kd": 0.8, "ks": 0.3, "single_shininess": True,
+    #     "name": "single-value specularity"},
+    # {"shader": "CT", "name": "CT shader"},
+
 ]
-
-device = "cuda"
-
-
-def _rand_sh_coeffs(rng, ambient=True):
-    """Random order-2 SH coefficients (9, 3) for plausible diffuse lighting."""
-    coeffs = np.zeros((9, 3), dtype=np.float32)
-    color = _rand_color(rng)
-    intensity = float(rng.uniform(0.5, 2.0))
-    if ambient:
-        coeffs[0] = color * intensity
-    scale1 = 0.5 * intensity
-    scale2 = 0.3 * intensity
-    coeffs[1:4] = rng.uniform(-scale1, scale1, (3, 3)).astype(np.float32)
-    coeffs[4:9] = rng.uniform(-scale2, scale2, (5, 3)).astype(np.float32)
-    return torch.from_numpy(coeffs)
-
-
-def _rand_surface_normal(rng) -> np.ndarray:
-    d = rng.standard_normal(3).astype(np.float32)
-    d[2] = abs(d[2])
-    return d / (np.linalg.norm(d) + 1e-8)
-
-
-def _rand_color(rng) -> np.ndarray:
-    c = rng.uniform(0.7, 1.0, 3).astype(np.float32)
-    if rng.random() > 0.5:
-        c[0] = min(1.0, c[0] * 1.15)
-    else:
-        c[2] = min(1.0, c[2] * 1.15)
-    return c
-
-
-def _make_rand_normal_img(n_unique: int) -> np.ndarray:
-    unique = np.stack([_rand_surface_normal(rng) for _ in range(n_unique)])
-    assign = rng.integers(0, n_unique, size=H*W)
-    for j in range(n_unique):
-        if j not in assign:
-            assign[rng.integers(0, H*W)] = j
-    normals = unique[assign]
-    # encoded = ((normals * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
-    # return encoded.reshape(3, 6, 3)
-    return normals
-
-
-def _make_structured_normal_img(n_unique: int, z_min=0.2, z_max=1.0, H=3, W=6):
-    """
-    Evenly sample n_unique normals on the upper hemisphere cap
-    with z in [z_min, z_max], then repeat until N_px.
-    """
-    z_min = float(np.clip(z_min, 0.0, 1.0))
-    z_max = float(np.clip(z_max, 0.0, 1.0))
-    i = np.arange(n_unique, dtype=np.float32)
-    z = np.linspace(z_max, z_min, n_unique, dtype=np.float32)
-    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
-    phi = i * golden_angle
-    r = np.sqrt(np.maximum(0.0, 1.0 - z**2))
-    x = r * np.cos(phi)
-    y = r * np.sin(phi)
-    unique = np.stack([x, y, z], axis=-1).astype(np.float32)
-    unique /= np.linalg.norm(unique, axis=1, keepdims=True).clip(min=1e-8)
-    reps = int(np.ceil(H*W / n_unique))
-    normals_px = np.tile(unique, (reps, 1))[:H*W]
-    return normals_px
-
-
-def _albedo_rmse(est, gt):
-    est = est.detach()
-    gt = gt.detach()
-    num = (gt * est).sum(0)
-    den = (est * est).sum(0).clamp_min(1e-8)
-    scale = num / den
-    est *= scale
-    return torch.sqrt(((gt - est)**2).mean())
-
-
-def _to_img(tensor, H, W):
-    return tensor.detach().reshape(H, W, 3).clamp(0, 1).cpu().numpy()
-
-
-def _albedo_err_map(gt, pred, H, W):
-    gt_img = _to_img(gt, H, W)
-    pred_img = _to_img(pred, H, W)
-    err_img = np.abs(gt_img - pred_img).mean(axis=-1)
-    max_err = err_img.max()
-    if max_err > 1e-8:
-        err_img = err_img / max_err
-    return (255 * err_img).clip(0, 255).astype(np.uint8)
-
-
-def _grad_to_img(grad, H, W):
-    g = grad.detach().reshape(H, W, 3).abs().cpu().numpy()
-    return g / (g.max() + 1e-8)
-
-
-def _mse(t1, t2):
-    return np.mean((t1.cpu().numpy() - t2.cpu().numpy())**2)
 
 
 def run_experiment(cfg):
+
+    device = cfg["device"]
+
+    # Create GT
+
+    H = cfg["H"]
+    W = cfg["W"]
+
     rng = np.random.default_rng(cfg["seed"])
     torch.manual_seed(cfg["seed"])
 
     albedo_min = torch.tensor(cfg["albedo_min"], dtype=torch.float32)
     albedo_max = torch.tensor(cfg["albedo_max"], dtype=torch.float32)
 
-    # Create GT
-
     # normals_np = _make_rand_normal_img(N_unique_normals)
     normals_np = _make_structured_normal_img(
-        cfg["N_unique_normals"], z_min=cfg["z_min"], z_max=cfg["z_max"], H=cfg["H"], W=cfg["W"])
+        cfg["N_unique_normals"], z_min=cfg["z_min"], z_max=cfg["z_max"], H=H, W=W)
     normals_np /= np.linalg.norm(normals_np, axis=1,
                                  keepdims=True).clip(min=1e-8)
     N_t = torch.tensor(normals_np, device=device)
 
     # albedo_gt = torch.rand(H*W, 3, dtype=torch.float32, device=device)
-    t = torch.linspace(0, 1, cfg["H"] * cfg["W"]).unsqueeze(-1)
+    t = torch.linspace(0, 1, H * W).unsqueeze(-1)
     albedo_gt = ((1 - t) * albedo_min +
                  t * albedo_max).to(device)
 
     coeffs_gt = torch.zeros(cfg["N_imgs"], 9, 3, device=device)
-    images = torch.zeros(cfg["N_imgs"], cfg["H"]*cfg["W"], 3, device=device)
+    images = torch.zeros(cfg["N_imgs"], H*W, 3, device=device)
+
+    min_s, max_s = cfg["shininess_range"]
+    if cfg["single_shininess"]:
+        shininess_gt = torch.full(
+            (albedo_gt.shape[0], 1), 48.0, dtype=albedo_gt.dtype, device=device)
+    else:
+        shininess_gt = torch.rand(H * W, 1,
+                                  dtype=torch.float32, device=device)*(max_s - min_s) + min_s
+    V_gt = _make_structured_normal_img(
+        n_unique=W*H, z_min=0.7, z_max=1, H=H, W=W)
+    V_gt /= np.linalg.norm(V_gt, axis=1,
+                           keepdims=True).clip(min=1e-8)
+
+    V_gt = torch.tensor(V_gt, device=device)
+
+    ks_gt = torch.rand(H * W, 1, dtype=torch.float32,
+                       device=device) * cfg["ks"]
+
+    if cfg["uint8_comp"]:
+        N_t = _uint8_compression(N_t*0.5 + 0.5) * 2.0 - 1.0
+        albedo_gt = _uint8_compression(albedo_gt)
 
     for i in range(cfg["N_imgs"]):
         coeffs_gt[i] = _rand_sh_coeffs(rng, ambient=cfg["use_sh0"])
-        images[i] = shade_ct_sh(
-            N_t, albedo_gt, coeffs_gt[i], metallic=cfg["metallic"])
+        images[i] = shade_phong_sh(V_gt, N_t, cfg["ka"], cfg["kd"], ks_gt, shininess_gt,
+                                   albedo_gt, coeffs_gt[i])
+
+    if cfg["uint8_comp"]:
+        images = _uint8_compression(images)
 
     # OPTIMIZATION
 
-    albedo_init = images.mean(0).clamp(0.05, 0.95)
-    albedo = albedo_init.clone().to(device).requires_grad_(True)
-
-    def _forward():
+    def _forward(sh_est, shininess):
         loss_data = albedo.new_zeros(())
         for k in range(cfg["N_imgs"]):
-            if cfg["use_sh0"]:
-                coeffs_k = sh_coeffs[k]
-            else:
-                coeffs_k = torch.zeros(9, 3, device=device)
-                coeffs_k[1:] = sh_coeffs_rest[k]
-            recon = shade_ct_sh(N_t, albedo, coeffs_k,
-                                metallic=cfg["metallic"])
+            coeffs_k = sh_est[k]
+            # recon = shade_ct_sh(N_t, albedo, coeffs_k,
+            #                     metallic=cfg["metallic"])
+            recon = shade_phong_sh(V_gt, N_t, cfg["ka"], cfg["kd"], ks_est, shininess,
+                                   albedo, coeffs_k)
+            if cfg["uint8_comp"]:
+                recon = _uint8_compression(recon)
             if cfg["loss"] == "L1":
                 diff = torch.abs(recon - images[k])
             else:
                 diff = (recon - images[k]) ** 2
             loss_data = loss_data + diff.mean()
 
-        # loss_sparse = lambda_sparse * _tv(log_albedo.permute(2, 0, 1))
-        # loss_white = lambda_white * (torch.exp(log_albedo).mean() - 0.5) ** 2
-        # return loss_data + loss_sparse + loss_white, loss_data, loss_sparse, loss_white
-        return loss_data
+        loss_data *= 1e6
+        loss_data = loss_data / cfg["N_imgs"]
+        loss_white = 0
+        loss_sh_energy = 0
+        loss_sh0_energy = 0
+        loss_sh0_0 = 0
+
+        if cfg["lambda_white"] > 0:
+            loss_white = cfg["lambda_white"] * (albedo.mean() - 0.5) ** 2
+        if cfg["lambda_SH_energy"] > 0:
+            loss_sh_energy = cfg["lambda_SH_energy"] * (sh_est ** 2).mean()
+        if cfg["lambda_SH0_energy"] > 0:
+            loss_sh0_energy = cfg["lambda_SH0_energy"] * \
+                (sh_est[:, 0, :] ** 2).mean()
+        if cfg["lambda_SH0_0"] > 0:
+            loss_sh0_0 = cfg["lambda_SH0_0"] * \
+                ((1 - sh_est[0, 0, :]) ** 2).mean()
+
+        summed_loss = loss_data + loss_white + \
+            loss_sh_energy + loss_sh0_energy + loss_sh0_0
+
+        return summed_loss, loss_data, loss_white, loss_sh_energy, loss_sh0_energy, loss_sh0_0
+
+    albedo_init = images.mean(0).clamp(0.05, 0.95)
+    albedo = albedo_init.clone().to(device).requires_grad_(True)
 
     sh_init = torch.zeros(cfg["N_imgs"], 9, 3, device=device)
-    if cfg["use_sh0"]:
-        sh_init[:, 0, :] = 1.5
-        sh_coeffs = sh_init.clone().to(device).requires_grad_(True)
-        opt = torch.optim.Adam([albedo, sh_coeffs], lr=cfg["lr"])
-    else:
+
+    shininess = shininess_gt.clone()
+
+    ks_est = ks_gt
+
+    optimizer = torch.optim.Adam
+    opt_params = {}
+    opt_params["lr"] = cfg["lr"]
+    if cfg["optimizer"] == "LBFGS":
+        optimizer = torch.optim.LBFGS
+        # opt_params["line_search_fn"] = "strong_wolfe"
+        opt_params = {
+            "lr": 1.0,
+            "max_iter": 50,
+            "tolerance_grad": 0,
+            "tolerance_change": 0,
+            "line_search_fn": "strong_wolfe",
+        }
+
+    if cfg["exclude_sh0_0"]:
+        sh_coeffs_0_0 = torch.tensor(
+            [[1, 1, 1]], dtype=torch.float32, device=device)
+        sh_coeffs_0 = sh_init[0, 1:, :].clone(
+        ).detach().requires_grad_(True)
+        sh_coeffs_rest = sh_init[1:, 0:, :].clone(
+        ).detach().requires_grad_(True)
+        params = [albedo, sh_coeffs_rest, sh_coeffs_0]
+    elif not cfg["use_sh0"]:
         sh_coeffs_rest = sh_init[:, 1:, :].clone(
         ).detach().requires_grad_(True)
-        opt = torch.optim.Adam([albedo, sh_coeffs_rest], lr=cfg["lr"])
+        params = [albedo, sh_coeffs_rest]
+    else:
+        sh_init[:, 0, :] = 1.5
+        sh_coeffs = sh_init.clone().to(device).requires_grad_(True)
+
+        if cfg["ks"] > 0:
+            if cfg["single_shininess"]:
+                s_min, s_max = cfg["shininess_range"]
+                shininess_val = torch.tensor(
+                    (s_max + s_min) / 2, device=device).requires_grad_(True)
+                shininess = shininess_val.expand_as(shininess_gt)
+                params = [albedo, sh_coeffs, shininess_val]
+            else:
+                # shininess = torch.full(
+                #     (albedo.shape[0], 1), 32.0, dtype=albedo.dtype, device=device).requires_grad_(True)
+
+                shininess_raw = torch.zeros(
+                    H * W, 1, device=device, requires_grad=True)
+                # albedo = albedo_gt.clone()
+                # sh_coeffs = coeffs_gt.clone()
+
+                # params = [albedo, sh_coeffs, shininess]
+                params = [albedo, sh_coeffs, shininess_raw]
+                if cfg["opt_ks"]:
+                    ks = torch.rand(H * W, 1, dtype=torch.float32,
+                                    device=device).requires_grad_(True)
+                    params.append(ks)
+                    ks_est = ks
+
+        else:
+            params = [albedo, sh_coeffs]
+
+    opt = optimizer(params, **opt_params)
 
     run = wandb.init(
-        entity="dlvc-image-intrinsics",
+        # entity="dlvc-image-intrinsics",
+        entity="DLVC-intrinsics",
         project="simple_sh_decomp",
         config=cfg,
         name=(cfg['name']),
@@ -213,58 +263,104 @@ def run_experiment(cfg):
     )
 
     run.log({
-        "gt_albedo": wandb.Image(_to_img(albedo_gt, cfg["H"], cfg["W"])),
-        "gt_normals": wandb.Image(_to_img(N_t / 2 + 0.5, cfg["H"], cfg["W"])),
+        "gt_albedo": wandb.Image(_to_img(albedo_gt, H, W)),
+        "gt_normals": wandb.Image(_to_img(N_t / 2 + 0.5, H, W)),
+        "gt_V": wandb.Image(_to_img(V_gt / 2 + 0.5, H, W)),
+        "gt_shininess": wandb.Image(_shininess_to_img(shininess_gt, H, W, cfg["shininess_range"])),
         "gt_sh": coeffs_gt,
+        "gt_ks": wandb.Image(_to_img(ks_gt, H, W)),
     }, step=0)
 
     # ── Optimisation loop ────────────────────────────────────────────────────
     loss_history = []
     albedo_history = []
+
+    def get_sh_coeffs():
+        sh_est = torch.zeros(cfg["N_imgs"], 9, 3, device=device)
+        if cfg["exclude_sh0_0"]:
+            sh0 = torch.cat([sh_coeffs_0_0, sh_coeffs_0], dim=0)
+            sh_est = torch.cat([sh0[None, ...], sh_coeffs_rest], dim=0)
+        elif cfg["use_sh0"]:
+            sh_est = sh_coeffs
+        else:
+            sh_est[:, 1:, :] = sh_coeffs_rest
+        return sh_est
+
     for i in range(cfg["n_iter"]):
-        opt.zero_grad()
-        loss = _forward()
-        loss.backward()
+
+        first_closure_call = [True]
+
+        def closure():
+            opt.zero_grad()
+            shininess = shininess_raw.sigmoid() * (max_s - min_s) + min_s
+
+            sh_est = get_sh_coeffs()
+            loss, *_ = _forward(sh_est, shininess)
+            loss.backward()
+            if first_closure_call[0] and i % cfg["log_every"] == 0:
+                print(
+                    f"iter {i}: first-call grad norm = {shininess_raw.grad.norm().item():.2e}")
+                first_closure_call[0] = False
+            return loss
+
+        loss = opt.step(closure)
 
         if i % cfg["log_every"] == 0:
             with torch.no_grad():
+                shininess_cur = shininess_raw.sigmoid() * (max_s - min_s) + min_s
                 grad_logs = {}
+                sh_est = get_sh_coeffs()
+                loss, loss_data, loss_white, loss_sh, loss_sh0, loss_sh0_0 = _forward(
+                    sh_est, shininess_cur)
+
                 if albedo.grad is not None:
                     grad_logs["grad/albedo_norm"] = albedo.grad.norm().item()
                     grad_logs["grad/albedo_abs_mean"] = albedo.grad.abs().mean().item()
-                if cfg["use_sh0"]:
+                if cfg["use_sh0"] and not cfg["exclude_sh0_0"]:
                     if sh_coeffs.grad is not None:
                         grad_logs["grad/sh_norm"] = sh_coeffs.grad.norm().item()
                         grad_logs["grad/sh_abs_mean"] = sh_coeffs.grad.abs().mean().item()
                 elif sh_coeffs_rest.grad is not None:
-                    grad_logs["grad/sh_norm"] = sh_coeffs_rest.grad.norm().item()
-                    grad_logs["grad/sh_abs_mean"] = sh_coeffs_rest.grad.abs().mean().item()
+                    grad_logs["grad/sh_rest_norm"] = sh_coeffs_rest.grad.norm().item()
+                    grad_logs["grad/sh_rest_abs_mean"] = sh_coeffs_rest.grad.abs().mean().item()
 
-                albedo_error = _albedo_rmse(albedo, albedo_gt)
+                albedo_error, scale = _albedo_rmse(albedo, albedo_gt)
                 loss_history.append(loss.item())
                 albedo_history.append(albedo_error.item())
 
                 print(
                     f"[{i:4d}] total={loss.item():.2e}   albedo_error: {albedo_error:.2e}")
 
-                run.log({
-                    "iter": i,
-                    "loss": loss.item(),
-                    "albedo_error": albedo_error.item(),
-                    "sh_error": _mse(sh_coeffs.detach(), coeffs_gt) if cfg["use_sh0"] else _mse(sh_coeffs_rest.detach(), coeffs_gt[:, 1:, :]),
-                    "pred_albedo": wandb.Image(_to_img(albedo, cfg["H"], cfg["W"])),
-                    "albedo_err_map": wandb.Image(_albedo_err_map(albedo_gt, albedo, cfg["H"], cfg["W"])),
-                    "albedo_grad_map": wandb.Image(_grad_to_img(albedo.grad, cfg["H"], cfg["W"])),
-                    "pred_sh": (
-                        sh_coeffs.detach().cpu().numpy()
-                        if cfg["use_sh0"]
-                        else sh_coeffs_rest.detach().cpu().numpy()
-                    ),
-                    **grad_logs,
-                }, step=i)
-
-        opt.step()
-
+                run.log(
+                    {
+                        "iter": i,
+                        "loss": loss.item(),
+                        "loss_data": loss_data,
+                        "loss_white": loss_white,
+                        "loss_sh": loss_sh,
+                        "loss_sh0": loss_sh0,
+                        "loss_sh0_0": loss_sh0_0,
+                        "albedo_error": albedo_error.item(),
+                        "albedo_scale": scale,
+                        "sh_error": _mse(sh_est.detach(), coeffs_gt*scale.view(1, 1, 3)),
+                        "pred_albedo": wandb.Image(_to_img(albedo, H, W)),
+                        "pred_ks": wandb.Image(_to_img(ks_est, H, W)),
+                        "pred_shininess": wandb.Image(_shininess_to_img(shininess_cur, H, W, cfg["shininess_range"])),
+                        "shininess_error": _mse(shininess_cur, shininess_gt),
+                        "albedo_err_map": wandb.Image(_albedo_err_map(albedo_gt, albedo, H, W)),
+                        "albedo_grad_map": wandb.Image(_grad_to_img(albedo.grad, H, W)) if albedo.grad is not None else None,
+                        "pred_sh": sh_est.detach().cpu().numpy(),
+                        **grad_logs,
+                        "shininess/min": shininess_cur.min().item(),
+                        "shininess/max": shininess_cur.max().item(),
+                        "shininess/mean": shininess_cur.mean().item(),
+                        "shininess/grad_norm": shininess_raw.grad.norm().item() if shininess_raw.grad is not None else 0,
+                        "ks/min": ks_est.min().item(),
+                        "ks/max": ks_est.max().item(),
+                        "ks/mean": ks_est.mean().item(),
+                        "ks/grad_norm": ks_est.grad.norm().item() if ks_est.grad is not None else 0,
+                    }, step=i
+                )
     run.finish()
 
 

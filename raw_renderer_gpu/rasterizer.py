@@ -222,9 +222,7 @@ def _sh_phong_filtered_radiance(coeffs_t, dirs, shininess):
     B_1 = 2 * torch.pi / (shininess + 2)
     B_2 = torch.pi * (3.0 / (shininess + 3) - 1.0 / (shininess + 1))
     norm = (shininess + 2) / (2 * torch.pi)
-    B = Y.new_tensor([B_0,
-                      B_1, B_1, B_1,
-                      B_2, B_2, B_2, B_2, B_2]) * norm
+    B = torch.cat([B_0, B_1, B_1, B_1, B_2, B_2, B_2, B_2, B_2], dim=-1) * norm
     return ((B * Y) @ coeffs_t).clamp(min=0)       # (..., 3)
 
 
@@ -283,15 +281,31 @@ def _phong_envmap(frag_pos, N, cam_pos, mat: PhongMat, light: EnvMapLightGPU, sb
     return (mat.ka*mean_rad*mat.base_color + mat.kd*diff*mat.base_color/torch.pi + mat.ks*spec*norm_f).clamp(0, 1)
 
 
-def _phong_sh(frag_pos, N, cam_pos, mat: PhongMat, light: SHLight):
-    irr = _sh_irradiance(light.coeffs, N)
-    diff = mat.kd * irr * mat.base_color / torch.pi
-    V = _norm(cam_pos - frag_pos)
-    NdV = (N*V).sum(1, keepdim=True).clamp(min=0)
-    R = _norm(2*NdV*N - V)
-    L_R = _sh_phong_filtered_radiance(light.coeffs, R, mat.shininess)
-    spec = mat.ks * L_R
-    return (diff + spec).clamp(0, 1)
+# def shade_phong_sh(frag_pos, N, cam_pos, mat: PhongMat, light: SHLight):
+#     irr = _sh_irradiance(light.coeffs, N)
+#     diff = mat.kd * irr * mat.base_color / torch.pi
+#     V = _norm(cam_pos - frag_pos)
+#     NdV = (N*V).sum(1, keepdim=True).clamp(min=0)
+#     R = _norm(2*NdV*N - V)
+#     L_R = _sh_phong_filtered_radiance(light.coeffs, R, mat.shininess)
+#     spec = mat.ks * L_R
+#     return (diff + spec).clamp(0, 1)
+
+
+def shade_phong_sh(V, N, ka, kd, ks, shininess, base_color, coeffs):
+    irr = _sh_irradiance(coeffs, N)
+    diff = kd * irr * base_color / torch.pi
+    # V = _norm(cam_pos - frag_pos)
+    if torch.any(ks > 0):
+        NdV = (N*V).sum(1, keepdim=True).clamp(min=0)
+        R = _norm(2*NdV*N - V)
+        L_R = _sh_phong_filtered_radiance(coeffs, R, shininess)
+        spec = ks * L_R
+        # return (diff + spec).clamp(0, 1)
+        return diff + spec
+    else:
+        # return (diff).clamp(0, 1)
+        return diff
 
 
 # ─────────────────────────────────────────── Cook-Torrance shaders ───────────
@@ -487,8 +501,9 @@ def render(
                 col = _phong_envmap(frag_pos, N, cam_t, mat,
                                     EnvMapLightGPU(_dev(light.dirs), _dev(light.image_flat), _dev(light.solid_angles)))
             elif isinstance(light, SHLight):
-                col = _phong_sh(frag_pos, N, cam_t, mat,
-                                SHLight(_dev(light.coeffs)))
+                # def shade_phong_sh(frag_pos, N, cam_pos, ka, kd, ks, shininess, base_color, coeffs):
+                col = shade_phong_sh(frag_pos, N, cam_t, mat.ka, mat.kd,
+                                     mat.ks, mat.shininess, mat.base_color, _dev(light.coeffs))
             else:
                 raise TypeError(type(light))
 
