@@ -7,11 +7,14 @@ Everything else (projection, interpolation, BRDF) is fully vectorised
 over all hit pixels at once.
 """
 
+from __future__ import annotations
+
 import numpy as np
 import torch
 from dataclasses import dataclass
 from PIL import Image
-from typing import Union
+from typing import Optional, Union
+from pathlib import Path
 
 
 # ─────────────────────────────────────────── tensor-based types ──────────────
@@ -218,6 +221,11 @@ def _sh_irradiance(coeffs_t, N):
 def _sh_phong_filtered_radiance(coeffs_t, dirs, shininess):
     """Phong-lobe SH filter — coeffs_t: (9,3); dirs: (...,3) → (...,3)"""
     Y = _sh_basis(dirs)
+    # accept plain float or 0-d tensor as well as per-pixel (..., 1) tensor
+    if not torch.is_tensor(shininess):
+        shininess = torch.tensor(shininess, dtype=Y.dtype, device=Y.device)
+    if shininess.dim() == 0:
+        shininess = shininess.unsqueeze(-1)   # → (1,), broadcasts over pixels
     B_0 = 2 * torch.pi / (shininess + 1)
     B_1 = 2 * torch.pi / (shininess + 2)
     B_2 = torch.pi * (3.0 / (shininess + 3) - 1.0 / (shininess + 1))
@@ -295,8 +303,8 @@ def _phong_envmap(frag_pos, N, cam_pos, mat: PhongMat, light: EnvMapLightGPU, sb
 def shade_phong_sh(V, N, ka, kd, ks, shininess, base_color, coeffs):
     irr = _sh_irradiance(coeffs, N)
     diff = kd * irr * base_color / torch.pi
-    # V = _norm(cam_pos - frag_pos)
-    if torch.any(ks > 0):
+    ks_pos = (ks > 0) if not torch.is_tensor(ks) else torch.any(ks > 0)
+    if ks_pos:
         NdV = (N*V).sum(1, keepdim=True).clamp(min=0)
         R = _norm(2*NdV*N - V)
         L_R = _sh_phong_filtered_radiance(coeffs, R, shininess)
@@ -340,66 +348,284 @@ def _ct_point(frag_pos, N, cam_pos, mat: PBRMat, light: PointLightGPU):
 
 def _ct_envmap(frag_pos, N, cam_pos, mat: PBRMat, light: EnvMapLightGPU, sbatch=64):
     F0 = _f0_mat(mat.albedo, mat.metallic)
-    alpha2 = mat.roughness**4
-    k = alpha2 / 2.0                              # IBL Smith k
+
+    roughness = max(float(mat.roughness), 0.12)
+    alpha2 = roughness ** 4
+    k = alpha2 / 2.0
+
     S = light.dirs.shape[0]
     V = _norm(cam_pos - frag_pos)
-    NdV = (N*V).sum(1).clamp(min=1e-4)           # (M,)
+    NdV = (N * V).sum(1).clamp(min=1e-4)
+
     spec = frag_pos.new_zeros(frag_pos.shape)
     diff_irr = frag_pos.new_zeros(frag_pos.shape)
     F_sum = frag_pos.new_zeros(frag_pos.shape)
     n_valid = frag_pos.new_zeros(frag_pos.shape[0])
+
     for si in range(0, S, sbatch):
-        L_b = light.dirs[si:si+sbatch]            # (B, 3)
-        r_b = light.image_flat[si:si+sbatch]
-        dw_b = light.solid_angles[si:si+sbatch]   # (B,)
-        NdL = N @ L_b.T                           # (M, B)
-        mask = (NdL > 1e-4)
+        L_b = light.dirs[si:si + sbatch]
+        r_b = light.image_flat[si:si + sbatch]
+        dw_b = light.solid_angles[si:si + sbatch]
+
+        NdL_raw = N @ L_b.T
+        mask = NdL_raw > 1e-4
         mf = mask.float()
-        NdV_e = NdV[:, None]                      # (M, 1)
-        LdV = V @ L_b.T                           # (M, B)
-        H_len = (2.0 + 2.0*LdV).clamp(min=1e-8).sqrt()
-        NdH = ((NdL + NdV_e) / H_len).clamp(0, 1)
+        NdL = NdL_raw.clamp(min=1e-4)
+
+        NdV_e = NdV[:, None]
+        LdV = V @ L_b.T
+
+        H_len = (2.0 + 2.0 * LdV).clamp(min=1e-8).sqrt()
+        NdH = ((NdL_raw + NdV_e) / H_len).clamp(0, 1)
         VdH = ((LdV + 1.0) / H_len).clamp(0, 1)
-        D = _ggx_D(NdH, alpha2)                   # (M, B)
-        F = _schlick_F(VdH, F0)                   # (M, B, 3)
-        G = _smith_G(NdV_e, NdL, k)               # (M, B)
-        w = (D*G*dw_b / (4*NdV_e + 1e-7)) * mf   # (M, B)
+
+        D = _ggx_D(NdH, alpha2)
+        F = _schlick_F(VdH, F0)
+        G = _smith_G(NdV_e, NdL, k)
+
+        w = (D * G * dw_b / (4 * NdV_e + 1e-7)) * mf
+
         spec += (F * w[:, :, None] * r_b).sum(1)
-        diff_irr += ((NdL*dw_b*mf) @ r_b)
+        diff_irr += ((NdL_raw.clamp(min=0) * dw_b * mf) @ r_b)
+
         F_sum += (F * mf[:, :, None]).sum(1)
         n_valid += mf.sum(1)
+
     F_mean = F_sum / n_valid[:, None].clamp(min=1)
     k_d = (1 - F_mean) * (1 - mat.metallic)
     diff = k_d * mat.albedo / torch.pi * diff_irr
+
     return (diff + spec).clamp(0, 1)
 
 
 # ─────────────────────────────────────────── public shading API ──────────────
 
-def shade_ct_sh(
-    normals:   torch.Tensor,                    # [..., 3] unit normals
-    # [..., 3] per-pixel albedo in [0, 1]
-    albedo:    torch.Tensor,
-    # [9, 3]  SH lighting coefficients
-    sh_coeffs: torch.Tensor,
-    metallic:  Union[float, torch.Tensor] = 0.0,
+# def shade_ct_sh(
+#     view: torch.Tensor,
+#     normals:   torch.Tensor,                    # [..., 3] unit normals
+#     # [..., 3] per-pixel albedo in [0, 1]
+#     albedo:    torch.Tensor,
+#     # [9, 3]  SH lighting coefficients
+#     sh_coeffs: torch.Tensor,
+#     metallic:  Union[float, torch.Tensor] = 0.0,
+#     roughness: Union[float, torch.Tensor] = 0.0,
+# ) -> torch.Tensor:
+#     """
+#     Differentiable Cook-Torrance + SH irradiance shading.
+
+#     All tensors must reside on the same device. Works on any leading batch
+#     dimensions (e.g. flat (M,3) or spatial (H,W,3)).
+#     Returns RGB in [0, 1] with the same leading shape as albedo.
+#     """
+#     irr = _sh_irradiance(sh_coeffs, normals)
+#     k_d = 1.0 - metallic
+
+#     return (k_d * albedo / torch.pi * irr)
+
+
+# ── LUT configuration ─────────────────────────────────────────────────────────
+
+_LUT_PATH = Path(__file__).parent / "ggx_sh_lut.npz"
+_LUT_N_ROUGH = 512    # roughness resolution (uniform grid over [0, 1])
+_LUT_N_THETA = 8192   # integration resolution
+
+_LUT_CACHE: Optional[torch.Tensor] = None   # shape (N, 3), in-memory cache
+
+
+# ── LUT computation ───────────────────────────────────────────────────────────
+
+def _compute_ggx_sh_lut(
+    n_roughness: int = _LUT_N_ROUGH,
+    n_theta:     int = _LUT_N_THETA,
+) -> np.ndarray:
+    """
+    Numerically integrate GGX zonal SH band weights for bands 0, 1, 2.
+
+    Kernel:   w(θ) = D_GGX(n·h = cos(θ/2), α)        ← no cos θ factor
+    Bands:    h_l = 2π ∫₀^{π/2} w(θ) P_l(cosθ) sinθ dθ
+    Stored:   raw h_l (no h_1 normalisation)
+
+    Limit:  α → 0  ⇒  D → δ  ⇒  ∫D dω_l = 4  ⇒  h_l = 4 for all l.
+    """
+
+    theta = np.linspace(0.0, np.pi / 2.0, n_theta, dtype=np.float64)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    cos_th2 = np.cos(theta / 2.0)**2
+
+    Pl = [
+        np.ones_like(cos_t),
+        cos_t,
+        0.5 * (3.0 * cos_t**2 - 1.0),
+    ]
+
+    lut = np.zeros((n_roughness, 3), dtype=np.float32)
+
+    for i in range(n_roughness):
+        r = float(i) / max(n_roughness - 1, 1)
+        a = r ** 2
+        a2 = a ** 2
+
+        if a2 < 1e-12:                       # delta limit
+            lut[i] = [4.0, 4.0, 4.0]
+            continue
+
+        D = a2 / (np.pi * (cos_th2 * (a2 - 1.0) + 1.0) ** 2)
+        # NO cos_t factor in the kernel
+        h = np.array([
+            2.0 * np.pi * np.trapezoid(D * p * sin_t, theta)
+            for p in Pl
+        ])
+        lut[i] = h                            # raw, unnormalised
+
+    return lut
+
+
+# ── LUT loading / caching ─────────────────────────────────────────────────────
+
+def _get_ggx_sh_lut(
+    device:     torch.device,
+    cache_path: Path = _LUT_PATH,
 ) -> torch.Tensor:
     """
-    Differentiable Cook-Torrance + SH irradiance shading.
+    Return the GGX SH LUT on `device`.
 
-    All tensors must reside on the same device. Works on any leading batch
-    dimensions (e.g. flat (M,3) or spatial (H,W,3)).
-    Returns RGB in [0, 1] with the same leading shape as albedo.
+    First call:  computes the LUT, saves it to `cache_path`, caches in memory.
+    Later calls: returns the in-memory tensor (moved to `device` if needed).
     """
-    irr = _sh_irradiance(sh_coeffs, normals)
-    k_d = 1.0 - metallic
-    # if ((k_d * albedo / torch.pi * irr) > 1.0).any():
-    #     print("clamped to < 1 ")
-    # elif ((k_d * albedo / torch.pi * irr) < 0).any():
-    #     print("clamped to > 0 ")
-    # return (k_d * albedo / torch.pi * irr).clamp(0.0, 1.0)
-    return (k_d * albedo / torch.pi * irr)
+    global _LUT_CACHE
+
+    if _LUT_CACHE is None:
+        if cache_path.exists():
+            data = np.load(cache_path)
+            _LUT_CACHE = torch.from_numpy(data["lut"])
+        else:
+            print("[ggx_sh] LUT not found — computing … ", end="", flush=True)
+            lut_np = _compute_ggx_sh_lut()
+            np.savez_compressed(cache_path, lut=lut_np)
+            _LUT_CACHE = torch.from_numpy(lut_np)
+            print(f"done  →  saved to {cache_path}")
+
+    return _LUT_CACHE.to(device)
+
+
+# ── LUT interpolation ─────────────────────────────────────────────────────────
+
+def _lut_lookup(lut: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
+    """
+    Differentiable linear interpolation into a uniform 1-D LUT.
+
+    Parameters
+    ----------
+    lut       : (N, C)   table indexed uniformly over roughness ∈ [0, 1]
+    roughness : (...)    values in [0, 1], any shape
+
+    Returns
+    -------
+    (..., C)  — gradients flow through `roughness` via the lerp weight `t`.
+    """
+    N = lut.shape[0]
+    idx_f = roughness.clamp(0.0, 1.0) * (N - 1)
+    idx_lo = idx_f.long().clamp(0, N - 2)              # integer, no grad needed
+    t = (idx_f - idx_lo.float()).unsqueeze(-1)     # (..., 1)  differentiable
+    return lut[idx_lo] + t * (lut[idx_lo + 1] - lut[idx_lo])  # (..., C)
+
+
+# ── GGX SH specular filter ────────────────────────────────────────────────────
+
+def _sh_ggx_filtered_radiance(
+    coeffs_t:  torch.Tensor,   # (9, 3)
+    dirs:      torch.Tensor,   # (..., 3)  unit reflection directions
+    roughness: torch.Tensor,   # (..., 1)  in [0, 1]
+    lut:       torch.Tensor,   # (N, 3)
+) -> torch.Tensor:
+    """
+    GGX-lobe SH filter — analogue of _sh_phong_filtered_radiance.
+
+    Convolves the SH-encoded environment with the GGX lobe centred on `dirs`,
+    with per-element width controlled by `roughness`.
+
+    Returns (..., 3), clamped to ≥ 0.
+    """
+    Y = _sh_basis(dirs)                          # (..., 9)
+    Bvals = _lut_lookup(lut, roughness.squeeze(-1))  # (..., 3)
+
+    B0 = Bvals[..., 0:1]   # h0/h1
+    B1 = Bvals[..., 1:2]   # 1  (always, kept explicit for clarity)
+    B2 = Bvals[..., 2:3]   # h2/h1
+
+    # Expand per-band scalar to all 9 SH coefficients
+    B = torch.cat([B0, B1, B1, B1, B2, B2, B2, B2, B2], dim=-1)  # (..., 9)
+
+    return ((B * Y) @ coeffs_t).clamp(min=0.0)   # (..., 3)
+
+
+# ── Main shader ───────────────────────────────────────────────────────────────
+
+def shade_ct_sh(
+    view:      torch.Tensor,
+    normals:   torch.Tensor,
+    albedo:    torch.Tensor,
+    sh_coeffs: torch.Tensor,
+    metallic:  Union[float, torch.Tensor] = 0.0,
+    roughness: Union[float, torch.Tensor] = 0.5,
+    lut:       Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Differentiable Cook-Torrance shading with SH-environment specular.
+
+    Parameters
+    ----------
+    view      : (..., 3)  unit view directions (camera → fragment, or reversed)
+    normals   : (..., 3)  unit surface normals
+    albedo    : (..., 3)  base colour in [0, 1]
+    sh_coeffs : (9, 3)    SH lighting coefficients
+    metallic  : scalar or (..., 1)  metallic factor in [0, 1]
+    roughness : scalar or (..., 1)  perceptual roughness in [0, 1]
+    lut       : optional pre-loaded GGX SH LUT; fetched/computed if None
+
+    Returns
+    -------
+    (..., 3)  shaded RGB
+    """
+    device = albedo.device
+
+    def _as_tensor(x: Union[float, torch.Tensor]) -> torch.Tensor:
+        if torch.is_tensor(x):
+            return x.to(device)
+        return torch.full(
+            albedo.shape[:-1] + (1,), float(x),
+            dtype=albedo.dtype, device=device,
+        )
+
+    roughness = _as_tensor(roughness)
+    metallic = _as_tensor(metallic)
+
+    if lut is None:
+        lut = _get_ggx_sh_lut(device)
+
+    # ── Fresnel-Schlick ───────────────────────────────────────────────────────
+    # F0: dielectrics reflect ~4%; metals reflect with their albedo tint
+    f0 = 0.04 * (1.0 - metallic) + albedo * metallic          # (..., 3)
+    NdotV = (normals * view).sum(-1, keepdim=True).clamp(min=0.0)  # (..., 1)
+    F = f0 + (1.0 - f0) * (1.0 - NdotV).pow(5)              # (..., 3)
+
+    # ── Smith G1 — view term  (IBL variant: k = α⁴/2) ────────────────────────
+    alpha = roughness ** 2                          # α = roughness²
+    k = alpha ** 2 / 2.0                        # k = α²/2
+    G1 = NdotV / (NdotV * (1.0 - k) + k + 1e-6)  # (..., 1)
+
+    # ── Diffuse (Lambertian, energy-conserving) ───────────────────────────────
+    irr = _sh_irradiance(sh_coeffs, normals)       # (..., 3)
+    k_d = (1.0 - F) * (1.0 - metallic)            # energy taken by specular
+    diff = k_d * albedo / torch.pi * irr
+
+    # ── Specular (GGX SH) ─────────────────────────────────────────────────────
+    R = _norm(2.0 * NdotV * normals - view)
+    L_spec = _sh_ggx_filtered_radiance(sh_coeffs, R, roughness, lut)
+    spec = F * G1 * L_spec / 4.0
+
+    return diff + spec
 
 
 # ─────────────────────────────────────────── geometry extraction ─────────────
@@ -502,7 +728,8 @@ def render(
                                     EnvMapLightGPU(_dev(light.dirs), _dev(light.image_flat), _dev(light.solid_angles)))
             elif isinstance(light, SHLight):
                 # def shade_phong_sh(frag_pos, N, cam_pos, ka, kd, ks, shininess, base_color, coeffs):
-                col = shade_phong_sh(frag_pos, N, cam_t, mat.ka, mat.kd,
+                V = _norm(cam_t - frag_pos)
+                col = shade_phong_sh(V, N, mat.ka, mat.kd,
                                      mat.ks, mat.shininess, mat.base_color, _dev(light.coeffs))
             else:
                 raise TypeError(type(light))
@@ -517,8 +744,9 @@ def render(
                 col = _ct_envmap(frag_pos, N, cam_t, mat,
                                  EnvMapLightGPU(_dev(light.dirs), _dev(light.image_flat), _dev(light.solid_angles)))
             elif isinstance(light, SHLight):
-                col = shade_ct_sh(N, _dev(material.albedo), _dev(
-                    light.coeffs), material.metallic)
+                V = _norm(cam_t - frag_pos)
+                col = shade_ct_sh(V, N, _dev(material.albedo), _dev(
+                    light.coeffs), material.metallic, material.roughness)
             else:
                 raise TypeError(type(light))
 
@@ -527,8 +755,6 @@ def render(
 
         fb[hit] = col
 
-    if (fb > 0).any():
-        print("clamped image")
     img_u8 = (fb.reshape(H, W, 3)*255).clamp(0, 255).byte().cpu().numpy()
     Image.fromarray(img_u8).save(output_path)
     print(f"Saved {output_path}  ({W}×{H})")

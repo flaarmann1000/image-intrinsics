@@ -38,6 +38,8 @@ sh_raw = SHLighting.directional(
 sh_light = SHLight(coeffs=torch.from_numpy(sh_raw.coeffs))
 
 env_raw = EnvMap.from_sh(sh_raw)
+# env_raw = EnvMap.point_like(direction=np.array(
+#     [1.0, 0.0, 1.0]), color=(100, 90, 80))
 env_light = EnvMapLightGPU(
     dirs=torch.from_numpy(env_raw._dirs),
     image_flat=torch.from_numpy(env_raw._image_flat),
@@ -79,8 +81,8 @@ print(f"  phong+envmap : {(time.perf_counter()-t0)*1e3:.1f} ms")
 # ── Cook-Torrance ─────────────────────────────────────────────────────────────
 pbr_mat = PBRMat(
     albedo=torch.tensor([0.5, 0.6, 0.9]),
-    roughness=0.25,
-    metallic=0.0,
+    roughness=0.3,
+    metallic=0.3,
 )
 
 t0 = time.perf_counter()
