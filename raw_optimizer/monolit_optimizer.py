@@ -39,6 +39,7 @@ DEFAULT_CFG = dict(
     lighting="Phong",
     # Phong
     shininess_range=(16, 64),
+    transform_shininess=False,
     opt_ks=False,
     ka=0.00,
     kd=1.00,
@@ -78,11 +79,16 @@ OVERRIDES = [
     #     "name": "opt specularity w/o ks"},
     # {"kd": 0.8, "ks": 0.3, "opt_ks": True,
     #     "name": "opt specularity incl. ks"},
+    # {"kd": 0.8, "ks": 0.3, "opt_ks": True, "transform_shininess": True,
+    #     "name": "opt specularity incl. ks (transformed shininess)"},
     # {"kd": 0.8, "ks": 0.3, "single_shininess": True,
     #     "name": "single-value specularity"},
-    {"lighting": "CT", "name": "CT lighting"},
-    {"lighting": "CT", "metallic_range": (0.25, 0.75),
-     "roughness_range": (0.25, 0.75), "name": "CT lighting - reduced ranges"},
+    # {"lighting": "CT", "name": "CT lighting"},
+    {"lighting": "CT", "name": "CT-RED: reduced albedo & z",
+     "albedo_min": [1, 0.5, 0.1], "albedo_max": [0.1, 0.5, 1],
+     "z_min": 0.3, },
+    # {"lighting": "CT", "metallic_range": (0.25, 0.75),
+    #  "roughness_range": (0.25, 0.75), "name": "CT lighting - reduced ranges"},
 
 ]
 
@@ -121,11 +127,14 @@ def run_experiment(cfg):
     coeffs_gt = torch.zeros(cfg["N_imgs"], 9, 3, device=device)
 
     V_gt = _make_structured_normal_img(
-        n_unique=W*H, z_min=0.7, z_max=1, H=H, W=W)
+        n_unique=W*H, z_min=0.9, z_max=1, H=H, W=W)
     V_gt /= np.linalg.norm(V_gt, axis=1,
                            keepdims=True).clip(min=1e-8)
 
     V_gt = torch.tensor(V_gt, device=device)
+
+    # V_gt = V_gt[torch.randperm(V_gt.shape[0], device=V_gt.device)]
+    V_gt = V_gt.flip(dims=[0])
 
     # phong
     min_s, max_s = cfg["shininess_range"]
@@ -160,7 +169,8 @@ def run_experiment(cfg):
         else:
             images[i] = shade_ct_sh(
                 V_gt, N_t, albedo_gt, coeffs_gt[i], metallic_gt, roughness_gt)
-
+            plt.imshow(_to_img(images[i], H, W))
+            plt.savefig(f"C:/Users/felix/Downloads/dlvc/ct/img{i}.png")
     if cfg["uint8_comp"]:
         images = _uint8_compression(images)
 
@@ -269,14 +279,18 @@ def run_experiment(cfg):
     # --- Specularity ---
     ks_est = ks_gt
     if cfg["lighting"] == "Phong" and cfg["ks"] > 0:
+        s_min, s_max = cfg["shininess_range"]
         if cfg["single_shininess"]:
-            s_min, s_max = cfg["shininess_range"]
             shininess_val = torch.tensor(
                 (s_max + s_min) / 2, device=device).requires_grad_(True)
             params["shininess_val"] = shininess_val
-        else:
+        elif cfg["transform_shininess"]:
             shininess_raw = torch.zeros(
-                H * W, 1, device=device, requires_grad=True)
+                (H*W, 1), device=device, requires_grad=True)
+            params["shininess_raw"] = shininess_raw
+        else:
+            shininess_raw = torch.full(
+                (H*W, 1), (s_max + s_min) / 2, device=device, requires_grad=True)
             params["shininess_raw"] = shininess_raw
         if cfg["opt_ks"]:
             ks = torch.rand(H * W, 1, dtype=torch.float32,
@@ -289,8 +303,10 @@ def run_experiment(cfg):
         if cfg["ks"] > 0:
             if cfg["single_shininess"]:
                 shininess_est = shininess_val.expand_as(shininess_gt)
-            else:
+            elif cfg["transform_shininess"]:
                 shininess_est = shininess_raw.sigmoid() * (max_s - min_s) + min_s
+            else:
+                shininess_est = shininess_raw
 
         return shininess_est
     # --- Cook Torrance ---
@@ -330,6 +346,7 @@ def run_experiment(cfg):
         "gt_normals": wandb.Image(_to_img(N_t / 2 + 0.5, H, W)),
         "gt_V": wandb.Image(_to_img(V_gt / 2 + 0.5, H, W)),
         "gt_sh": coeffs_gt,
+        "gt_images": [wandb.Image(_to_img(img, H, W)) for img in images],
         **lighting_gt
     }, step=0)
 

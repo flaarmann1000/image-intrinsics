@@ -5,9 +5,12 @@ from dataclasses import dataclass
 @dataclass
 class Mesh:
     vertices:       np.ndarray  # (V, 3) float32
-    faces:          np.ndarray  # (F, 3) int32  — triangle indices into vertices
-    normals:        np.ndarray  # (F, 3) float32 — outward unit normal per face (flat shading)
-    vertex_normals: np.ndarray  # (V, 3) float32 — averaged face normals per vertex (smooth shading)
+    # (F, 3) int32  — triangle indices into vertices
+    faces:          np.ndarray
+    # (F, 3) float32 — outward unit normal per face (flat shading)
+    normals:        np.ndarray
+    # (V, 3) float32 — averaged face normals per vertex (smooth shading)
+    vertex_normals: np.ndarray
 
 
 def _vertex_normals(vertices: np.ndarray, faces: np.ndarray, face_normals: np.ndarray) -> np.ndarray:
@@ -60,7 +63,8 @@ def _sphere_mesh(n_lat: int, n_lon: int) -> tuple:
     south = len(v) - 1
     faces = []
 
-    def ring_start(i: int) -> int:                     # index of first vertex in ring i (1-based)
+    # index of first vertex in ring i (1-based)
+    def ring_start(i: int) -> int:
         return 1 + (i - 1) * n_lon
 
     # North cap
@@ -69,12 +73,12 @@ def _sphere_mesh(n_lat: int, n_lon: int) -> tuple:
 
     # Body
     for i in range(1, n_lat - 1):
-        rs  = ring_start(i)
+        rs = ring_start(i)
         rs2 = ring_start(i + 1)
         for j in range(n_lon):
             nj = (j + 1) % n_lon
-            faces.append([rs + j,  rs2 + nj, rs2 + j ])
-            faces.append([rs + j,  rs  + nj, rs2 + nj])
+            faces.append([rs + j,  rs2 + nj, rs2 + j])
+            faces.append([rs + j,  rs + nj, rs2 + nj])
 
     # South cap
     rs_last = ring_start(n_lat - 1)
@@ -82,6 +86,51 @@ def _sphere_mesh(n_lat: int, n_lon: int) -> tuple:
         faces.append([south, rs_last + j, rs_last + (j + 1) % n_lon])
 
     return v, np.array(faces, dtype=np.int32)
+
+
+def load_obj(path: str, normalize: bool = True) -> Mesh:
+    """
+    Load a triangulated OBJ file and return a Mesh.
+
+    Only 'v' and 'f' entries are used; UVs and normals in the file are ignored
+    and recomputed from geometry to match the conventions of generate_mesh.
+    Faces with more than 3 vertices are fan-triangulated.
+
+    normalize: centre the mesh at the origin and scale it to fit in a unit sphere.
+               Matches the scale convention of generate_mesh primitives.
+    """
+    verts = []
+    faces = []
+
+    with open(path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if parts[0] == "v":
+                verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif parts[0] == "f":
+                # Each token may be "v", "v/vt", "v/vt/vn", or "v//vn"
+                indices = [int(tok.split("/")[0]) for tok in parts[1:]]
+                # Convert 1-based (and negative) OBJ indices to 0-based
+                n = len(verts)
+                indices = [i - 1 if i > 0 else n + i for i in indices]
+                # Fan-triangulate
+                for k in range(1, len(indices) - 1):
+                    faces.append([indices[0], indices[k], indices[k + 1]])
+
+    v = np.array(verts, dtype=np.float32)
+    if normalize:
+        v -= v.mean(axis=0)
+        v /= np.linalg.norm(v, axis=1).max() + 1e-8
+    f = np.array(faces, dtype=np.int32)
+    normals = np.array(
+        [_face_normal(v[tri[0]], v[tri[1]], v[tri[2]]) for tri in f],
+        dtype=np.float32,
+    )
+    return Mesh(vertices=v, faces=f, normals=normals,
+                vertex_normals=_vertex_normals(v, f, normals))
 
 
 def generate_mesh(shape: str = "cube", **kwargs) -> Mesh:
@@ -97,10 +146,10 @@ def generate_mesh(shape: str = "cube", **kwargs) -> Mesh:
     """
     if shape == "cube":
         v = np.array([
-            [-0.5, -0.5, -0.5], [ 0.5, -0.5, -0.5],  # 0 1
-            [ 0.5,  0.5, -0.5], [-0.5,  0.5, -0.5],  # 2 3
-            [-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5],  # 4 5
-            [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],  # 6 7
+            [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5],  # 0 1
+            [0.5,  0.5, -0.5], [-0.5,  0.5, -0.5],  # 2 3
+            [-0.5, -0.5,  0.5], [0.5, -0.5,  0.5],  # 4 5
+            [0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],  # 6 7
         ], dtype=np.float32)
         faces = np.array([
             [0, 2, 1], [0, 3, 2],  # back   (-Z)
@@ -112,8 +161,8 @@ def generate_mesh(shape: str = "cube", **kwargs) -> Mesh:
         ], dtype=np.int32)
     elif shape == "plane":
         v = np.array([
-            [-1, 0, -1], [ 1, 0, -1],
-            [ 1, 0,  1], [-1, 0,  1],
+            [-1, 0, -1], [1, 0, -1],
+            [1, 0,  1], [-1, 0,  1],
         ], dtype=np.float32)
         faces = np.array([[0, 2, 1], [0, 3, 2]], dtype=np.int32)
     elif shape == "sphere":
@@ -121,7 +170,8 @@ def generate_mesh(shape: str = "cube", **kwargs) -> Mesh:
         n_lon = int(kwargs.get("n_lon", 32))
         v, faces = _sphere_mesh(n_lat, n_lon)
     else:
-        raise ValueError(f"Unknown shape {shape!r}. Choose 'cube', 'plane', or 'sphere'.")
+        raise ValueError(
+            f"Unknown shape {shape!r}. Choose 'cube', 'plane', or 'sphere'.")
 
     normals = np.array(
         [_face_normal(v[f[0]], v[f[1]], v[f[2]]) for f in faces],

@@ -31,6 +31,7 @@ from raw_renderer import (
     generate_mesh,
     phong_shader,
     render,
+    load_obj
 )
 
 mesh = generate_mesh("sphere")

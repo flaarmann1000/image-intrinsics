@@ -1,4 +1,4 @@
-from .mesh import Mesh, generate_mesh
+from .mesh import Mesh, generate_mesh, load_obj
 from .camera import Camera
 from .rasterizer import render
 from .shaders import (

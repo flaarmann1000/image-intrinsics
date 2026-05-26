@@ -607,7 +607,8 @@ def shade_ct_sh(
     # ── Fresnel-Schlick ───────────────────────────────────────────────────────
     # F0: dielectrics reflect ~4%; metals reflect with their albedo tint
     f0 = 0.04 * (1.0 - metallic) + albedo * metallic          # (..., 3)
-    NdotV = (normals * view).sum(-1, keepdim=True).clamp(min=0.0)  # (..., 1)
+    NdotV_raw = (normals * view).sum(-1, keepdim=True)
+    NdotV = NdotV_raw.clamp(min=0.0)
     F = f0 + (1.0 - f0) * (1.0 - NdotV).pow(5)              # (..., 3)
 
     # ── Smith G1 — view term  (IBL variant: k = α⁴/2) ────────────────────────
@@ -617,15 +618,47 @@ def shade_ct_sh(
 
     # ── Diffuse (Lambertian, energy-conserving) ───────────────────────────────
     irr = _sh_irradiance(sh_coeffs, normals)       # (..., 3)
-    k_d = (1.0 - F) * (1.0 - metallic)            # energy taken by specular
+    # k_d = (1.0 - F) * (1.0 - metallic)            # energy taken by specular
+    k_d = (1.0 - metallic)
     diff = k_d * albedo / torch.pi * irr
 
     # ── Specular (GGX SH) ─────────────────────────────────────────────────────
-    R = _norm(2.0 * NdotV * normals - view)
+    R = _norm(2.0 * NdotV_raw * normals - view)
     L_spec = _sh_ggx_filtered_radiance(sh_coeffs, R, roughness, lut)
     spec = F * G1 * L_spec / 4.0
+    # spec = G1 * L_spec / 4.0
 
-    return diff + spec
+    # import matplotlib.pyplot as plt
+    # n = normals[NdotV.squeeze() <= 0][:1].numpy()   # shape: (N, 3)
+    # v = view[NdotV.squeeze() <= 0][:1].numpy()   # shape: (N, 3)
+
+    # fig = plt.figure()
+    # ax = fig.add_subplot(projection='3d')
+
+    # ax.quiver(
+    #     np.zeros(len(n)),  # x origins
+    #     np.zeros(len(n)),  # y origins
+    #     np.zeros(len(n)),  # z origins
+    #     n[:, 0],            # dx
+    #     n[:, 1],            # dy
+    #     n[:, 2],            # dz
+    #     color="red",
+    # )
+
+    # ax.quiver(
+    #     np.zeros(len(v)),  # x origins
+    #     np.zeros(len(v)),  # y origins
+    #     np.zeros(len(v)),  # z origins
+    #     v[:, 0],            # dx
+    #     v[:, 1],            # dy
+    #     v[:, 2],            # dz
+    # )
+
+    # plt.show()
+
+    front = (NdotV_raw > 0).to(albedo.dtype)
+    return (diff + spec) * front
+    # return diff
 
 
 # ─────────────────────────────────────────── geometry extraction ─────────────
@@ -690,6 +723,8 @@ def render(
     height:      int = 512,
     smooth:      bool = False,
     output_path: str = "render_gpu.png",
+    # amp: float = 1,
+    amp: float = 5,
 ) -> np.ndarray:
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     W, H = width, height
@@ -707,7 +742,8 @@ def render(
     face_ids, bary = _rasterize(sverts, faces, W, H)
 
     hit = face_ids >= 0                          # (H*W,)
-    fb = verts.new_zeros(H*W, 3)
+    # fb = verts.new_zeros(H*W, 3)
+    fb = verts.new_ones(H*W, 3)
 
     if hit.any():
         frag_pos, N = _interp(verts, fn, vn, faces,
@@ -753,7 +789,7 @@ def render(
         else:
             raise TypeError(type(material))
 
-        fb[hit] = col
+        fb[hit] = col * amp
 
     img_u8 = (fb.reshape(H, W, 3)*255).clamp(0, 255).byte().cpu().numpy()
     Image.fromarray(img_u8).save(output_path)
