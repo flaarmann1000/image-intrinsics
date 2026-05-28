@@ -16,3 +16,11 @@ raw_optimizer_results/
 study output/
 
 wandb/
+synthetic_ct/
+
+.next/
+out/
+node_modules/
+.env*.local
+.vercel/
+*.tsbuildinfo

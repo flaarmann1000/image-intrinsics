@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from raw_renderer_gpu import shade_ct_sh
+from raw_renderer_gpu.rasterizer import _sh_irradiance
 
 import torch.nn as nn
 
@@ -71,7 +71,7 @@ def optimize(
     shadings  : list of ndarray [H, W, 3] float32
     history   : list of float, total loss recorded every log_every steps
     """
-    del frag_pos, cam_pos  # not used in CT+SH; kept for API compatibility
+    # frag_pos and cam_pos unused in diffuse-only CT+SH forward model
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     N_imgs = len(images)
@@ -118,7 +118,8 @@ def optimize(
 
         loss_data = albedo.new_zeros(())
         for k in range(N_imgs):
-            recon = shade_ct_sh(N_t, albedo, sh_coeffs[k], metallic_t)
+            irr = _sh_irradiance(sh_coeffs[k], N_t)
+            recon = (1.0 - metallic_t) * albedo / torch.pi * irr
             # diff = (recon - imgs_t[k]) ** 2
             diff = torch.abs(recon - imgs_t[k])
             if mask_t is not None:
@@ -156,7 +157,8 @@ def optimize(
         albedo = torch.exp(log_albedo)
         shadings = []
         for k in range(N_imgs):
-            s = shade_ct_sh(N_t, albedo, sh_coeffs[k], metallic_t)
+            irr = _sh_irradiance(sh_coeffs[k], N_t)
+            s = (1.0 - metallic_t) * albedo / torch.pi * irr
             if mask_t is not None:
                 s = s * mask_t
             shadings.append(s.cpu().numpy())

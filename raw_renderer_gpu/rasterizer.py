@@ -300,20 +300,23 @@ def _phong_envmap(frag_pos, N, cam_pos, mat: PhongMat, light: EnvMapLightGPU, sb
 #     return (diff + spec).clamp(0, 1)
 
 
-def shade_phong_sh(V, N, ka, kd, ks, shininess, base_color, coeffs):
-    irr = _sh_irradiance(coeffs, N)
+def shade_phong_sh(V, N, ka, kd, ks, shininess, base_color, coeffs,
+                   return_components: bool = False):
+    irr  = _sh_irradiance(coeffs, N)
     diff = kd * irr * base_color / torch.pi
+    NdV  = (N * V).sum(1, keepdim=True).clamp(min=0)
+    R    = _norm(2 * NdV * N - V)
     ks_pos = (ks > 0) if not torch.is_tensor(ks) else torch.any(ks > 0)
     if ks_pos:
-        NdV = (N*V).sum(1, keepdim=True).clamp(min=0)
-        R = _norm(2*NdV*N - V)
-        L_R = _sh_phong_filtered_radiance(coeffs, R, shininess)
+        L_R  = _sh_phong_filtered_radiance(coeffs, R, shininess)
         spec = ks * L_R
-        # return (diff + spec).clamp(0, 1)
-        return diff + spec
     else:
-        # return (diff).clamp(0, 1)
-        return diff
+        L_R  = diff.new_zeros(diff.shape)
+        spec = diff.new_zeros(diff.shape)
+    composite = diff + spec
+    if not return_components:
+        return composite
+    return composite, {"irr": irr, "diff": diff, "R": R, "L_spec": L_R, "spec": spec}
 
 
 # ─────────────────────────────────────────── Cook-Torrance shaders ───────────
@@ -563,13 +566,14 @@ def _sh_ggx_filtered_radiance(
 # ── Main shader ───────────────────────────────────────────────────────────────
 
 def shade_ct_sh(
-    view:      torch.Tensor,
-    normals:   torch.Tensor,
-    albedo:    torch.Tensor,
-    sh_coeffs: torch.Tensor,
-    metallic:  Union[float, torch.Tensor] = 0.0,
-    roughness: Union[float, torch.Tensor] = 0.5,
-    lut:       Optional[torch.Tensor] = None,
+    view:             torch.Tensor,
+    normals:          torch.Tensor,
+    albedo:           torch.Tensor,
+    sh_coeffs:        torch.Tensor,
+    metallic:         Union[float, torch.Tensor] = 0.0,
+    roughness:        Union[float, torch.Tensor] = 0.5,
+    lut:              Optional[torch.Tensor] = None,
+    return_components: bool = False,
 ) -> torch.Tensor:
     """
     Differentiable Cook-Torrance shading with SH-environment specular.
@@ -618,8 +622,8 @@ def shade_ct_sh(
 
     # ── Diffuse (Lambertian, energy-conserving) ───────────────────────────────
     irr = _sh_irradiance(sh_coeffs, normals)       # (..., 3)
-    # k_d = (1.0 - F) * (1.0 - metallic)            # energy taken by specular
-    k_d = (1.0 - metallic)
+    k_d = (1.0 - F) * (1.0 - metallic)            # energy taken by specular
+    # k_d = (1.0 - metallic)
     diff = k_d * albedo / torch.pi * irr
 
     # ── Specular (GGX SH) ─────────────────────────────────────────────────────
@@ -657,8 +661,210 @@ def shade_ct_sh(
     # plt.show()
 
     front = (NdotV_raw > 0).to(albedo.dtype)
-    return (diff + spec) * front
-    # return diff
+    composite = (diff + spec) * front
+    if not return_components:
+        return composite
+    return composite, {
+        "NdotV":  NdotV,
+        "F":      F,
+        "G1":     G1,
+        "irr":    irr,
+        "k_d":    k_d,
+        "R":      R,
+        "L_spec": L_spec,
+        "diff":   diff,
+        "spec":   spec,
+    }
+
+
+# ─────────────────────────────────────────── env-map CT shader ───────────────
+
+def shade_ct_env(
+    view:              torch.Tensor,
+    normals:           torch.Tensor,
+    albedo:            torch.Tensor,
+    env_pixels:        torch.Tensor,       # (P, 3) — may be learnable
+    env_dirs:          torch.Tensor,       # (P, 3)
+    env_dw:            torch.Tensor,       # (P,)
+    metallic:          Union[float, torch.Tensor] = 0.0,
+    roughness:         Union[float, torch.Tensor] = 0.5,
+    sbatch:            int = 64,
+    return_components: bool = False,
+) -> torch.Tensor:
+    """
+    Differentiable Cook-Torrance shading with explicit env-map integration.
+
+    Drop-in companion to shade_ct_sh: same flat (M, 3) interface, same front-face
+    masking, but integrates over explicit (P, 3) env-map samples instead of SH.
+    Gradients flow through env_pixels, albedo, metallic, and roughness.
+
+    Parameters
+    ----------
+    view, normals, albedo : (M, 3)  flat foreground-pixel arrays
+    env_pixels            : (P, 3)  env-map radiance (learnable)
+    env_dirs              : (P, 3)  sample directions (unit sphere)
+    env_dw                : (P,)    solid angles
+    metallic, roughness   : scalar or (M, 1) Tensor
+    sbatch                : env-map samples per memory batch
+    return_components     : if True, return (composite, dict)
+
+    Returns
+    -------
+    (M, 3) shaded RGB, optionally paired with a components dict containing
+    NdotV (M,1), F_avg (M,3), irr (M,3), k_d (M,3), diff (M,3), spec (M,3).
+    """
+    device = albedo.device
+
+    def _as_tensor(x):
+        if torch.is_tensor(x):
+            return x.to(device)
+        return torch.full(
+            albedo.shape[:-1] + (1,), float(x),
+            dtype=albedo.dtype, device=device,
+        )
+
+    metallic_t  = _as_tensor(metallic)
+    roughness_t = _as_tensor(roughness).clamp(min=0.05)
+    alpha2      = roughness_t ** 4
+    k_smith     = alpha2 / 2.0
+
+    F0        = _f0_mat(albedo, metallic_t)                   # (M, 3)
+    NdotV_raw = (normals * view).sum(-1, keepdim=True)        # (M, 1)
+    NdotV     = NdotV_raw.clamp(min=1e-4)                     # (M, 1)
+
+    P         = env_pixels.shape[0]
+    spec      = albedo.new_zeros(albedo.shape)
+    diff_irr  = albedo.new_zeros(albedo.shape)
+    F_sum     = albedo.new_zeros(albedo.shape)
+    n_valid   = albedo.new_zeros(albedo.shape[0])
+
+    for si in range(0, P, sbatch):
+        L_b  = env_dirs[si:si + sbatch]             # (B, 3)
+        r_b  = env_pixels[si:si + sbatch]           # (B, 3)
+        dw_b = env_dw[si:si + sbatch]               # (B,)
+
+        NdL_raw = normals @ L_b.T                   # (M, B)
+        mf      = (NdL_raw > 1e-4).float()
+        NdL     = NdL_raw.clamp(min=1e-4)
+
+        LdV   = view @ L_b.T                        # (M, B)
+        H_len = (2.0 + 2.0 * LdV).clamp(min=1e-8).sqrt()
+        NdH   = ((NdL_raw + NdotV) / H_len).clamp(0, 1)
+        VdH   = ((LdV + 1.0)       / H_len).clamp(0, 1)
+
+        D = _ggx_D(NdH, alpha2)                               # (M, B)
+        F = _schlick_F(VdH, F0.unsqueeze(1))                  # (M, B, 3)
+        G = _smith_G(NdotV, NdL, k_smith)                     # (M, B)
+
+        w     = (D * G * dw_b / (4 * NdotV + 1e-7)) * mf     # (M, B)
+        spec     += (F * w[:, :, None] * r_b).sum(1)
+        diff_irr += (NdL_raw.clamp(min=0) * dw_b * mf) @ r_b
+        F_sum    += (F * mf[:, :, None]).sum(1)
+        n_valid  += mf.sum(1)
+
+    F_mean    = F_sum / n_valid[:, None].clamp(min=1)         # (M, 3)
+    k_d       = (1.0 - F_mean) * (1.0 - metallic_t)          # (M, 3)
+    diff      = k_d * albedo / torch.pi * diff_irr            # (M, 3)
+    front     = (NdotV_raw > 0).to(albedo.dtype)
+    composite = (diff + spec) * front
+    if not return_components:
+        return composite
+    return composite, {
+        "NdotV": NdotV,
+        "F_avg": F_mean,
+        "irr":   diff_irr,
+        "k_d":   k_d,
+        "diff":  diff,
+        "spec":  spec,
+    }
+
+
+# ─────────────────────────────────────────── env-map Phong shader ────────────
+
+def shade_phong_env(
+    view:              torch.Tensor,
+    normals:           torch.Tensor,
+    albedo:            torch.Tensor,
+    env_pixels:        torch.Tensor,       # (P, 3) — may be learnable
+    env_dirs:          torch.Tensor,       # (P, 3)
+    env_dw:            torch.Tensor,       # (P,)
+    ka:                float = 0.0,
+    kd:                float = 1.0,
+    ks:                Union[float, torch.Tensor] = 0.5,
+    shininess:         Union[float, torch.Tensor] = 32.0,
+    sbatch:            int = 128,
+    return_components: bool = False,
+) -> torch.Tensor:
+    """
+    Differentiable Phong shading with explicit env-map integration.
+
+    Companion to shade_phong_sh: same flat (M, 3) interface, integrates over
+    explicit (P, 3) env-map samples. Gradients flow through env_pixels, albedo,
+    ks, and shininess.
+
+    Parameters
+    ----------
+    view, normals, albedo : (M, 3)
+    env_pixels            : (P, 3)  env-map radiance (learnable)
+    env_dirs              : (P, 3)  sample directions
+    env_dw                : (P,)    solid angles
+    ka, kd                : scene-level ambient / diffuse scalars
+    ks                    : scalar or (M, 1) specular coefficient
+    shininess             : scalar or (M, 1) Phong exponent
+    return_components     : if True, return (composite, dict)
+    """
+    device = albedo.device
+
+    def _as_tensor(x):
+        if torch.is_tensor(x):
+            return x.to(device)
+        return torch.full(
+            albedo.shape[:-1] + (1,), float(x),
+            dtype=albedo.dtype, device=device,
+        )
+
+    ks_t        = _as_tensor(ks)
+    shininess_t = _as_tensor(shininess)
+    norm_f      = (shininess_t + 2.0) / (2.0 * torch.pi)  # (M,1) or scalar
+
+    P           = env_pixels.shape[0]
+    NdotV_raw   = (normals * view).sum(-1, keepdim=True)   # (M, 1)
+    front       = (NdotV_raw > 0).to(albedo.dtype)
+
+    diff_irr    = albedo.new_zeros(albedo.shape)
+    spec        = albedo.new_zeros(albedo.shape)
+
+    for si in range(0, P, sbatch):
+        L_b  = env_dirs[si:si + sbatch]    # (B, 3)
+        r_b  = env_pixels[si:si + sbatch]  # (B, 3)
+        dw_b = env_dw[si:si + sbatch]      # (B,)
+
+        NdL_raw = normals @ L_b.T          # (M, B)
+        mf      = (NdL_raw > 1e-4).float()
+        LdV     = view @ L_b.T             # (M, B)
+
+        # R·V = 2*(N·L)*(N·V) - L·V, clamped and masked to front-facing lights
+        RdV     = (2.0 * NdL_raw.clamp(min=0) * NdotV_raw - LdV).clamp(min=0) * mf
+
+        # spec_contrib: (M, B)  —  shininess_t (M,1) broadcasts over B
+        spec_contrib = RdV ** shininess_t * norm_f * dw_b * mf
+        spec     += spec_contrib @ r_b                            # (M, 3)
+        diff_irr += (NdL_raw.clamp(min=0) * dw_b * mf) @ r_b    # (M, 3)
+
+    mean_rad  = env_pixels.mean(0)
+    diff      = kd * albedo / torch.pi * diff_irr
+    spec_out  = ks_t * spec
+    amb       = ka * mean_rad * albedo
+    composite = (amb + diff + spec_out) * front
+
+    if not return_components:
+        return composite
+    return composite, {
+        "NdotV": NdotV_raw,
+        "irr":   diff_irr,
+        "diff":  diff,
+        "spec":  spec_out,
+    }
 
 
 # ─────────────────────────────────────────── geometry extraction ─────────────
