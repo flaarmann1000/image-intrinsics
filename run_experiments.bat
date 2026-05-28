@@ -117,6 +117,32 @@ for %%M in (%MESHES%) do (
     %PYTHON% %SCRIPT% --phase 2 --mesh %%M --shader phong_env --opt-params albedo,env,shininess  --n-iter %N_ITER% --width %WIDTH% --height %HEIGHT% --device %DEVICE%
 )
 
+REM ── Phase 2d: lambda-white = 0.1 ────────────────────────────────────────────
+echo.
+echo ============================================================
+echo  Phase 2d: lambda-white = 0.1
+echo ============================================================
+for %%M in (%MESHES%) do (
+    for %%S in (%SHADERS%) do (
+        echo [lw=0.1] mesh=%%M  shader=%%S
+        %PYTHON% %SCRIPT% --phase 2 --mesh %%M --shader %%S --lambda-white 0.1 --n-iter %N_ITER% --width %WIDTH% --height %HEIGHT% --device %DEVICE%
+        if errorlevel 1 ( echo ERROR & exit /b 1 )
+    )
+)
+
+REM ── Phase 2e: lambda-sparse = 0.1 ────────────────────────────────────────────
+echo.
+echo ============================================================
+echo  Phase 2e: lambda-sparse = 0.1
+echo ============================================================
+for %%M in (%MESHES%) do (
+    for %%S in (%SHADERS%) do (
+        echo [ls=0.1] mesh=%%M  shader=%%S
+        %PYTHON% %SCRIPT% --phase 2 --mesh %%M --shader %%S --lambda-sparse 0.1 --n-iter %N_ITER% --width %WIDTH% --height %HEIGHT% --device %DEVICE%
+        if errorlevel 1 ( echo ERROR & exit /b 1 )
+    )
+)
+
 echo.
 echo ============================================================
 echo  All experiments complete.

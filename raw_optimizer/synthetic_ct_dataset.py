@@ -1099,11 +1099,17 @@ def run_decomposition(
     is_phong = shader.startswith("phong")
     mat_configs = PHONG_MATERIAL_CONFIGS if is_phong else MATERIAL_CONFIGS
 
-    # Folder/run suffix for selective optimization
+    # Folder/run suffix for selective optimization and regularization
     if opt_params is not None:
         result_shader = shader + "_op=" + ",".join(sorted(opt_params))
     else:
         result_shader = shader
+    ls = cfg.get("lambda_sparse", 0.0)
+    lw = cfg.get("lambda_white",  0.0)
+    if ls:
+        result_shader += f"_ls={ls}"
+    if lw:
+        result_shader += f"_lw={lw}"
 
     mesh = _load_mesh(mesh_name)
     normals_hw, frag_pos_hw, mask_hw, cam_pos = rasterize_geometry(
@@ -1224,7 +1230,18 @@ def run_decomposition(
         gt_px  = torch.from_numpy(gt_color).unsqueeze(0).expand_as(est_px)
         rmse_t, scale_t = _albedo_rmse(est_px, gt_px)
         rmse   = float(rmse_t)
-        scale  = scale_t.numpy()
+        scale  = scale_t.numpy()                                  # (3,) per-channel
+
+        # Rescale lighting by 1/scale to match the albedo correction
+        inv_scale = 1.0 / np.maximum(scale[None, None, :], 1e-8)  # (1,1,3)
+        if shader in ("ct_sh", "phong_sh") and sh_out.size:
+            sh_out_rescaled = sh_out * inv_scale
+        else:
+            sh_out_rescaled = sh_out
+        if shader in ("ct_env", "phong_env") and env_maps.size:
+            env_maps_rescaled = env_maps * inv_scale
+        else:
+            env_maps_rescaled = env_maps
 
         mat_a_err  = np.abs(mat_a - gt_a)
         mat_b_err  = np.abs(mat_b - gt_b)
@@ -1250,13 +1267,13 @@ def run_decomposition(
                f"{b_label}_err_mean": float(mat_b_err[mask_np].mean())},
         )
 
-        # Build final SH/env map images for wandb summary
+        # Build final SH/env map images for wandb summary (scale-corrected)
         if shader in ("ct_sh", "phong_sh"):
-            final_light_imgs = [wandb.Image(_sh_coeffs_to_env_img(sh_out[k]))
+            final_light_imgs = [wandb.Image(_sh_coeffs_to_env_img(sh_out_rescaled[k]))
                                 for k in range(len(images))]
             light_img_key = "est_sh_env_maps"
         else:
-            final_light_imgs = [wandb.Image(_env_flat_to_img(env_maps[k], env_H, env_W))
+            final_light_imgs = [wandb.Image(_env_flat_to_img(env_maps_rescaled[k], env_H, env_W))
                                 for k in range(len(images))]
             light_img_key = "est_env_maps"
 
@@ -1302,18 +1319,18 @@ def run_decomposition(
                 recon_dir / f"recon_err_{angle:02d}deg.png")
 
         if shader in ("ct_sh", "phong_sh"):
-            np.save(out_dir / "sh_coeffs_est.npy", sh_out)
-            for k, sh_k in enumerate(sh_out):
+            np.save(out_dir / "sh_coeffs_est.npy", sh_out_rescaled)
+            for k, sh_k in enumerate(sh_out_rescaled):
                 img = (_sh_coeffs_to_env_img(sh_k) * 255).astype(np.uint8)
                 Image.fromarray(img).save(
                     out_dir / f"sh_env_map_{LIGHT_ANGLES_DEG[k]:02d}deg.png")
         else:
-            np.save(out_dir / "env_maps_est.npy", env_maps)
-            for k, env_k in enumerate(env_maps):
+            np.save(out_dir / "env_maps_est.npy", env_maps_rescaled)
+            for k, env_k in enumerate(env_maps_rescaled):
                 img = (_env_flat_to_img(env_k, env_H, env_W) * 255).astype(np.uint8)
                 Image.fromarray(img).save(
                     out_dir / f"env_map_{LIGHT_ANGLES_DEG[k]:02d}deg.png")
-            env_avg_img = _env_flat_to_img(env_maps.mean(0), env_H, env_W)
+            env_avg_img = _env_flat_to_img(env_maps_rescaled.mean(0), env_H, env_W)
             Image.fromarray((env_avg_img * 255).astype(np.uint8)).save(
                 out_dir / "env_map_avg.png")
 
@@ -1352,8 +1369,10 @@ def _build_parser():
                    choices=_ALL_SHADERS + ["all"],
                    help="Shader type (default: ct_sh)")
     p.add_argument("--optimizer", default=None, choices=["LBFGS", "Adam"])
-    p.add_argument("--n-iter",   type=int,   default=None)
-    p.add_argument("--lr",       type=float, default=None)
+    p.add_argument("--n-iter",        type=int,   default=None)
+    p.add_argument("--lr",            type=float, default=None)
+    p.add_argument("--lambda-sparse", type=float, default=None)
+    p.add_argument("--lambda-white",  type=float, default=None)
     p.add_argument("--mat",      default=None,
                    help="Single material config, e.g. sphere_default")
     p.add_argument("--device",    default=None,
@@ -1367,7 +1386,11 @@ def _build_parser():
 def main():
     args = _build_parser().parse_args()
     overrides = {k: v for k, v in [
-        ("optimizer", args.optimizer), ("n_iter", args.n_iter), ("lr", args.lr)
+        ("optimizer",      args.optimizer),
+        ("n_iter",         args.n_iter),
+        ("lr",             args.lr),
+        ("lambda_sparse",  args.lambda_sparse),
+        ("lambda_white",   args.lambda_white),
     ] if v is not None}
 
     device     = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
