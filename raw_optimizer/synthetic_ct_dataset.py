@@ -160,12 +160,15 @@ NAMED_TRANSFORMS: dict[str, dict] = {
                  shininess="none", ks="none", env="none"),
     "all":  dict(albedo="log",  metallic="sigmoid", roughness="sigmoid",
                  shininess="sigmoid", ks="sigmoid", env="softplus"),
+    "only_softplus":  dict(albedo="none",  metallic="none", roughness="none",
+                 shininess="none", ks="none", env="softplus"),
 }
 
 
 def _transforms_folder(tr: dict) -> str:
     if tr == NAMED_TRANSFORMS["none"]: return "no_transforms"
     if tr == NAMED_TRANSFORMS["all"]:  return "all_transforms"
+    if tr == NAMED_TRANSFORMS["only_softplus"]:  return "only_softplus_transforms"
     parts = [f"{k}={v}" for k, v in sorted(tr.items()) if v != "none"]
     return "tr_" + ",".join(parts)
 
