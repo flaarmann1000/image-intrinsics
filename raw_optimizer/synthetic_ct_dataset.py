@@ -96,6 +96,7 @@ DEFAULT_CFG = dict(
     lambda_sparse  = 0.0,
     lambda_white   = 0.0,
     lambda_tv      = 0.0,
+    sbatch         = 64,
     log_every      = 20,
     loss           = "L2",
     shininess_min  = SHININESS_RANGE[0],
@@ -786,7 +787,8 @@ def _optimize_ct_env(
             env_pix_k = _fwd_env(env_raw_params[k], tr_env)
             recon_m   = shade_ct_env(view_m, N_m, albedo_m,
                                      env_pix_k, env_dirs_t, env_dw_t,
-                                     metallic_m, roughness_m)
+                                     metallic_m, roughness_m,
+                                     sbatch=cfg.get("sbatch", 64))
             recon = albedo.new_zeros(H, W, 3)
             recon.reshape(-1, 3)[flat_mask] = recon_m
             loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"])
@@ -1127,7 +1129,8 @@ def _optimize_phong_env(
             env_pix_k = _fwd_env(env_raw_params[k], tr_env)
             recon_m   = shade_phong_env(view_m, N_m, albedo_m,
                                         env_pix_k, env_dirs_t, env_dw_t,
-                                        ka, kd, ks_m, shininess_m)
+                                        ka, kd, ks_m, shininess_m,
+                                        sbatch=cfg.get("sbatch", 64))
             recon = albedo.new_zeros(H, W, 3)
             recon.reshape(-1, 3)[flat_mask] = recon_m
             loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"])

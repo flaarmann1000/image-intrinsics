@@ -14,6 +14,7 @@ render_gpu/
 raw_dataset/
 raw_optimizer_results/
 study output/
+mit_results/
 
 wandb/
 synthetic_ct/
