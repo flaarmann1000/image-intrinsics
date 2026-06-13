@@ -69,6 +69,11 @@ MATERIAL_CONFIGS: dict[str, dict] = {
     # checkerboard: two colors sampled from [0.1, 0.9] per channel
     "albedo_checker":   dict(albedo_checker=([0.8, 0.3, 0.2], [0.2, 0.5, 0.8]),
                              metallic=0.1, roughness=0.4, n_tiles=4),
+    # random patch textures for all parameters
+    "all_texture":      dict(albedo_range=([0.1, 0.1, 0.1], [0.9, 0.9, 0.9]),
+                             metallic_range=(0.0, 1.0),
+                             roughness_range=(0.1, 0.9),
+                             n_tiles=16, seed=42),
 }
 
 PHONG_MATERIAL_CONFIGS: dict[str, dict] = {
@@ -87,6 +92,11 @@ PHONG_MATERIAL_CONFIGS: dict[str, dict] = {
                               ks=0.5, ka=0.0, kd=1.0, n_tiles=4),
     "ks_checker":        dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,
                               ks_checker=(0.1, 0.9), ka=0.0, kd=1.0, n_tiles=4),
+    # random patch textures for all parameters
+    "all_texture":       dict(albedo_range=([0.1, 0.1, 0.1], [0.9, 0.9, 0.9]),
+                              shininess_range=(4.0, 63.0),
+                              ks_range=(0.1, 0.9),
+                              ka=0.0, kd=1.0, n_tiles=16, seed=42),
 }
 
 SHININESS_RANGE = (1.0, 63.0)
@@ -313,6 +323,24 @@ def _make_checker_map(normals_m: np.ndarray, val_a, val_b, n_tiles: int = 4) -> 
     result[ cell_a] = a
     result[~cell_a] = b
     return result
+
+
+def _make_random_patch_map(normals_m: np.ndarray, val_low, val_high,
+                           n_tiles: int = 16, seed: int = 42) -> np.ndarray:
+    """Per-pixel map (M, C) with independent random values per spherical UV patch.
+
+    Each of the n_tiles x n_tiles grid cells gets a uniformly random value in
+    [val_low, val_high].  val_low / val_high are scalars or RGB lists.
+    """
+    u, v = _checker_uv(normals_m)
+    cell_u = np.floor(u * n_tiles).astype(int).clip(0, n_tiles - 1)
+    cell_v = np.floor(v * n_tiles).astype(int).clip(0, n_tiles - 1)
+    low  = np.asarray(val_low,  dtype=np.float32).reshape(-1)
+    high = np.asarray(val_high, dtype=np.float32).reshape(-1)
+    C = len(low)
+    rng = np.random.default_rng(seed)
+    grid = rng.random((n_tiles, n_tiles, C)).astype(np.float32) * (high - low) + low
+    return grid[cell_v, cell_u]  # (M, C)
 
 
 def _scatter_np(flat_m: np.ndarray, mask_flat: np.ndarray, H: int, W: int) -> np.ndarray:
@@ -563,13 +591,18 @@ def generate_dataset(
             if not need_ct_sh and not need_ct_env:
                 print(f"[Phase 1] {scene_name}  skipped (all renders exist)")
                 continue
-            n_tiles      = mat_cfg.get("n_tiles", 4)
+            n_tiles      = mat_cfg.get("n_tiles", 16)
+            seed         = mat_cfg.get("seed", 42)
             normals_m_np = normals_m.cpu().numpy()
             flat_mask_np = flat_mask.cpu().numpy()
-            metallic     = mat_cfg["metallic"]
-            roughness    = mat_cfg["roughness"]
 
-            if "albedo_checker" in mat_cfg:
+            # ── albedo ───────────────────────────────────────────────────────
+            if "albedo_range" in mat_cfg:
+                low, high   = mat_cfg["albedo_range"]
+                albedo_flat = _make_random_patch_map(normals_m_np, low, high, n_tiles, seed)
+                albedo_t    = torch.from_numpy(albedo_flat).to(dev)
+                albedo_hw   = _scatter_np(albedo_flat, flat_mask_np, height, width)
+            elif "albedo_checker" in mat_cfg:
                 col_a, col_b = mat_cfg["albedo_checker"]
                 albedo_flat  = _make_checker_map(normals_m_np, col_a, col_b, n_tiles)
                 albedo_t     = torch.from_numpy(albedo_flat).to(dev)
@@ -580,15 +613,39 @@ def generate_dataset(
                 albedo_hw = (np.tile(np.array(mat_cfg["albedo"], dtype=np.float32),
                                      (height, width, 1)) * mask_np_gen[:, :, None])
 
+            # ── metallic ─────────────────────────────────────────────────────
+            if "metallic_range" in mat_cfg:
+                m_low, m_high  = mat_cfg["metallic_range"]
+                met_flat       = _make_random_patch_map(normals_m_np, m_low, m_high, n_tiles, seed + 1)
+                metallic_t     = torch.from_numpy(met_flat).to(dev)   # (M, 1)
+                metallic_hw    = _scatter_np(met_flat, flat_mask_np, height, width)
+                metallic       = float(met_flat.mean())
+            else:
+                metallic       = mat_cfg["metallic"]
+                metallic_t     = None
+                metallic_hw    = np.full((height, width, 1), metallic, dtype=np.float32) * mask_np_gen[:, :, None]
+
+            # ── roughness ────────────────────────────────────────────────────
+            if "roughness_range" in mat_cfg:
+                r_low, r_high  = mat_cfg["roughness_range"]
+                rough_flat     = _make_random_patch_map(normals_m_np, r_low, r_high, n_tiles, seed + 2)
+                roughness_t    = torch.from_numpy(rough_flat).to(dev)  # (M, 1)
+                roughness_hw   = _scatter_np(rough_flat, flat_mask_np, height, width)
+                roughness      = float(rough_flat.mean())
+            else:
+                roughness      = mat_cfg["roughness"]
+                roughness_t    = None
+                roughness_hw   = np.full((height, width, 1), roughness, dtype=np.float32) * mask_np_gen[:, :, None]
+
             gt_dir = DATASET_ROOT / scene_name / "gt"
             gt_dir.mkdir(parents=True, exist_ok=True)
             gt_albedo_img = (albedo_hw * 255).clip(0, 255).astype(np.uint8)
             Image.fromarray(gt_albedo_img).save(gt_dir / "albedo.png")
             np.save(gt_dir / "albedo.npy", albedo_hw.astype(np.float32))
-            for name, val in [("metallic", metallic), ("roughness", roughness)]:
-                gray = (np.full((height, width), val, dtype=np.float32)
-                        * mask_np_gen * 255).clip(0, 255).astype(np.uint8)
+            for name, hw in [("metallic", metallic_hw), ("roughness", roughness_hw)]:
+                gray = (hw[:, :, 0] * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(gray, mode="L").save(gt_dir / f"{name}.png")
+                np.save(gt_dir / f"{name}.npy", hw.astype(np.float32))
             Image.fromarray(normals_vis).save(gt_dir / "normals.png")
 
             for light_id, make_fn in light_entries:
@@ -601,7 +658,9 @@ def generate_dataset(
                         (sh_dir / "components").mkdir(parents=True, exist_ok=True)
                         composite, comps = shade_ct_sh(  # type: ignore[misc]
                             view_m, normals_m, albedo_t,
-                            sh_light.coeffs.to(dev), metallic, roughness,
+                            sh_light.coeffs.to(dev),
+                            metallic_t if metallic_t is not None else metallic,
+                            roughness_t if roughness_t is not None else roughness,
                             lut=lut, return_components=True,
                         )
                         _save_render(composite, flat_mask, height, width, sh_dir / "render.png")
@@ -626,7 +685,9 @@ def generate_dataset(
                         composite_env, comps_env = shade_ct_env(  # type: ignore[misc]
                             view_m, normals_m, albedo_t,
                             env_pix_t, env_dirs_t, env_dw_t,
-                            metallic, roughness, return_components=True,
+                            metallic_t if metallic_t is not None else metallic,
+                            roughness_t if roughness_t is not None else roughness,
+                            return_components=True,
                         )
                         _save_render(composite_env, flat_mask, height, width, env_dir / "render.png")
                         _save_component_images(comps_env, flat_mask, height, width, env_dir / "components")
@@ -654,13 +715,19 @@ def generate_dataset(
             if not need_phong_sh and not need_phong_env:
                 print(f"[Phase 1] {scene_name}  skipped (all renders exist)")
                 continue
-            n_tiles      = mat_cfg.get("n_tiles", 4)
+            n_tiles      = mat_cfg.get("n_tiles", 16)
+            seed         = mat_cfg.get("seed", 42)
             normals_m_np = normals_m.cpu().numpy()
             flat_mask_np = flat_mask.cpu().numpy()
             ka, kd = mat_cfg["ka"], mat_cfg["kd"]
 
             # ── albedo ───────────────────────────────────────────────────────
-            if "albedo_checker" in mat_cfg:
+            if "albedo_range" in mat_cfg:
+                low, high   = mat_cfg["albedo_range"]
+                albedo_flat = _make_random_patch_map(normals_m_np, low, high, n_tiles, seed)
+                albedo_t    = torch.from_numpy(albedo_flat).to(dev)
+                albedo_hw   = _scatter_np(albedo_flat, flat_mask_np, height, width)
+            elif "albedo_checker" in mat_cfg:
                 col_a, col_b = mat_cfg["albedo_checker"]
                 albedo_flat  = _make_checker_map(normals_m_np, col_a, col_b, n_tiles)
                 albedo_t     = torch.from_numpy(albedo_flat).to(dev)
@@ -672,10 +739,16 @@ def generate_dataset(
                                      (height, width, 1)) * mask_np_gen[:, :, None])
 
             # ── shininess ────────────────────────────────────────────────────
-            if "shininess_checker" in mat_cfg:
+            if "shininess_range" in mat_cfg:
+                s_low, s_high = mat_cfg["shininess_range"]
+                shin_flat = _make_random_patch_map(normals_m_np, s_low, s_high, n_tiles, seed + 1)
+                shin_t    = torch.from_numpy(shin_flat).to(dev)            # (M, 1)
+                shin_hw   = _scatter_np(shin_flat, flat_mask_np, height, width)
+                shin = float(shin_flat.mean())
+            elif "shininess_checker" in mat_cfg:
                 shin_a, shin_b = mat_cfg["shininess_checker"]
                 shin_flat = _make_checker_map(normals_m_np, shin_a, shin_b, n_tiles)
-                shin_t    = torch.from_numpy(shin_flat).to(dev)            # (M, 1)
+                shin_t    = torch.from_numpy(shin_flat).to(dev)
                 shin_hw   = _scatter_np(shin_flat, flat_mask_np, height, width)
                 shin = float(np.mean([shin_a, shin_b]))
             else:
@@ -684,10 +757,16 @@ def generate_dataset(
                 shin_hw = np.full((height, width, 1), shin, dtype=np.float32) * mask_np_gen[:, :, None]
 
             # ── ks ───────────────────────────────────────────────────────────
-            if "ks_checker" in mat_cfg:
+            if "ks_range" in mat_cfg:
+                k_low, k_high = mat_cfg["ks_range"]
+                ks_flat = _make_random_patch_map(normals_m_np, k_low, k_high, n_tiles, seed + 2)
+                ks_t    = torch.from_numpy(ks_flat).to(dev)                # (M, 1)
+                ks_hw   = _scatter_np(ks_flat, flat_mask_np, height, width)
+                ks = float(ks_flat.mean())
+            elif "ks_checker" in mat_cfg:
                 ks_a, ks_b = mat_cfg["ks_checker"]
                 ks_flat = _make_checker_map(normals_m_np, ks_a, ks_b, n_tiles)
-                ks_t    = torch.from_numpy(ks_flat).to(dev)                # (M, 1)
+                ks_t    = torch.from_numpy(ks_flat).to(dev)
                 ks_hw   = _scatter_np(ks_flat, flat_mask_np, height, width)
                 ks = float(np.mean([ks_a, ks_b]))
             else:
@@ -865,8 +944,8 @@ def _optimize_ct_sh(
     frag_pos_hw:  torch.Tensor,
     mask_hw:      torch.Tensor,
     cam_pos:      torch.Tensor,
-    gt_metallic:  float,
-    gt_roughness: float,
+    gt_metallic:  Union[float, np.ndarray],
+    gt_roughness: Union[float, np.ndarray],
     cfg:          dict,
     wandb_run=None,
     gt_sh_coeffs: Optional[list] = None,
@@ -931,28 +1010,31 @@ def _optimize_ct_sh(
             torch.from_numpy(gt_sh_coeffs[k]).to(dev) for k in range(N_imgs)
         ])
 
+    _gt_met_scalar  = float(np.asarray(gt_metallic).mean())
+    _gt_rou_scalar  = float(np.asarray(gt_roughness).mean())
+
     if "metallic" in op:
         if init_from_gt:
-            metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev).requires_grad_(True)
+            metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev).requires_grad_(True)
         else:
             m0 = 0.5 if tr_met != "sigmoid" else 0.0
             metallic_raw = torch.full((H, W, 1), m0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(metallic_raw)
         named_params["metallic"] = metallic_raw
     else:
-        metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev)
+        metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
 
     if "roughness" in op:
         if init_from_gt:
             metallic_raw_tr = "sigmoid_r" if tr_rou == "sigmoid" else tr_rou
-            roughness_raw = _init_scalar(gt_roughness, H, W, metallic_raw_tr, dev=dev).requires_grad_(True)
+            roughness_raw = _init_scalar(_gt_rou_scalar, H, W, metallic_raw_tr, dev=dev).requires_grad_(True)
         else:
             r0 = 0.5 if tr_rou != "sigmoid" else 0.0
             roughness_raw = torch.full((H, W, 1), r0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(roughness_raw)
         named_params["roughness"] = roughness_raw
     else:
-        roughness_raw = _init_scalar(gt_roughness, H, W, "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev)
+        roughness_raw = _init_scalar(_gt_rou_scalar, H, W, "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev)
 
     opt = _make_optimizer(learnable, cfg)
 
@@ -992,10 +1074,10 @@ def _optimize_ct_sh(
         return result
 
     gt_map_grad = {
-        "albedo":    np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
+        "albedo":    np.broadcast_to(np.asarray(gt_albedo,   np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
         "sh":        np.stack(gt_sh_coeffs).astype(np.float32) if gt_sh_coeffs is not None else None,
-        "metallic":  np.full((H, W, 1), gt_metallic, dtype=np.float32),
-        "roughness": np.full((H, W, 1), gt_roughness, dtype=np.float32),
+        "metallic":  np.broadcast_to(np.asarray(gt_metallic,  np.float32), (H, W, 1)).copy(),
+        "roughness": np.broadcast_to(np.asarray(gt_roughness, np.float32), (H, W, 1)).copy(),
     }
     fwd_map_grad = {
         "albedo":    lambda p: _fwd_albedo(p, tr_ab),
@@ -1082,8 +1164,8 @@ def _optimize_ct_env(
     frag_pos_hw:  torch.Tensor,
     mask_hw:      torch.Tensor,
     cam_pos:      torch.Tensor,
-    gt_metallic:  float,
-    gt_roughness: float,
+    gt_metallic:  Union[float, np.ndarray],
+    gt_roughness: Union[float, np.ndarray],
     env_dirs:     np.ndarray,
     env_dw:       np.ndarray,
     cfg:          dict,
@@ -1158,20 +1240,23 @@ def _optimize_ct_env(
         gt_ef_t = torch.from_numpy(gt_ef).to(dev)
         env_raw_params = _softplus_inv(gt_ef_t) if tr_env == "softplus" else gt_ef_t.clone()
 
+    _gt_met_scalar  = float(np.asarray(gt_metallic).mean())
+    _gt_rou_scalar  = float(np.asarray(gt_roughness).mean())
+
     if "metallic" in op:
         if init_from_gt:
-            metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev).requires_grad_(True)
+            metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev).requires_grad_(True)
         else:
             m0 = 0.5 if tr_met != "sigmoid" else 0.0
             metallic_raw = torch.full((H, W, 1), m0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(metallic_raw)
         named_params["metallic"] = metallic_raw
     else:
-        metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev)
+        metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
 
     if "roughness" in op:
         if init_from_gt:
-            roughness_raw = _init_scalar(gt_roughness, H, W,
+            roughness_raw = _init_scalar(_gt_rou_scalar, H, W,
                                          "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev).requires_grad_(True)
         else:
             r0 = 0.5 if tr_rou != "sigmoid" else 0.0
@@ -1179,7 +1264,7 @@ def _optimize_ct_env(
         learnable.append(roughness_raw)
         named_params["roughness"] = roughness_raw
     else:
-        roughness_raw = _init_scalar(gt_roughness, H, W,
+        roughness_raw = _init_scalar(_gt_rou_scalar, H, W,
                                      "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev)
 
     opt = _make_optimizer(learnable, cfg)
@@ -1232,8 +1317,8 @@ def _optimize_ct_env(
     gt_map_grad = {
         "albedo":    np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
         "env":       gt_ef_np,
-        "metallic":  np.full((H, W, 1), gt_metallic, dtype=np.float32),
-        "roughness": np.full((H, W, 1), gt_roughness, dtype=np.float32),
+        "metallic":  np.broadcast_to(np.asarray(gt_metallic,  np.float32), (H, W, 1)).copy(),
+        "roughness": np.broadcast_to(np.asarray(gt_roughness, np.float32), (H, W, 1)).copy(),
     }
     fwd_map_grad = {
         "albedo":    lambda p: _fwd_albedo(p, tr_ab),
@@ -2000,10 +2085,18 @@ def run_decomposition(
                      "gt_ks":           wandb.Image(gt_ks_img),
                      "gt_sh_env_maps":  [wandb.Image(e) for e in gt_sh_env_imgs]}, step=0)
         else:
-            gt_metallic  = mat_cfg["metallic"]
-            gt_roughness = mat_cfg["roughness"]
-            gt_metallic_img  = np.full((height, width), gt_metallic,  dtype=np.float32)
-            gt_roughness_img = np.full((height, width), gt_roughness, dtype=np.float32)
+            _gt_met_npy   = DATASET_ROOT / scene_prefix / "gt" / "metallic.npy"
+            _gt_rough_npy = DATASET_ROOT / scene_prefix / "gt" / "roughness.npy"
+            gt_met_map    = (np.load(_gt_met_npy) if _gt_met_npy.exists()
+                             else np.full((height, width, 1),
+                                          mat_cfg["metallic"], dtype=np.float32) * mask_np[:, :, None])
+            gt_rough_map  = (np.load(_gt_rough_npy) if _gt_rough_npy.exists()
+                             else np.full((height, width, 1),
+                                          mat_cfg["roughness"], dtype=np.float32) * mask_np[:, :, None])
+            gt_metallic      = float(gt_met_map[mask_np].mean())
+            gt_roughness     = float(gt_rough_map[mask_np].mean())
+            gt_metallic_img  = gt_met_map[:, :, 0]
+            gt_roughness_img = gt_rough_map[:, :, 0]
             run.log({"gt_images":       [wandb.Image(img) for img in images],
                      "gt_albedo":       wandb.Image(gt_albedo_img),
                      "gt_metallic":     wandb.Image(gt_metallic_img),
@@ -2020,7 +2113,7 @@ def run_decomposition(
         if shader == "ct_sh":
             albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
                 images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_metallic, gt_roughness, cfg,  # type: ignore[possibly-undefined]
+                gt_met_map, gt_rough_map, cfg,  # type: ignore[possibly-undefined]
                 wandb_run=run, gt_sh_coeffs=gt_sh_list,
                 gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
                 init_from_gt=init_from_gt, log_gradients=log_gradients,
@@ -2029,7 +2122,7 @@ def run_decomposition(
         elif shader == "ct_env":
             albedo, env_maps, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(
                 images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_metallic, gt_roughness, env_dirs, env_dw, cfg,  # type: ignore[possibly-undefined]
+                gt_met_map, gt_rough_map, env_dirs, env_dw, cfg,  # type: ignore[possibly-undefined]
                 wandb_run=run, env_H=env_H, env_W=env_W,
                 gt_sh_coeffs=gt_sh_list, gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
                 init_from_gt=init_from_gt, log_gradients=log_gradients,
@@ -2079,13 +2172,12 @@ def run_decomposition(
         else:
             env_maps_rescaled = env_maps
 
-        # Use spatial GT maps for per-pixel error (broadcast scalar GT for CT)
         if is_phong:
-            mat_a_err = np.abs(mat_a - gt_shin_map)   # type: ignore[possibly-undefined]
-            mat_b_err = np.abs(mat_b - gt_ks_map)     # type: ignore[possibly-undefined]
+            mat_a_err = np.abs(mat_a - gt_shin_map)    # type: ignore[possibly-undefined]
+            mat_b_err = np.abs(mat_b - gt_ks_map)      # type: ignore[possibly-undefined]
         else:
-            mat_a_err = np.abs(mat_a - gt_a)
-            mat_b_err = np.abs(mat_b - gt_b)
+            mat_a_err = np.abs(mat_a - gt_met_map)     # type: ignore[possibly-undefined]
+            mat_b_err = np.abs(mat_b - gt_rough_map)   # type: ignore[possibly-undefined]
         mat_a_mean = float(mat_a[mask_np].mean())
         mat_b_mean = float(mat_b[mask_np].mean())
 
