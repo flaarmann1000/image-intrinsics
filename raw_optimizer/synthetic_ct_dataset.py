@@ -29,6 +29,7 @@ import argparse
 import json
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -44,7 +45,7 @@ if str(_REPO_ROOT) not in sys.path:
 from raw_renderer_gpu import (
     rasterize_geometry, shade_ct_sh, shade_ct_env, shade_phong_sh, shade_phong_env,
     SHLight, EnvMapLightGPU,
-    Camera, EnvMap, SHLighting, generate_mesh, load_obj,
+    Camera, EnvMap, SHLighting, build_sh_basis, generate_mesh, load_obj,
 )
 from raw_renderer_gpu.rasterizer import _norm, _get_ggx_sh_lut, _sh_irradiance
 from raw_optimizer.optimizer import _tv
@@ -58,26 +59,37 @@ DATASET_ROOT   = SYNTHETIC_ROOT / "dataset"
 RESULTS_ROOT   = SYNTHETIC_ROOT / "results"
 
 MATERIAL_CONFIGS: dict[str, dict] = {
-    "default":     dict(albedo=[0.5, 0.5, 0.5], metallic=0.1, roughness=0.4),
-    "albedo_0":    dict(albedo=[0.8, 0.3, 0.2], metallic=0.1, roughness=0.4),
-    "albedo_1":    dict(albedo=[0.2, 0.5, 0.8], metallic=0.1, roughness=0.4),
-    "metallic_0":  dict(albedo=[0.5, 0.5, 0.5], metallic=0.0, roughness=0.4),
-    "metallic_1":  dict(albedo=[0.5, 0.5, 0.5], metallic=0.8, roughness=0.4),
-    "roughness_0": dict(albedo=[0.5, 0.5, 0.5], metallic=0.1, roughness=0.1),
-    "roughness_1": dict(albedo=[0.5, 0.5, 0.5], metallic=0.1, roughness=0.8),
+    "default":          dict(albedo=[0.5, 0.5, 0.5], metallic=0.1, roughness=0.4),
+    "albedo_0":         dict(albedo=[0.8, 0.3, 0.2], metallic=0.1, roughness=0.4),
+    "albedo_1":         dict(albedo=[0.2, 0.5, 0.8], metallic=0.1, roughness=0.4),
+    "metallic_0":       dict(albedo=[0.5, 0.5, 0.5], metallic=0.0, roughness=0.4),
+    "metallic_1":       dict(albedo=[0.5, 0.5, 0.5], metallic=0.8, roughness=0.4),
+    "roughness_0":      dict(albedo=[0.5, 0.5, 0.5], metallic=0.1, roughness=0.1),
+    "roughness_1":      dict(albedo=[0.5, 0.5, 0.5], metallic=0.1, roughness=0.8),
+    # checkerboard: two colors sampled from [0.1, 0.9] per channel
+    "albedo_checker":   dict(albedo_checker=([0.8, 0.3, 0.2], [0.2, 0.5, 0.8]),
+                             metallic=0.1, roughness=0.4, n_tiles=4),
 }
 
 PHONG_MATERIAL_CONFIGS: dict[str, dict] = {
-    "default":     dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,  ks=0.5, ka=0.0, kd=1.0),
-    "albedo_0":    dict(albedo=[0.8, 0.3, 0.2], shininess=32.0,  ks=0.5, ka=0.0, kd=1.0),
-    "albedo_1":    dict(albedo=[0.2, 0.5, 0.8], shininess=32.0,  ks=0.5, ka=0.0, kd=1.0),
-    "shininess_0": dict(albedo=[0.5, 0.5, 0.5], shininess=4.0,   ks=0.5, ka=0.0, kd=1.0),
-    "shininess_1": dict(albedo=[0.5, 0.5, 0.5], shininess=128.0, ks=0.5, ka=0.0, kd=1.0),
-    "ks_0":        dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,  ks=0.1, ka=0.0, kd=1.0),
-    "ks_1":        dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,  ks=0.9, ka=0.0, kd=1.0),
+    "default":           dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,  ks=0.5, ka=0.0, kd=1.0),
+    "albedo_0":          dict(albedo=[0.8, 0.3, 0.2], shininess=32.0,  ks=0.5, ka=0.0, kd=1.0),
+    "albedo_1":          dict(albedo=[0.2, 0.5, 0.8], shininess=32.0,  ks=0.5, ka=0.0, kd=1.0),
+    "shininess_0":       dict(albedo=[0.5, 0.5, 0.5], shininess=4.0,   ks=0.5, ka=0.0, kd=1.0),
+    "shininess_1":       dict(albedo=[0.5, 0.5, 0.5], shininess=128.0, ks=0.5, ka=0.0, kd=1.0),
+    "ks_0":              dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,  ks=0.1, ka=0.0, kd=1.0),
+    "ks_1":              dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,  ks=0.9, ka=0.0, kd=1.0),
+    # checkerboard: two values sampled from per-parameter allowed range
+    "albedo_checker":    dict(albedo_checker=([0.8, 0.3, 0.2], [0.2, 0.5, 0.8]),
+                              shininess=32.0, ks=0.5, ka=0.0, kd=1.0, n_tiles=4),
+    "shininess_checker": dict(albedo=[0.5, 0.5, 0.5],
+                              shininess_checker=(4.0, 63.0),
+                              ks=0.5, ka=0.0, kd=1.0, n_tiles=4),
+    "ks_checker":        dict(albedo=[0.5, 0.5, 0.5], shininess=32.0,
+                              ks_checker=(0.1, 0.9), ka=0.0, kd=1.0, n_tiles=4),
 }
 
-SHININESS_RANGE = (1.0, 256.0)
+SHININESS_RANGE = (1.0, 63.0)
 
 LIGHT_ANGLES_DEG = [0, 18, 36, 54, 72, 90]
 LIGHT_COLOR      = np.array([1.0, 0.9, 0.8], dtype=np.float32)
@@ -154,6 +166,163 @@ def _softplus_inv(x: torch.Tensor) -> torch.Tensor:
     return torch.log(torch.expm1(x.clamp(min=1e-7)))
 
 
+# ── Lighting mode helpers ──────────────────────────────────────────────────────
+
+def _get_light_angles(n_lights: int, full_circle: bool) -> list:
+    if full_circle:
+        return np.linspace(0, 360, n_lights, endpoint=False).tolist()
+    return np.linspace(0, 90, n_lights).tolist()
+
+
+def _scene_suffix(light_mode: str, n_lights: int, full_circle: bool) -> str:
+    """Return empty string for the default config (directional, 6, quarter-circle)."""
+    # if light_mode == "directional" and n_lights == 6 and not full_circle:
+    #     return ""
+    mode_short = {"directional": "dir", "random_sh": "rsh", "circular": "circ"}[light_mode]
+    suffix = f"_{mode_short}{n_lights}"
+    if full_circle:
+        suffix += "full"
+    return suffix
+
+
+def _make_lights_random_sh(seed: int, n_dirs: int = 2, min_front_irr: float = 0.3) -> tuple:
+    """Random but plausible SH lighting as a sum of n_dirs directional lights.
+
+    Resamples up to 10 times until the mean RGB irradiance at the front-facing
+    normal (+Z, toward camera) reaches min_front_irr. Falls back to the best
+    attempt found if the threshold is never met.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Band-limiting weights for diffuse SH irradiance (L=0,1,2)
+    _A = np.array([np.pi, 2*np.pi/3, 2*np.pi/3, 2*np.pi/3,
+                   np.pi/4, np.pi/4, np.pi/4, np.pi/4, np.pi/4], dtype=np.float32)
+    # Front-facing normal: +Z (camera is along +Z in this scene convention)
+    _front_Y = build_sh_basis(np.array([0.0, 0.0, 1.0], dtype=np.float32))  # (9,)
+    _AY = _A * _front_Y  # (9,) — reusable dot-product weights
+
+    def _sample() -> tuple:
+        c = np.zeros((9, 3), dtype=np.float32)
+        for _ in range(n_dirs):
+            phi   = rng.uniform(0, 2 * np.pi)
+            cos_t = rng.uniform(-0.3, 1.0)
+            sin_t = float(np.sqrt(max(0.0, 1.0 - cos_t ** 2)))
+            d = np.array([sin_t * np.cos(phi), cos_t, sin_t * np.sin(phi)], dtype=np.float32)
+            d /= np.linalg.norm(d)
+            intensity = rng.uniform(0.5, 2.0)
+            color     = rng.uniform([0.6, 0.5, 0.4], [1.4, 1.3, 1.2]).astype(np.float32)
+            c += build_sh_basis(d)[:, None] * (color * intensity)[None, :]
+        irr = float(_AY @ c.mean(axis=-1))  # mean RGB irradiance at front normal
+        return c, irr
+
+    best_coeffs, best_irr = _sample()
+    for _ in range(9):
+        if best_irr >= min_front_irr:
+            break
+        coeffs, irr = _sample()
+        if irr > best_irr:
+            best_coeffs, best_irr = coeffs, irr
+
+    coeffs    = best_coeffs
+    sh_raw    = SHLighting(coeffs)
+    sh_light  = SHLight(coeffs=torch.from_numpy(coeffs))
+    env_raw   = EnvMap.from_sh(sh_raw)
+    env_light = EnvMapLightGPU(
+        dirs        =torch.from_numpy(env_raw._dirs),
+        image_flat  =torch.from_numpy(env_raw._image_flat),
+        solid_angles=torch.from_numpy(env_raw._solid_angles),
+    )
+    return sh_light, env_light, None, coeffs, env_raw
+
+
+def _make_lights_circular(seed: int, n_sources: int = 2,
+                          radius_range=(0.1, 0.5),
+                          intensity_range=(2.0, 10.0)) -> tuple:
+    """Circular area light sources rendered into an env map, approximated with SH."""
+    rng   = np.random.default_rng(seed)
+    env_H, env_W = 64, 128
+    i_idx = np.arange(env_H)
+    j_idx = np.arange(env_W)
+    theta = np.pi * (i_idx + 0.5) / env_H           # (env_H,)
+    phi   = 2 * np.pi * (j_idx + 0.5) / env_W       # (env_W,)
+    dirs_grid = np.stack([                           # (env_H, env_W, 3)
+        np.outer(np.sin(theta), np.cos(phi)),
+        np.tile(np.cos(theta)[:, None], (1, env_W)),
+        np.outer(np.sin(theta), np.sin(phi)),
+    ], axis=-1).astype(np.float32)
+
+    env_img = np.zeros((env_H, env_W, 3), dtype=np.float32)
+    for _ in range(n_sources):
+        phi_s   = rng.uniform(0, 2 * np.pi)
+        cos_t_s = rng.uniform(-0.5, 1.0)
+        sin_t_s = float(np.sqrt(max(0.0, 1.0 - cos_t_s ** 2)))
+        center  = np.array([sin_t_s * np.cos(phi_s), cos_t_s, sin_t_s * np.sin(phi_s)],
+                            dtype=np.float32)
+        center /= np.linalg.norm(center)
+        radius    = rng.uniform(*radius_range)
+        color     = rng.uniform(0.3, 1.0, size=3).astype(np.float32)
+        intensity = rng.uniform(*intensity_range)
+        cos_angle = np.clip((dirs_grid * center[None, None, :]).sum(-1), -1.0, 1.0)
+        mask      = cos_angle >= float(np.cos(radius))
+        env_img[mask] += color * intensity
+
+    env_raw   = EnvMap(env_img)
+    sh_raw    = SHLighting.from_env_map(env_raw)
+    sh_light  = SHLight(coeffs=torch.from_numpy(sh_raw.coeffs))
+    env_light = EnvMapLightGPU(
+        dirs        =torch.from_numpy(env_raw._dirs),
+        image_flat  =torch.from_numpy(env_raw._image_flat),
+        solid_angles=torch.from_numpy(env_raw._solid_angles),
+    )
+    return sh_light, env_light, None, sh_raw.coeffs, env_raw
+
+
+def _get_light_entries(light_mode: str, n_lights: int, full_circle: bool) -> list:
+    """Return [(key, make_fn), ...] for each light in the dataset."""
+    if light_mode == "directional":
+        angles = _get_light_angles(n_lights, full_circle)
+        return [(f"light_{int(a):02d}deg", partial(_make_lights, angle_deg=a)) for a in angles]
+    if light_mode == "random_sh":
+        return [(f"light_{i:03d}", partial(_make_lights_random_sh, seed=i)) for i in range(n_lights)]
+    if light_mode == "circular":
+        return [(f"light_{i:03d}", partial(_make_lights_circular, seed=i)) for i in range(n_lights)]
+    raise ValueError(f"Unknown light_mode {light_mode!r}")
+
+
+# ── Checkerboard texture helpers ──────────────────────────────────────────────
+
+def _checker_uv(normals_m: np.ndarray) -> tuple:
+    """Spherical UV from unit normals (M, 3). Returns (u, v), each (M,) in [0, 1]."""
+    nx, ny, nz = normals_m[:, 0], normals_m[:, 1], normals_m[:, 2]
+    u = 0.5 + np.arctan2(nz, nx) / (2 * np.pi)
+    v = 0.5 - np.arcsin(ny.clip(-1.0, 1.0)) / np.pi
+    return u, v
+
+
+def _make_checker_map(normals_m: np.ndarray, val_a, val_b, n_tiles: int = 4) -> np.ndarray:
+    """Per-pixel map (M, C) alternating val_a / val_b on a spherical checkerboard.
+
+    val_a / val_b can be scalars or RGB lists; C is inferred from them.
+    """
+    u, v = _checker_uv(normals_m)
+    cell_a = ((np.floor(u * n_tiles).astype(int) + np.floor(v * n_tiles).astype(int)) % 2) == 0
+    a = np.asarray(val_a, dtype=np.float32).reshape(-1)
+    b = np.asarray(val_b, dtype=np.float32).reshape(-1)
+    C, M = len(a), normals_m.shape[0]
+    result = np.empty((M, C), dtype=np.float32)
+    result[ cell_a] = a
+    result[~cell_a] = b
+    return result
+
+
+def _scatter_np(flat_m: np.ndarray, mask_flat: np.ndarray, H: int, W: int) -> np.ndarray:
+    """Scatter foreground values (M, C) to (H, W, C); background stays zero."""
+    C   = flat_m.shape[1] if flat_m.ndim > 1 else 1
+    out = np.zeros((H * W, C), dtype=np.float32)
+    out[mask_flat] = flat_m.reshape(-1, C)
+    return out.reshape(H, W, C)
+
+
 # ── Domain transforms ─────────────────────────────────────────────────────────
 
 NAMED_TRANSFORMS: dict[str, dict] = {
@@ -163,6 +332,8 @@ NAMED_TRANSFORMS: dict[str, dict] = {
                  shininess="sigmoid", ks="sigmoid", env="softplus"),
     "only_softplus":  dict(albedo="none",  metallic="none", roughness="none",
                  shininess="none", ks="none", env="softplus"),
+    "only_shininess":  dict(albedo="none",  metallic="none", roughness="none",
+                 shininess="log", ks="none", env="none"),
 }
 
 
@@ -170,6 +341,7 @@ def _transforms_folder(tr: dict) -> str:
     if tr == NAMED_TRANSFORMS["none"]: return "no_transforms"
     if tr == NAMED_TRANSFORMS["all"]:  return "all_transforms"
     if tr == NAMED_TRANSFORMS["only_softplus"]:  return "only_softplus_transforms"
+    if tr == NAMED_TRANSFORMS["only_shininess"]:  return "only_shininess_transforms"
     parts = [f"{k}={v}" for k, v in sorted(tr.items()) if v != "none"]
     return "tr_" + ",".join(parts)
 
@@ -194,7 +366,12 @@ def _fwd_roughness(p: torch.Tensor, t: str) -> torch.Tensor:
     return 0.05 + 0.9 * torch.sigmoid(p) if t == "sigmoid" else p.clamp(0.05, 1.0)
 
 def _fwd_shininess(p: torch.Tensor, t: str, s_min: float, s_max: float) -> torch.Tensor:
-    return s_min + (s_max - s_min) * torch.sigmoid(p) if t == "sigmoid" else p.clamp(s_min, s_max)
+    if t == "sigmoid":
+        return s_min + (s_max - s_min) * torch.sigmoid(p)
+    elif t == "log":
+        return torch.exp(p).clamp(s_min, s_max)
+    else:
+        return p.clamp(s_min, s_max)
 
 def _fwd_ks(p: torch.Tensor, t: str) -> torch.Tensor:
     return torch.sigmoid(p) if t == "sigmoid" else p.clamp(0.0, 1.0)
@@ -233,11 +410,30 @@ _PHONG_SH_PARAMS = frozenset({"albedo", "sh",  "shininess", "ks"})
 _PHONG_ENV_PARAMS= frozenset({"albedo", "env", "shininess", "ks"})
 
 
-def _all_renders_exist(scene_name: str, shader_type: str) -> bool:
+def _write_dataset_meta(scene_name: str, light_mode: str, n_lights: int,
+                        full_circle: bool, light_keys: list) -> None:
+    meta_path = DATASET_ROOT / scene_name / "dataset_meta.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(meta_path, "w") as fh:
+        json.dump({"light_mode": light_mode, "n_lights": n_lights,
+                   "full_circle": full_circle, "light_keys": light_keys}, fh, indent=2)
+
+
+def _read_dataset_meta(scene_name: str) -> Optional[dict]:
+    meta_path = DATASET_ROOT / scene_name / "dataset_meta.json"
+    if meta_path.exists():
+        with open(meta_path) as fh:
+            return json.load(fh)
+    return None
+
+
+def _all_renders_exist(scene_name: str, shader_type: str,
+                       light_keys: Optional[list] = None) -> bool:
     """True when every light's render.png is present for this scene × shader."""
+    keys = light_keys if light_keys is not None else [f"light_{int(a):02d}deg" for a in LIGHT_ANGLES_DEG]
     return all(
-        (DATASET_ROOT / scene_name / shader_type / f"light_{int(a):02d}deg" / "render.png").exists()
-        for a in LIGHT_ANGLES_DEG
+        (DATASET_ROOT / scene_name / shader_type / k / "render.png").exists()
+        for k in keys
     )
 
 
@@ -286,17 +482,19 @@ def _save_render(composite: torch.Tensor, flat_mask: torch.Tensor,
                  H: int, W: int, path: Path) -> None:
     img = _scatter(composite.detach(), flat_mask, H, W).cpu().numpy()
     Image.fromarray((img.clip(0, 1) * 255).astype(np.uint8)).save(path)
+    np.save(path.with_suffix(".npy"), img.astype(np.float32))
 
 
 def _save_config_json(path: Path, *, mesh_name, mat_cfg, angle_deg, direction,
-                      sh_coeffs_np, width, height, light_type) -> None:
+                      sh_coeffs_np, width, height, light_type, light_mode="directional") -> None:
     with open(path, "w") as fh:
         json.dump({
             "mesh_name": mesh_name,
             "material":  mat_cfg,
             "light": {
+                "light_mode": light_mode,
                 "angle_deg":  angle_deg,
-                "direction":  direction.tolist(),
+                "direction":  direction.tolist() if direction is not None else None,
                 "color":      LIGHT_COLOR.tolist(),
                 "intensity":  LIGHT_INTENSITY,
                 "sh_coeffs":  sh_coeffs_np.tolist(),
@@ -315,16 +513,23 @@ def generate_dataset(
     shader:             str            = "all",
     device:             str            = "cuda",
     skip_existing:      bool           = False,
-    mat_configs_filter: Optional[set]  = None,   # None = use all configs
+    mat_configs_filter: Optional[set]  = None,
+    light_mode:         str            = "directional",
+    n_lights:           int            = 6,
+    full_circle:        bool           = False,
 ) -> None:
     """Render material × light × shader combinations.
 
-    shader             : "ct_sh" | "ct_env" | "phong_sh" | "phong_env" | "all"
-    skip_existing      : skip scenes whose renders are already on disk
-    mat_configs_filter : set of config keys to render, e.g. {"albedo_0"}; None = all
+    shader      : "ct_sh" | "ct_env" | "phong_sh" | "phong_env" | "all"
+    light_mode  : "directional" | "random_sh" | "circular"
+    n_lights    : number of light configurations per scene
+    full_circle : for directional mode — span [0°, 360°) instead of [0°, 90°]
     """
-    dev  = device
-    mesh = _load_mesh(mesh_name)
+    dev          = device
+    mesh         = _load_mesh(mesh_name)
+    light_entries = _get_light_entries(light_mode, n_lights, full_circle)
+    light_keys    = [k for k, _ in light_entries]
+    suffix        = _scene_suffix(light_mode, n_lights, full_circle)
 
     ct_mat_cfgs    = {k: v for k, v in MATERIAL_CONFIGS.items()
                       if mat_configs_filter is None or k in mat_configs_filter}
@@ -352,32 +557,43 @@ def generate_dataset(
     if do_ct_sh or do_ct_env:
         lut = _get_ggx_sh_lut(torch.device(dev))
         for mat_id, mat_cfg in ct_mat_cfgs.items():
-            scene_name   = f"{mesh_name}_{mat_id}"
-            need_ct_sh   = do_ct_sh  and not (skip_existing and _all_renders_exist(scene_name, "ct_sh"))
-            need_ct_env  = do_ct_env and not (skip_existing and _all_renders_exist(scene_name, "ct_env"))
+            scene_name   = f"{mesh_name}_{mat_id}{suffix}"
+            need_ct_sh   = do_ct_sh  and not (skip_existing and _all_renders_exist(scene_name, "ct_sh",  light_keys))
+            need_ct_env  = do_ct_env and not (skip_existing and _all_renders_exist(scene_name, "ct_env", light_keys))
             if not need_ct_sh and not need_ct_env:
                 print(f"[Phase 1] {scene_name}  skipped (all renders exist)")
                 continue
-            albedo_t   = torch.tensor(mat_cfg["albedo"], device=dev,
-                                      dtype=torch.float32).expand(M, 3).contiguous()
-            metallic   = mat_cfg["metallic"]
-            roughness  = mat_cfg["roughness"]
+            n_tiles      = mat_cfg.get("n_tiles", 4)
+            normals_m_np = normals_m.cpu().numpy()
+            flat_mask_np = flat_mask.cpu().numpy()
+            metallic     = mat_cfg["metallic"]
+            roughness    = mat_cfg["roughness"]
+
+            if "albedo_checker" in mat_cfg:
+                col_a, col_b = mat_cfg["albedo_checker"]
+                albedo_flat  = _make_checker_map(normals_m_np, col_a, col_b, n_tiles)
+                albedo_t     = torch.from_numpy(albedo_flat).to(dev)
+                albedo_hw    = _scatter_np(albedo_flat, flat_mask_np, height, width)
+            else:
+                albedo_t  = torch.tensor(mat_cfg["albedo"], device=dev,
+                                         dtype=torch.float32).expand(M, 3).contiguous()
+                albedo_hw = (np.tile(np.array(mat_cfg["albedo"], dtype=np.float32),
+                                     (height, width, 1)) * mask_np_gen[:, :, None])
 
             gt_dir = DATASET_ROOT / scene_name / "gt"
             gt_dir.mkdir(parents=True, exist_ok=True)
-            gt_albedo_img = np.tile(
-                np.array(mat_cfg["albedo"], dtype=np.float32), (height, width, 1))
-            gt_albedo_img = (gt_albedo_img * mask_np_gen[:, :, None] * 255).clip(0, 255).astype(np.uint8)
+            gt_albedo_img = (albedo_hw * 255).clip(0, 255).astype(np.uint8)
             Image.fromarray(gt_albedo_img).save(gt_dir / "albedo.png")
+            np.save(gt_dir / "albedo.npy", albedo_hw.astype(np.float32))
             for name, val in [("metallic", metallic), ("roughness", roughness)]:
                 gray = (np.full((height, width), val, dtype=np.float32)
                         * mask_np_gen * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(gray, mode="L").save(gt_dir / f"{name}.png")
             Image.fromarray(normals_vis).save(gt_dir / "normals.png")
 
-            for angle_deg in LIGHT_ANGLES_DEG:
-                sh_light, env_light, direction, sh_coeffs_np, env_raw = _make_lights(angle_deg)
-                light_id = f"light_{int(angle_deg):02d}deg"
+            for light_id, make_fn in light_entries:
+                sh_light, env_light, direction, sh_coeffs_np, env_raw = make_fn()
+                angle_deg = float(np.degrees(np.arctan2(float(direction[0]), float(direction[2])))) if direction is not None else None
 
                 with torch.no_grad():
                     if need_ct_sh:
@@ -394,10 +610,12 @@ def generate_dataset(
                                           mesh_name=mesh_name, mat_cfg=mat_cfg,
                                           angle_deg=angle_deg, direction=direction,
                                           sh_coeffs_np=sh_coeffs_np,
-                                          width=width, height=height, light_type="ct_sh")
+                                          width=width, height=height, light_type="ct_sh",
+                                          light_mode=light_mode)
                         sh_env_img = _sh_coeffs_to_env_img(sh_coeffs_np)
                         Image.fromarray((sh_env_img * 255).astype(np.uint8)).save(
                             sh_dir / "sh_env_map.png")
+                        np.save(sh_dir / "sh_env_map.npy", sh_env_img.astype(np.float32))
 
                     if need_ct_env:
                         env_dir = DATASET_ROOT / scene_name / "ct_env" / light_id
@@ -416,45 +634,87 @@ def generate_dataset(
                                           mesh_name=mesh_name, mat_cfg=mat_cfg,
                                           angle_deg=angle_deg, direction=direction,
                                           sh_coeffs_np=sh_coeffs_np,
-                                          width=width, height=height, light_type="ct_env")
+                                          width=width, height=height, light_type="ct_env",
+                                          light_mode=light_mode)
                         env_img = _env_flat_to_img(env_raw._image_flat,
                                                    *env_raw.image.shape[:2])
                         Image.fromarray((env_img * 255).astype(np.uint8)).save(
                             env_dir / "env_map.png")
+                        np.save(env_dir / "env_map.npy", env_img.astype(np.float32))
 
+            _write_dataset_meta(scene_name, light_mode, n_lights, full_circle, light_keys)
             print(f"[Phase 1] {scene_name}  done")
 
     # ── Phong scenes ─────────────────────────────────────────────────────────
     if do_phong_sh or do_phong_env:
         for mat_id, mat_cfg in phong_mat_cfgs.items():
-            scene_name     = f"{mesh_name}_phong_{mat_id}"
-            need_phong_sh  = do_phong_sh  and not (skip_existing and _all_renders_exist(scene_name, "phong_sh"))
-            need_phong_env = do_phong_env and not (skip_existing and _all_renders_exist(scene_name, "phong_env"))
+            scene_name     = f"{mesh_name}_phong_{mat_id}{suffix}"
+            need_phong_sh  = do_phong_sh  and not (skip_existing and _all_renders_exist(scene_name, "phong_sh",  light_keys))
+            need_phong_env = do_phong_env and not (skip_existing and _all_renders_exist(scene_name, "phong_env", light_keys))
             if not need_phong_sh and not need_phong_env:
                 print(f"[Phase 1] {scene_name}  skipped (all renders exist)")
                 continue
-            albedo_t   = torch.tensor(mat_cfg["albedo"], device=dev,
-                                      dtype=torch.float32).expand(M, 3).contiguous()
-            ka, kd     = mat_cfg["ka"],  mat_cfg["kd"]
-            ks, shin   = mat_cfg["ks"],  mat_cfg["shininess"]
+            n_tiles      = mat_cfg.get("n_tiles", 4)
+            normals_m_np = normals_m.cpu().numpy()
+            flat_mask_np = flat_mask.cpu().numpy()
+            ka, kd = mat_cfg["ka"], mat_cfg["kd"]
+
+            # ── albedo ───────────────────────────────────────────────────────
+            if "albedo_checker" in mat_cfg:
+                col_a, col_b = mat_cfg["albedo_checker"]
+                albedo_flat  = _make_checker_map(normals_m_np, col_a, col_b, n_tiles)
+                albedo_t     = torch.from_numpy(albedo_flat).to(dev)
+                albedo_hw    = _scatter_np(albedo_flat, flat_mask_np, height, width)
+            else:
+                albedo_t  = torch.tensor(mat_cfg["albedo"], device=dev,
+                                         dtype=torch.float32).expand(M, 3).contiguous()
+                albedo_hw = (np.tile(np.array(mat_cfg["albedo"], dtype=np.float32),
+                                     (height, width, 1)) * mask_np_gen[:, :, None])
+
+            # ── shininess ────────────────────────────────────────────────────
+            if "shininess_checker" in mat_cfg:
+                shin_a, shin_b = mat_cfg["shininess_checker"]
+                shin_flat = _make_checker_map(normals_m_np, shin_a, shin_b, n_tiles)
+                shin_t    = torch.from_numpy(shin_flat).to(dev)            # (M, 1)
+                shin_hw   = _scatter_np(shin_flat, flat_mask_np, height, width)
+                shin = float(np.mean([shin_a, shin_b]))
+            else:
+                shin   = mat_cfg["shininess"]
+                shin_t = None
+                shin_hw = np.full((height, width, 1), shin, dtype=np.float32) * mask_np_gen[:, :, None]
+
+            # ── ks ───────────────────────────────────────────────────────────
+            if "ks_checker" in mat_cfg:
+                ks_a, ks_b = mat_cfg["ks_checker"]
+                ks_flat = _make_checker_map(normals_m_np, ks_a, ks_b, n_tiles)
+                ks_t    = torch.from_numpy(ks_flat).to(dev)                # (M, 1)
+                ks_hw   = _scatter_np(ks_flat, flat_mask_np, height, width)
+                ks = float(np.mean([ks_a, ks_b]))
+            else:
+                ks   = mat_cfg["ks"]
+                ks_t = None
+                ks_hw = np.full((height, width, 1), ks, dtype=np.float32) * mask_np_gen[:, :, None]
 
             gt_dir = DATASET_ROOT / scene_name / "gt"
             gt_dir.mkdir(parents=True, exist_ok=True)
-            gt_albedo_img = np.tile(
-                np.array(mat_cfg["albedo"], dtype=np.float32), (height, width, 1))
-            gt_albedo_img = (gt_albedo_img * mask_np_gen[:, :, None] * 255).clip(0, 255).astype(np.uint8)
-            Image.fromarray(gt_albedo_img).save(gt_dir / "albedo.png")
-            shin_gray = (np.full((height, width), shin / SHININESS_RANGE[1], dtype=np.float32)
-                         * mask_np_gen * 255).clip(0, 255).astype(np.uint8)
-            Image.fromarray(shin_gray, mode="L").save(gt_dir / "shininess.png")
-            ks_gray = (np.full((height, width), ks, dtype=np.float32)
-                       * mask_np_gen * 255).clip(0, 255).astype(np.uint8)
-            Image.fromarray(ks_gray, mode="L").save(gt_dir / "ks.png")
+            Image.fromarray((albedo_hw * 255).clip(0, 255).astype(np.uint8)).save(
+                gt_dir / "albedo.png")
+            np.save(gt_dir / "albedo.npy", albedo_hw.astype(np.float32))
+
+            Image.fromarray(
+                (shin_hw[:, :, 0] / SHININESS_RANGE[1] * 255).clip(0, 255).astype(np.uint8),
+                mode="L").save(gt_dir / "shininess.png")
+            np.save(gt_dir / "shininess.npy", shin_hw.astype(np.float32))
+
+            Image.fromarray(
+                (ks_hw[:, :, 0] * 255).clip(0, 255).astype(np.uint8),
+                mode="L").save(gt_dir / "ks.png")
+            np.save(gt_dir / "ks.npy", ks_hw.astype(np.float32))
             Image.fromarray(normals_vis).save(gt_dir / "normals.png")
 
-            for angle_deg in LIGHT_ANGLES_DEG:
-                sh_light, env_light, direction, sh_coeffs_np, env_raw = _make_lights(angle_deg)
-                light_id = f"light_{int(angle_deg):02d}deg"
+            for light_id, make_fn in light_entries:
+                sh_light, env_light, direction, sh_coeffs_np, env_raw = make_fn()
+                angle_deg = float(np.degrees(np.arctan2(float(direction[0]), float(direction[2])))) if direction is not None else None
 
                 with torch.no_grad():
                     if need_phong_sh:
@@ -462,7 +722,9 @@ def generate_dataset(
                         (ps_dir / "components").mkdir(parents=True, exist_ok=True)
                         composite_ps, comps_ps = shade_phong_sh(  # type: ignore[misc]
                             view_m, normals_m,
-                            ka, kd, ks, shin,
+                            ka, kd,
+                            ks_t   if ks_t   is not None else ks,
+                            shin_t if shin_t is not None else shin,
                             albedo_t, sh_light.coeffs.to(dev),
                             return_components=True,
                         )
@@ -472,10 +734,12 @@ def generate_dataset(
                                           mesh_name=mesh_name, mat_cfg=mat_cfg,
                                           angle_deg=angle_deg, direction=direction,
                                           sh_coeffs_np=sh_coeffs_np,
-                                          width=width, height=height, light_type="phong_sh")
+                                          width=width, height=height, light_type="phong_sh",
+                                          light_mode=light_mode)
                         sh_env_img = _sh_coeffs_to_env_img(sh_coeffs_np)
                         Image.fromarray((sh_env_img * 255).astype(np.uint8)).save(
                             ps_dir / "sh_env_map.png")
+                        np.save(ps_dir / "sh_env_map.npy", sh_env_img.astype(np.float32))
 
                     if need_phong_env:
                         pe_dir = DATASET_ROOT / scene_name / "phong_env" / light_id
@@ -486,7 +750,9 @@ def generate_dataset(
                         composite_pe, comps_pe = shade_phong_env(  # type: ignore[misc]
                             view_m, normals_m, albedo_t,
                             env_pix_t, env_dirs_t, env_dw_t,
-                            ka, kd, ks, shin,
+                            ka, kd,
+                            ks_t   if ks_t   is not None else ks,
+                            shin_t if shin_t is not None else shin,
                             return_components=True,
                         )
                         _save_render(composite_pe, flat_mask, height, width, pe_dir / "render.png")
@@ -495,18 +761,67 @@ def generate_dataset(
                                           mesh_name=mesh_name, mat_cfg=mat_cfg,
                                           angle_deg=angle_deg, direction=direction,
                                           sh_coeffs_np=sh_coeffs_np,
-                                          width=width, height=height, light_type="phong_env")
+                                          width=width, height=height, light_type="phong_env",
+                                          light_mode=light_mode)
                         env_img = _env_flat_to_img(env_raw._image_flat,
                                                    *env_raw.image.shape[:2])
                         Image.fromarray((env_img * 255).astype(np.uint8)).save(
                             pe_dir / "env_map.png")
+                        np.save(pe_dir / "env_map.npy", env_img.astype(np.float32))
 
+            _write_dataset_meta(scene_name, light_mode, n_lights, full_circle, light_keys)
             print(f"[Phase 1] {scene_name}  done")
 
     print("[Phase 1] Complete.")
 
 
 # ─────────────────────────────────────── Phase 2 helpers ─────────────────────
+
+def _save_grad_step(
+    step:       int,
+    named_params: dict,        # {name: tensor} — learnable raw params
+    pre_raw:    dict,          # {name: tensor} — param.data clone before opt step
+    gt_map:     dict,          # {name: np.ndarray} — GT values in physical space, broadcast to param shape
+    fwd_map:    dict,          # {name: callable(raw) -> physical}
+    fwd_comps_fn,              # callable() -> list[dict] of shade components per image
+    losses:     tuple,         # (total, data, sparse, white, tv)
+    grad_log_dir: Path,
+    flat_mask:  torch.Tensor,
+    H: int, W: int,
+) -> None:
+    """Save one gradient-flow snapshot as a compressed npz file."""
+    data = {}
+    data["loss_total"]  = np.float32(losses[0])
+    data["loss_data"]   = np.float32(losses[1])
+    data["loss_sparse"] = np.float32(losses[2])
+    data["loss_white"]  = np.float32(losses[3])
+    data["loss_tv"]     = np.float32(losses[4])
+
+    with torch.no_grad():
+        for name, p in named_params.items():
+            raw_np  = p.data.detach().cpu().numpy()
+            data[f"{name}_raw"]    = raw_np
+            data[f"{name}_update"] = raw_np - pre_raw[name].cpu().numpy()
+            if p.grad is not None:
+                data[f"{name}_grad"] = p.grad.detach().cpu().numpy()
+            val = fwd_map[name](p.data)
+            val_np = val.detach().cpu().numpy()
+            data[f"{name}_value"] = val_np
+            if name in gt_map:
+                gt_np = np.broadcast_to(gt_map[name], val_np.shape)
+                data[f"{name}_gt_error"] = val_np - gt_np
+
+        comps_per_img = fwd_comps_fn()
+        for k, comps in enumerate(comps_per_img):
+            for cname, ctensor in comps.items():
+                c_np = ctensor.detach().float().cpu()
+                C = c_np.shape[-1] if c_np.dim() > 1 else 1
+                full = torch.zeros(H * W, C, dtype=torch.float32)
+                full[flat_mask.cpu()] = c_np.reshape(-1, C)
+                data[f"shade_k{k:02d}_{cname}"] = full.reshape(H, W, C).numpy()
+
+    np.savez_compressed(grad_log_dir / f"step_{step:05d}.npz", **data)
+
 
 def _make_optimizer(params, cfg):
     if cfg["optimizer"] == "LBFGS":
@@ -558,6 +873,9 @@ def _optimize_ct_sh(
     gt_albedo:    Optional[np.ndarray] = None,
     opt_params:   Optional[frozenset] = None,
     transforms:   Optional[dict] = None,
+    init_from_gt: bool = False,
+    log_gradients: bool = False,
+    grad_log_dir: Optional[Path] = None,
 ) -> tuple:
     dev    = normals_hw.device
     H, W   = normals_hw.shape[:2]
@@ -578,12 +896,19 @@ def _optimize_ct_sh(
     lut       = _get_ggx_sh_lut(dev)
     mask_t    = mask_hw.unsqueeze(-1).to(dev)
 
-    learnable = []
+    learnable    = []
+    named_params = {}   # for gradient logging
 
     if "albedo" in op:
-        base = imgs_t.mean(0).clamp(0.05, 0.95)
+        if init_from_gt and gt_albedo is not None:
+            base = torch.from_numpy(
+                np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
+            ).to(dev).clamp(0.05, 0.95)
+        else:
+            base = imgs_t.mean(0).clamp(0.05, 0.95)
         albedo_param = _init_albedo(base, tr_ab).requires_grad_(True)
         learnable.append(albedo_param)
+        named_params["albedo"] = albedo_param
     else:
         base = torch.from_numpy(
             np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
@@ -591,26 +916,41 @@ def _optimize_ct_sh(
         albedo_param = _init_albedo(base, tr_ab)
 
     if "sh" in op:
-        sh_init = torch.zeros(N_imgs, 9, 3, device=dev)
-        sh_init[:, 0, :] = 1.5
-        sh_coeffs = sh_init.clone().requires_grad_(True)
+        if init_from_gt and gt_sh_coeffs is not None:
+            sh_coeffs = torch.stack([
+                torch.from_numpy(gt_sh_coeffs[k]).to(dev) for k in range(N_imgs)
+            ]).requires_grad_(True)
+        else:
+            sh_init = torch.zeros(N_imgs, 9, 3, device=dev)
+            sh_init[:, 0, :] = 1.5
+            sh_coeffs = sh_init.clone().requires_grad_(True)
         learnable.append(sh_coeffs)
+        named_params["sh"] = sh_coeffs
     else:
         sh_coeffs = torch.stack([
             torch.from_numpy(gt_sh_coeffs[k]).to(dev) for k in range(N_imgs)
         ])
 
     if "metallic" in op:
-        m0 = 0.5 if tr_met != "sigmoid" else 0.0
-        metallic_raw = torch.full((H, W, 1), m0, dtype=torch.float32, device=dev).requires_grad_(True)
+        if init_from_gt:
+            metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev).requires_grad_(True)
+        else:
+            m0 = 0.5 if tr_met != "sigmoid" else 0.0
+            metallic_raw = torch.full((H, W, 1), m0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(metallic_raw)
+        named_params["metallic"] = metallic_raw
     else:
         metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev)
 
     if "roughness" in op:
-        r0 = 0.5 if tr_rou != "sigmoid" else 0.0
-        roughness_raw = torch.full((H, W, 1), r0, dtype=torch.float32, device=dev).requires_grad_(True)
+        if init_from_gt:
+            metallic_raw_tr = "sigmoid_r" if tr_rou == "sigmoid" else tr_rou
+            roughness_raw = _init_scalar(gt_roughness, H, W, metallic_raw_tr, dev=dev).requires_grad_(True)
+        else:
+            r0 = 0.5 if tr_rou != "sigmoid" else 0.0
+            roughness_raw = torch.full((H, W, 1), r0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(roughness_raw)
+        named_params["roughness"] = roughness_raw
     else:
         roughness_raw = _init_scalar(gt_roughness, H, W, "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev)
 
@@ -639,10 +979,51 @@ def _optimize_ct_sh(
         )
         return loss_data + loss_sparse + loss_white + loss_tv, loss_data, loss_sparse, loss_white, loss_tv
 
+    def _forward_components():
+        with torch.no_grad():
+            albedo_m    = _fwd_albedo(albedo_param, tr_ab).reshape(-1, 3)[flat_mask]
+            metallic_m  = _fwd_metallic(metallic_raw, tr_met).reshape(-1, 1)[flat_mask]
+            roughness_m = _fwd_roughness(roughness_raw, tr_rou).reshape(-1, 1)[flat_mask]
+            result = []
+            for k in range(N_imgs):
+                _, comps = shade_ct_sh(view_m, N_m, albedo_m, sh_coeffs[k],
+                                       metallic_m, roughness_m, lut=lut, return_components=True)
+                result.append(comps)
+        return result
+
+    gt_map_grad = {
+        "albedo":    np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
+        "sh":        np.stack(gt_sh_coeffs).astype(np.float32) if gt_sh_coeffs is not None else None,
+        "metallic":  np.full((H, W, 1), gt_metallic, dtype=np.float32),
+        "roughness": np.full((H, W, 1), gt_roughness, dtype=np.float32),
+    }
+    fwd_map_grad = {
+        "albedo":    lambda p: _fwd_albedo(p, tr_ab),
+        "sh":        lambda p: p,
+        "metallic":  lambda p: _fwd_metallic(p, tr_met),
+        "roughness": lambda p: _fwd_roughness(p, tr_rou),
+    }
+
+    if log_gradients and grad_log_dir is not None:
+        grad_log_dir.mkdir(parents=True, exist_ok=True)
+
     history = []
+    with torch.no_grad():
+        _il, _ild, _ils, _ilw, _iltv = _forward()
+        _im = float(_fwd_metallic(metallic_raw, tr_met)[mask_hw].mean())
+        _ir = float(_fwd_roughness(roughness_raw, tr_rou)[mask_hw].mean())
+    print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
+          f"  metallic={_im:.3f}  roughness={_ir:.3f}")
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
+        if log_gradients:
+            pre_raw = {n: p.data.clone() for n, p in named_params.items()}
         loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        if log_gradients and grad_log_dir is not None:
+            _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
+                            _forward_components,
+                            (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
+                            grad_log_dir, flat_mask, H, W)
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
@@ -713,6 +1094,9 @@ def _optimize_ct_env(
     gt_albedo:    Optional[np.ndarray] = None,
     opt_params:   Optional[frozenset] = None,
     transforms:   Optional[dict] = None,
+    init_from_gt: bool = False,
+    log_gradients: bool = False,
+    grad_log_dir: Optional[Path] = None,
 ) -> tuple:
     dev    = normals_hw.device
     H, W   = normals_hw.shape[:2]
@@ -735,12 +1119,19 @@ def _optimize_ct_env(
     env_dw_t   = _t(env_dw)
     mask_t     = mask_hw.unsqueeze(-1).to(dev)
 
-    learnable = []
+    learnable    = []
+    named_params = {}
 
     if "albedo" in op:
-        base = imgs_t.mean(0).clamp(0.05, 0.95)
+        if init_from_gt and gt_albedo is not None:
+            base = torch.from_numpy(
+                np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
+            ).to(dev).clamp(0.05, 0.95)
+        else:
+            base = imgs_t.mean(0).clamp(0.05, 0.95)
         albedo_param = _init_albedo(base, tr_ab).requires_grad_(True)
         learnable.append(albedo_param)
+        named_params["albedo"] = albedo_param
     else:
         base = torch.from_numpy(
             np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
@@ -748,8 +1139,17 @@ def _optimize_ct_env(
         albedo_param = _init_albedo(base, tr_ab)
 
     if "env" in op:
-        env_raw_params = torch.zeros(N_imgs, P, 3, device=dev).requires_grad_(True)
+        if init_from_gt and gt_sh_coeffs is not None:
+            gt_ef = np.stack([
+                EnvMap.from_sh(SHLighting(gt_sh_coeffs[k]))._image_flat
+                for k in range(N_imgs)
+            ]).astype(np.float32)
+            gt_ef_t = torch.from_numpy(gt_ef).to(dev)
+            env_raw_params = (_softplus_inv(gt_ef_t) if tr_env == "softplus" else gt_ef_t.clone()).requires_grad_(True)
+        else:
+            env_raw_params = torch.zeros(N_imgs, P, 3, device=dev).requires_grad_(True)
         learnable.append(env_raw_params)
+        named_params["env"] = env_raw_params
     else:
         gt_ef = np.stack([
             EnvMap.from_sh(SHLighting(gt_sh_coeffs[k]))._image_flat
@@ -759,16 +1159,25 @@ def _optimize_ct_env(
         env_raw_params = _softplus_inv(gt_ef_t) if tr_env == "softplus" else gt_ef_t.clone()
 
     if "metallic" in op:
-        m0 = 0.5 if tr_met != "sigmoid" else 0.0
-        metallic_raw = torch.full((H, W, 1), m0, dtype=torch.float32, device=dev).requires_grad_(True)
+        if init_from_gt:
+            metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev).requires_grad_(True)
+        else:
+            m0 = 0.5 if tr_met != "sigmoid" else 0.0
+            metallic_raw = torch.full((H, W, 1), m0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(metallic_raw)
+        named_params["metallic"] = metallic_raw
     else:
         metallic_raw = _init_scalar(gt_metallic, H, W, tr_met, dev=dev)
 
     if "roughness" in op:
-        r0 = 0.5 if tr_rou != "sigmoid" else 0.0
-        roughness_raw = torch.full((H, W, 1), r0, dtype=torch.float32, device=dev).requires_grad_(True)
+        if init_from_gt:
+            roughness_raw = _init_scalar(gt_roughness, H, W,
+                                         "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev).requires_grad_(True)
+        else:
+            r0 = 0.5 if tr_rou != "sigmoid" else 0.0
+            roughness_raw = torch.full((H, W, 1), r0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(roughness_raw)
+        named_params["roughness"] = roughness_raw
     else:
         roughness_raw = _init_scalar(gt_roughness, H, W,
                                      "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev)
@@ -801,10 +1210,58 @@ def _optimize_ct_env(
         )
         return loss_data + loss_sparse + loss_white + loss_tv, loss_data, loss_sparse, loss_white, loss_tv
 
+    def _forward_components():
+        with torch.no_grad():
+            albedo_m    = _fwd_albedo(albedo_param, tr_ab).reshape(-1, 3)[flat_mask]
+            metallic_m  = _fwd_metallic(metallic_raw, tr_met).reshape(-1, 1)[flat_mask]
+            roughness_m = _fwd_roughness(roughness_raw, tr_rou).reshape(-1, 1)[flat_mask]
+            result = []
+            for k in range(N_imgs):
+                env_pix_k = _fwd_env(env_raw_params[k], tr_env)
+                _, comps = shade_ct_env(view_m, N_m, albedo_m,
+                                        env_pix_k, env_dirs_t, env_dw_t,
+                                        metallic_m, roughness_m,
+                                        sbatch=cfg.get("sbatch", 64), return_components=True)
+                result.append(comps)
+        return result
+
+    gt_ef_np = np.stack([
+        EnvMap.from_sh(SHLighting(gt_sh_coeffs[k]))._image_flat
+        for k in range(N_imgs)
+    ]).astype(np.float32) if gt_sh_coeffs is not None else None
+    gt_map_grad = {
+        "albedo":    np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
+        "env":       gt_ef_np,
+        "metallic":  np.full((H, W, 1), gt_metallic, dtype=np.float32),
+        "roughness": np.full((H, W, 1), gt_roughness, dtype=np.float32),
+    }
+    fwd_map_grad = {
+        "albedo":    lambda p: _fwd_albedo(p, tr_ab),
+        "env":       lambda p: _fwd_env(p, tr_env),
+        "metallic":  lambda p: _fwd_metallic(p, tr_met),
+        "roughness": lambda p: _fwd_roughness(p, tr_rou),
+    }
+
+    if log_gradients and grad_log_dir is not None:
+        grad_log_dir.mkdir(parents=True, exist_ok=True)
+
     history = []
+    with torch.no_grad():
+        _il, _ild, _ils, _ilw, _iltv = _forward()
+        _im = float(_fwd_metallic(metallic_raw, tr_met)[mask_hw].mean())
+        _ir = float(_fwd_roughness(roughness_raw, tr_rou)[mask_hw].mean())
+    print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
+          f"  metallic={_im:.3f}  roughness={_ir:.3f}")
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
+        if log_gradients:
+            pre_raw = {n: p.data.clone() for n, p in named_params.items()}
         loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        if log_gradients and grad_log_dir is not None:
+            _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
+                            _forward_components,
+                            (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
+                            grad_log_dir, flat_mask, H, W)
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
@@ -879,6 +1336,9 @@ def _optimize_phong_sh(
     gt_albedo:    Optional[np.ndarray] = None,
     opt_params:   Optional[frozenset] = None,
     transforms:   Optional[dict] = None,
+    init_from_gt: bool = False,
+    log_gradients: bool = False,
+    grad_log_dir: Optional[Path] = None,
 ) -> tuple:
     dev    = normals_hw.device
     H, W   = normals_hw.shape[:2]
@@ -900,12 +1360,19 @@ def _optimize_phong_sh(
     view_m    = _norm(cam_pos.unsqueeze(0) - fp_m)
     mask_t    = mask_hw.unsqueeze(-1).to(dev)
 
-    learnable = []
+    learnable    = []
+    named_params = {}
 
     if "albedo" in op:
-        base = imgs_t.mean(0).clamp(0.05, 0.95)
+        if init_from_gt and gt_albedo is not None:
+            base = torch.from_numpy(
+                np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
+            ).to(dev).clamp(0.05, 0.95)
+        else:
+            base = imgs_t.mean(0).clamp(0.05, 0.95)
         albedo_param = _init_albedo(base, tr_ab).requires_grad_(True)
         learnable.append(albedo_param)
+        named_params["albedo"] = albedo_param
     else:
         base = torch.from_numpy(
             np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
@@ -913,37 +1380,74 @@ def _optimize_phong_sh(
         albedo_param = _init_albedo(base, tr_ab)
 
     if "sh" in op:
-        sh_init = torch.zeros(N_imgs, 9, 3, device=dev)
-        sh_init[:, 0, :] = 1.5
-        sh_coeffs = sh_init.clone().requires_grad_(True)
+        if init_from_gt and gt_sh_coeffs is not None:
+            sh_coeffs = torch.stack([
+                torch.from_numpy(gt_sh_coeffs[k]).to(dev) for k in range(N_imgs)
+            ]).requires_grad_(True)
+        else:
+            sh_init = torch.zeros(N_imgs, 9, 3, device=dev)
+            sh_init[:, 0, :] = 1.5
+            sh_coeffs = sh_init.clone().requires_grad_(True)
         learnable.append(sh_coeffs)
+        named_params["sh"] = sh_coeffs
     else:
         sh_coeffs = torch.stack([
             torch.from_numpy(gt_sh_coeffs[k]).to(dev) for k in range(N_imgs)
         ])
 
     if "shininess" in op:
-        s0 = 0.0 if tr_shin == "sigmoid" else 0.5 * (s_min + s_max)
-        shininess_raw = torch.full((H, W, 1), s0, dtype=torch.float32, device=dev).requires_grad_(True)
-        learnable.append(shininess_raw)
-    else:
-        if tr_shin == "sigmoid":
-            sv = float(np.clip((gt_shininess - s_min) / (s_max - s_min), 1e-6, 1 - 1e-6))
-            shin_raw_val = float(np.log(sv / (1 - sv)))
+        if init_from_gt:
+            _gt_shin = np.broadcast_to(np.asarray(gt_shininess, np.float32), (H, W, 1)).copy()
+            if tr_shin == "sigmoid":
+                sv = np.clip((_gt_shin - s_min) / (s_max - s_min), 1e-6, 1 - 1e-6)
+                raw_arr = np.log(sv / (1 - sv))
+            elif tr_shin == "log":
+                raw_arr = np.log(_gt_shin.clip(1e-7))
+            else:
+                raw_arr = _gt_shin
+            shininess_raw = torch.from_numpy(raw_arr.astype(np.float32)).to(dev).requires_grad_(True)
         else:
-            shin_raw_val = float(gt_shininess)
+            if tr_shin == "sigmoid":
+                s0 = 0.0
+            elif tr_shin == "log":
+                s0 = float(np.log(0.5 * (s_min + s_max)))
+            else:
+                s0 = 0.5 * (s_min + s_max)
+            shininess_raw = torch.full((H, W, 1), s0, dtype=torch.float32, device=dev).requires_grad_(True)
+        learnable.append(shininess_raw)
+        named_params["shininess"] = shininess_raw
+    else:
+        _gt_shin_s = float(np.asarray(gt_shininess).mean())
+        if tr_shin == "sigmoid":
+            sv = float(np.clip((_gt_shin_s - s_min) / (s_max - s_min), 1e-6, 1 - 1e-6))
+            shin_raw_val = float(np.log(sv / (1 - sv)))
+        elif tr_shin == "log":
+            shin_raw_val = float(np.log(_gt_shin_s))
+        else:
+            shin_raw_val = float(_gt_shin_s)
         shininess_raw = torch.full((H, W, 1), shin_raw_val, dtype=torch.float32, device=dev)
 
     if "ks" in op:
-        ks0 = 0.0 if tr_ks == "sigmoid" else 0.5
-        ks_raw = torch.full((H, W, 1), ks0, dtype=torch.float32, device=dev).requires_grad_(True)
+        if init_from_gt:
+            _gt_ks = np.broadcast_to(np.asarray(gt_ks, np.float32), (H, W, 1)).copy()
+            if tr_ks == "sigmoid":
+                kv = np.clip(_gt_ks, 1e-6, 1 - 1e-6)
+                raw_arr = np.log(kv / (1 - kv))
+            else:
+                raw_arr = _gt_ks
+            ks_raw = torch.from_numpy(raw_arr.astype(np.float32)).to(dev).requires_grad_(True)
+        else:
+            ks0 = 0.0 if tr_ks == "sigmoid" else 0.5
+            ks_raw = torch.full((H, W, 1), ks0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(ks_raw)
+        named_params["ks"] = ks_raw
     else:
+        _gt_ks_s = float(np.asarray(gt_ks).mean())
         if tr_ks == "sigmoid":
-            kv = float(np.clip(gt_ks, 1e-6, 1 - 1e-6))
+            kv = float(np.clip(_gt_ks_s, 1e-6, 1 - 1e-6))
             ks_raw_val = float(np.log(kv / (1 - kv)))
         else:
-            ks_raw_val = float(gt_ks)
+            ks_raw_val = float(_gt_ks_s)
         ks_raw = torch.full((H, W, 1), ks_raw_val, dtype=torch.float32, device=dev)
 
     opt = _make_optimizer(learnable, cfg)
@@ -969,10 +1473,53 @@ def _optimize_phong_sh(
         )
         return loss_data + loss_sparse + loss_white + loss_tv, loss_data, loss_sparse, loss_white, loss_tv
 
+    def _forward_components():
+        with torch.no_grad():
+            albedo_m    = _fwd_albedo(albedo_param, tr_ab).reshape(-1, 3)[flat_mask]
+            shininess_m = _fwd_shininess(shininess_raw, tr_shin, s_min, s_max).reshape(-1, 1)[flat_mask]
+            ks_m        = _fwd_ks(ks_raw, tr_ks).reshape(-1, 1)[flat_mask]
+            result = []
+            for k in range(N_imgs):
+                _, comps = shade_phong_sh(view_m, N_m, ka, kd, ks_m, shininess_m,
+                                          albedo_m, sh_coeffs[k], return_components=True)
+                result.append(comps)
+        return result
+
+    gt_map_grad = {
+        "albedo":    np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
+        "sh":        np.stack(gt_sh_coeffs).astype(np.float32) if gt_sh_coeffs is not None else None,
+        "shininess": np.broadcast_to(np.asarray(gt_shininess, np.float32), (H, W, 1)).copy(),
+        "ks":        np.broadcast_to(np.asarray(gt_ks, np.float32), (H, W, 1)).copy(),
+    }
+    fwd_map_grad = {
+        "albedo":    lambda p: _fwd_albedo(p, tr_ab),
+        "sh":        lambda p: p,
+        "shininess": lambda p: _fwd_shininess(p, tr_shin, s_min, s_max),
+        "ks":        lambda p: _fwd_ks(p, tr_ks),
+    }
+
+    if log_gradients and grad_log_dir is not None:
+        grad_log_dir.mkdir(parents=True, exist_ok=True)
+
+    _gt_shin_mean = float(np.asarray(gt_shininess).mean())
+    _gt_ks_mean   = float(np.asarray(gt_ks).mean())
     history = []
+    with torch.no_grad():
+        _il, _ild, _ils, _ilw, _iltv = _forward()
+        _is = float(_fwd_shininess(shininess_raw, tr_shin, s_min, s_max)[mask_hw].mean())
+        _ik = float(_fwd_ks(ks_raw, tr_ks)[mask_hw].mean())
+    print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
+          f"  shininess={_is:.1f}  ks={_ik:.3f}")
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
+        if log_gradients:
+            pre_raw = {n: p.data.clone() for n, p in named_params.items()}
         loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        if log_gradients and grad_log_dir is not None:
+            _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
+                            _forward_components,
+                            (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
+                            grad_log_dir, flat_mask, H, W)
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
@@ -998,8 +1545,8 @@ def _optimize_phong_sh(
                                         for k in range(N_imgs)],
                     "shininess_mean":     shin_val,
                     "ks_mean":            ks_val,
-                    "shininess_err_mean": abs(shin_val - gt_shininess),
-                    "ks_err_mean":        abs(ks_val   - gt_ks),
+                    "shininess_err_mean": abs(shin_val - _gt_shin_mean),
+                    "ks_err_mean":        abs(ks_val   - _gt_ks_mean),
                 }, step=i)
     total_time = time.perf_counter() - t0
 
@@ -1046,6 +1593,9 @@ def _optimize_phong_env(
     gt_albedo:    Optional[np.ndarray] = None,
     opt_params:   Optional[frozenset] = None,
     transforms:   Optional[dict] = None,
+    init_from_gt: bool = False,
+    log_gradients: bool = False,
+    grad_log_dir: Optional[Path] = None,
 ) -> tuple:
     dev    = normals_hw.device
     H, W   = normals_hw.shape[:2]
@@ -1070,12 +1620,19 @@ def _optimize_phong_env(
     env_dw_t   = _t(env_dw)
     mask_t     = mask_hw.unsqueeze(-1).to(dev)
 
-    learnable = []
+    learnable    = []
+    named_params = {}
 
     if "albedo" in op:
-        base = imgs_t.mean(0).clamp(0.05, 0.95)
+        if init_from_gt and gt_albedo is not None:
+            base = torch.from_numpy(
+                np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
+            ).to(dev).clamp(0.05, 0.95)
+        else:
+            base = imgs_t.mean(0).clamp(0.05, 0.95)
         albedo_param = _init_albedo(base, tr_ab).requires_grad_(True)
         learnable.append(albedo_param)
+        named_params["albedo"] = albedo_param
     else:
         base = torch.from_numpy(
             np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy()
@@ -1083,8 +1640,17 @@ def _optimize_phong_env(
         albedo_param = _init_albedo(base, tr_ab)
 
     if "env" in op:
-        env_raw_params = torch.zeros(N_imgs, P, 3, device=dev).requires_grad_(True)
+        if init_from_gt and gt_sh_coeffs is not None:
+            gt_ef = np.stack([
+                EnvMap.from_sh(SHLighting(gt_sh_coeffs[k]))._image_flat
+                for k in range(N_imgs)
+            ]).astype(np.float32)
+            gt_ef_t = torch.from_numpy(gt_ef).to(dev)
+            env_raw_params = (_softplus_inv(gt_ef_t) if tr_env == "softplus" else gt_ef_t.clone()).requires_grad_(True)
+        else:
+            env_raw_params = torch.zeros(N_imgs, P, 3, device=dev).requires_grad_(True)
         learnable.append(env_raw_params)
+        named_params["env"] = env_raw_params
     else:
         gt_ef = np.stack([
             EnvMap.from_sh(SHLighting(gt_sh_coeffs[k]))._image_flat
@@ -1094,27 +1660,58 @@ def _optimize_phong_env(
         env_raw_params = _softplus_inv(gt_ef_t) if tr_env == "softplus" else gt_ef_t.clone()
 
     if "shininess" in op:
-        s0 = 0.0 if tr_shin == "sigmoid" else 0.5 * (s_min + s_max)
-        shininess_raw = torch.full((H, W, 1), s0, dtype=torch.float32, device=dev).requires_grad_(True)
-        learnable.append(shininess_raw)
-    else:
-        if tr_shin == "sigmoid":
-            sv = float(np.clip((gt_shininess - s_min) / (s_max - s_min), 1e-6, 1 - 1e-6))
-            shin_raw_val = float(np.log(sv / (1 - sv)))
+        if init_from_gt:
+            _gt_shin = np.broadcast_to(np.asarray(gt_shininess, np.float32), (H, W, 1)).copy()
+            if tr_shin == "sigmoid":
+                sv = np.clip((_gt_shin - s_min) / (s_max - s_min), 1e-6, 1 - 1e-6)
+                raw_arr = np.log(sv / (1 - sv))
+            elif tr_shin == "log":
+                raw_arr = np.log(_gt_shin.clip(1e-7))
+            else:
+                raw_arr = _gt_shin
+            shininess_raw = torch.from_numpy(raw_arr.astype(np.float32)).to(dev).requires_grad_(True)
         else:
-            shin_raw_val = float(gt_shininess)
+            if tr_shin == "sigmoid":
+                s0 = 0.0
+            elif tr_shin == "log":
+                s0 = float(np.log(0.5 * (s_min + s_max)))
+            else:
+                s0 = 0.5 * (s_min + s_max)
+            shininess_raw = torch.full((H, W, 1), s0, dtype=torch.float32, device=dev).requires_grad_(True)
+        learnable.append(shininess_raw)
+        named_params["shininess"] = shininess_raw
+    else:
+        _gt_shin_s = float(np.asarray(gt_shininess).mean())
+        if tr_shin == "sigmoid":
+            sv = float(np.clip((_gt_shin_s - s_min) / (s_max - s_min), 1e-6, 1 - 1e-6))
+            shin_raw_val = float(np.log(sv / (1 - sv)))
+        elif tr_shin == "log":
+            shin_raw_val = float(np.log(_gt_shin_s))
+        else:
+            shin_raw_val = float(_gt_shin_s)
         shininess_raw = torch.full((H, W, 1), shin_raw_val, dtype=torch.float32, device=dev)
 
     if "ks" in op:
-        ks0 = 0.0 if tr_ks == "sigmoid" else 0.5
-        ks_raw = torch.full((H, W, 1), ks0, dtype=torch.float32, device=dev).requires_grad_(True)
+        if init_from_gt:
+            _gt_ks = np.broadcast_to(np.asarray(gt_ks, np.float32), (H, W, 1)).copy()
+            if tr_ks == "sigmoid":
+                kv = np.clip(_gt_ks, 1e-6, 1 - 1e-6)
+                raw_arr = np.log(kv / (1 - kv))
+            else:
+                raw_arr = _gt_ks
+            ks_raw = torch.from_numpy(raw_arr.astype(np.float32)).to(dev).requires_grad_(True)
+        else:
+            ks0 = 0.0 if tr_ks == "sigmoid" else 0.5
+            ks_raw = torch.full((H, W, 1), ks0, dtype=torch.float32, device=dev).requires_grad_(True)
         learnable.append(ks_raw)
+        named_params["ks"] = ks_raw
     else:
+        _gt_ks_s = float(np.asarray(gt_ks).mean())
         if tr_ks == "sigmoid":
-            kv = float(np.clip(gt_ks, 1e-6, 1 - 1e-6))
+            kv = float(np.clip(_gt_ks_s, 1e-6, 1 - 1e-6))
             ks_raw_val = float(np.log(kv / (1 - kv)))
         else:
-            ks_raw_val = float(gt_ks)
+            ks_raw_val = float(_gt_ks_s)
         ks_raw = torch.full((H, W, 1), ks_raw_val, dtype=torch.float32, device=dev)
 
     opt = _make_optimizer(learnable, cfg)
@@ -1143,10 +1740,60 @@ def _optimize_phong_env(
         )
         return loss_data + loss_sparse + loss_white + loss_tv, loss_data, loss_sparse, loss_white, loss_tv
 
+    def _forward_components():
+        with torch.no_grad():
+            albedo_m    = _fwd_albedo(albedo_param, tr_ab).reshape(-1, 3)[flat_mask]
+            shininess_m = _fwd_shininess(shininess_raw, tr_shin, s_min, s_max).reshape(-1, 1)[flat_mask]
+            ks_m        = _fwd_ks(ks_raw, tr_ks).reshape(-1, 1)[flat_mask]
+            result = []
+            for k in range(N_imgs):
+                env_pix_k = _fwd_env(env_raw_params[k], tr_env)
+                _, comps = shade_phong_env(view_m, N_m, albedo_m,
+                                           env_pix_k, env_dirs_t, env_dw_t,
+                                           ka, kd, ks_m, shininess_m,
+                                           sbatch=cfg.get("sbatch", 64), return_components=True)
+                result.append(comps)
+        return result
+
+    gt_ef_np = np.stack([
+        EnvMap.from_sh(SHLighting(gt_sh_coeffs[k]))._image_flat
+        for k in range(N_imgs)
+    ]).astype(np.float32) if gt_sh_coeffs is not None else None
+    gt_map_grad = {
+        "albedo":    np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
+        "env":       gt_ef_np,
+        "shininess": np.broadcast_to(np.asarray(gt_shininess, np.float32), (H, W, 1)).copy(),
+        "ks":        np.broadcast_to(np.asarray(gt_ks, np.float32), (H, W, 1)).copy(),
+    }
+    fwd_map_grad = {
+        "albedo":    lambda p: _fwd_albedo(p, tr_ab),
+        "env":       lambda p: _fwd_env(p, tr_env),
+        "shininess": lambda p: _fwd_shininess(p, tr_shin, s_min, s_max),
+        "ks":        lambda p: _fwd_ks(p, tr_ks),
+    }
+
+    if log_gradients and grad_log_dir is not None:
+        grad_log_dir.mkdir(parents=True, exist_ok=True)
+
+    _gt_shin_mean = float(np.asarray(gt_shininess).mean())
+    _gt_ks_mean   = float(np.asarray(gt_ks).mean())
     history = []
+    with torch.no_grad():
+        _il, _ild, _ils, _ilw, _iltv = _forward()
+        _is = float(_fwd_shininess(shininess_raw, tr_shin, s_min, s_max)[mask_hw].mean())
+        _ik = float(_fwd_ks(ks_raw, tr_ks)[mask_hw].mean())
+    print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
+          f"  shininess={_is:.1f}  ks={_ik:.3f}")
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
+        if log_gradients:
+            pre_raw = {n: p.data.clone() for n, p in named_params.items()}
         loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        if log_gradients and grad_log_dir is not None:
+            _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
+                            _forward_components,
+                            (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
+                            grad_log_dir, flat_mask, H, W)
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
@@ -1175,8 +1822,8 @@ def _optimize_phong_env(
                     "env_map_avg":    wandb.Image(env_avg_img),
                     "shininess_mean":     shin_val,
                     "ks_mean":            ks_val,
-                    "shininess_err_mean": abs(shin_val - gt_shininess),
-                    "ks_err_mean":        abs(ks_val   - gt_ks),
+                    "shininess_err_mean": abs(shin_val - _gt_shin_mean),
+                    "ks_err_mean":        abs(ks_val   - _gt_ks_mean),
                 }, step=i)
     total_time = time.perf_counter() - t0
 
@@ -1217,6 +1864,11 @@ def run_decomposition(
     skip_existing:      bool           = False,
     mat_configs_filter: Optional[set]  = None,
     transforms:         Optional[dict] = None,
+    light_mode:         str            = "directional",
+    n_lights:           int            = 6,
+    full_circle:        bool           = False,
+    init_from_gt:       bool           = False,
+    log_gradients:      bool           = False,
 ) -> None:
     cfg = {**DEFAULT_CFG, **(cfg_overrides or {})}
     dev = device
@@ -1248,6 +1900,12 @@ def run_decomposition(
         result_shader += f"_lw={lw}"
     if lt:
         result_shader += f"_lt={lt}"
+    if init_from_gt:
+        result_shader += "_gtinit"
+    if log_gradients:
+        result_shader += "_gradlog"
+
+    suffix = _scene_suffix(light_mode, n_lights, full_circle)
 
     mesh = _load_mesh(mesh_name)
     normals_hw, frag_pos_hw, mask_hw, cam_pos = rasterize_geometry(
@@ -1264,9 +1922,17 @@ def run_decomposition(
         Image.fromarray((arr_hw1.squeeze(-1) * 255).clip(0, 255).astype(np.uint8)).save(path)
 
     for mat_id, mat_cfg in mat_configs.items():
-        scene_prefix = f"{mesh_name}_phong_{mat_id}" if is_phong else f"{mesh_name}_{mat_id}"
-        if mat_filter and scene_prefix != mat_filter:
+        base_prefix  = f"{mesh_name}_phong_{mat_id}" if is_phong else f"{mesh_name}_{mat_id}"
+        scene_prefix = f"{base_prefix}{suffix}"
+        if mat_filter and scene_prefix != mat_filter and base_prefix != mat_filter:
             continue
+
+        # Read light keys from dataset_meta.json; fall back to LIGHT_ANGLES_DEG for old data
+        meta = _read_dataset_meta(scene_prefix)
+        if meta is not None:
+            light_keys = meta["light_keys"]
+        else:
+            light_keys = [f"light_{int(a):02d}deg" for a in LIGHT_ANGLES_DEG]
 
         out_dir_check = tr_dir / scene_prefix / result_shader
         if skip_existing and (out_dir_check / "metrics.json").exists():
@@ -1276,21 +1942,28 @@ def run_decomposition(
         print(f"\n[Phase 2] {scene_prefix}  ({shader})")
 
         images, gt_sh_list = [], []
-        for angle_deg in LIGHT_ANGLES_DEG:
-            light_id = f"light_{int(angle_deg):02d}deg"
+        for light_id in light_keys:
             img_path = DATASET_ROOT / scene_prefix / shader / light_id / "render.png"
             cfg_path = DATASET_ROOT / scene_prefix / shader / light_id / "config.json"
             if not img_path.exists():
                 raise FileNotFoundError(f"{img_path} — run --phase 1 --shader {shader} first.")
-            images.append(np.array(Image.open(img_path), dtype=np.float32) / 255.0)
+            npy_path = img_path.with_suffix(".npy")
+            if npy_path.exists():
+                images.append(np.load(npy_path).astype(np.float32))
+            else:
+                images.append(np.array(Image.open(img_path), dtype=np.float32) / 255.0)
             with open(cfg_path) as fh:
                 gt_sh_list.append(np.array(
                     json.load(fh)["light"]["sh_coeffs"], dtype=np.float32))
 
-        gt_albedo_img = np.tile(np.array(mat_cfg["albedo"], dtype=np.float32),
-                                (height, width, 1))
         mask_np = mask_hw.cpu().numpy()
-        gt_color = np.array(mat_cfg["albedo"], dtype=np.float32)
+        _gt_alb_npy = DATASET_ROOT / scene_prefix / "gt" / "albedo.npy"
+        if _gt_alb_npy.exists():
+            gt_color = np.load(_gt_alb_npy)               # (H, W, 3), already masked
+        else:
+            gt_color = (np.tile(np.array(mat_cfg["albedo"], dtype=np.float32), (height, width, 1))
+                        * mask_np[:, :, None])
+        gt_albedo_img = gt_color
 
         run = wandb.init(
             entity  ="DLVC-intrinsics",
@@ -1299,7 +1972,8 @@ def run_decomposition(
                           material=mat_cfg, shader=shader,
                           opt_params=sorted(opt_params) if opt_params is not None else "all",
                           transforms=tr, transform_folder=transform_folder,
-                          width=width, height=height, n_images=len(images)),
+                          width=width, height=height, n_images=len(images),
+                          light_mode=light_mode, init_from_gt=init_from_gt),
             name    =f"{scene_prefix}_{result_shader}",
             reinit  =True,
         )
@@ -1308,11 +1982,18 @@ def run_decomposition(
         gt_sh_env_imgs = [_sh_coeffs_to_env_img(gt_sh) for gt_sh in gt_sh_list]
 
         if is_phong:
-            gt_shin = mat_cfg["shininess"]
-            gt_ks   = mat_cfg["ks"]
-            gt_shin_img = np.full((height, width),
-                                  gt_shin / SHININESS_RANGE[1], dtype=np.float32)
-            gt_ks_img   = np.full((height, width), gt_ks, dtype=np.float32)
+            _gt_shin_npy = DATASET_ROOT / scene_prefix / "gt" / "shininess.npy"
+            _gt_ks_npy   = DATASET_ROOT / scene_prefix / "gt" / "ks.npy"
+            gt_shin_map  = (np.load(_gt_shin_npy) if _gt_shin_npy.exists()
+                            else np.full((height, width, 1), mat_cfg["shininess"], dtype=np.float32)
+                                 * mask_np[:, :, None])
+            gt_ks_map    = (np.load(_gt_ks_npy) if _gt_ks_npy.exists()
+                            else np.full((height, width, 1), mat_cfg["ks"], dtype=np.float32)
+                                 * mask_np[:, :, None])
+            gt_shin = float(gt_shin_map[mask_np].mean())
+            gt_ks   = float(gt_ks_map[mask_np].mean())
+            gt_shin_img = gt_shin_map[:, :, 0] / SHININESS_RANGE[1]
+            gt_ks_img   = gt_ks_map[:, :, 0]
             run.log({"gt_images":       [wandb.Image(img) for img in images],
                      "gt_albedo":       wandb.Image(gt_albedo_img),
                      "gt_shininess":    wandb.Image(gt_shin_img),
@@ -1329,6 +2010,9 @@ def run_decomposition(
                      "gt_roughness":    wandb.Image(gt_roughness_img),
                      "gt_sh_env_maps":  [wandb.Image(e) for e in gt_sh_env_imgs]}, step=0)
 
+        # gradient log dir (created lazily by _optimize_* when log_gradients=True)
+        grad_log_dir = tr_dir / scene_prefix / result_shader / "gradient_flow"
+
         # ── dispatch ──────────────────────────────────────────────────────────
         sh_out:   np.ndarray = np.empty(0)
         env_maps: np.ndarray = np.empty(0)
@@ -1339,6 +2023,8 @@ def run_decomposition(
                 gt_metallic, gt_roughness, cfg,  # type: ignore[possibly-undefined]
                 wandb_run=run, gt_sh_coeffs=gt_sh_list,
                 gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
+                init_from_gt=init_from_gt, log_gradients=log_gradients,
+                grad_log_dir=grad_log_dir,
             )
         elif shader == "ct_env":
             albedo, env_maps, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(
@@ -1346,22 +2032,28 @@ def run_decomposition(
                 gt_metallic, gt_roughness, env_dirs, env_dw, cfg,  # type: ignore[possibly-undefined]
                 wandb_run=run, env_H=env_H, env_W=env_W,
                 gt_sh_coeffs=gt_sh_list, gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
+                init_from_gt=init_from_gt, log_gradients=log_gradients,
+                grad_log_dir=grad_log_dir,
             )
         elif shader == "phong_sh":
             albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_phong_sh(
                 images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_shin, gt_ks,  # type: ignore[possibly-undefined]
+                gt_shin_map, gt_ks_map,  # type: ignore[possibly-undefined]  # spatial GT (broadcast-compatible)
                 mat_cfg["ka"], mat_cfg["kd"], cfg,
                 wandb_run=run, gt_sh_coeffs=gt_sh_list,
                 gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
+                init_from_gt=init_from_gt, log_gradients=log_gradients,
+                grad_log_dir=grad_log_dir,
             )
         else:  # phong_env
             albedo, env_maps, mat_a, mat_b, shadings, history, elapsed = _optimize_phong_env(
                 images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_shin, gt_ks,  # type: ignore[possibly-undefined]
+                gt_shin_map, gt_ks_map,  # type: ignore[possibly-undefined]  # spatial GT
                 mat_cfg["ka"], mat_cfg["kd"],
                 env_dirs, env_dw, cfg, wandb_run=run, env_H=env_H, env_W=env_W,
                 gt_sh_coeffs=gt_sh_list, gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
+                init_from_gt=init_from_gt, log_gradients=log_gradients,
+                grad_log_dir=grad_log_dir,
             )
 
         # mat_a = metallic or shininess (H,W,1), mat_b = roughness or ks (H,W,1)
@@ -1371,7 +2063,7 @@ def run_decomposition(
 
         # ── albedo RMSE ───────────────────────────────────────────────────────
         est_px = torch.from_numpy(albedo[mask_np])
-        gt_px  = torch.from_numpy(gt_color).unsqueeze(0).expand_as(est_px)
+        gt_px  = torch.from_numpy(gt_color[mask_np])          # (M, 3) — handles flat and spatial GT
         rmse_t, scale_t = _albedo_rmse(est_px, gt_px)
         rmse   = float(rmse_t)
         scale  = scale_t.numpy()                                  # (3,) per-channel
@@ -1387,8 +2079,13 @@ def run_decomposition(
         else:
             env_maps_rescaled = env_maps
 
-        mat_a_err  = np.abs(mat_a - gt_a)
-        mat_b_err  = np.abs(mat_b - gt_b)
+        # Use spatial GT maps for per-pixel error (broadcast scalar GT for CT)
+        if is_phong:
+            mat_a_err = np.abs(mat_a - gt_shin_map)   # type: ignore[possibly-undefined]
+            mat_b_err = np.abs(mat_b - gt_ks_map)     # type: ignore[possibly-undefined]
+        else:
+            mat_a_err = np.abs(mat_a - gt_a)
+            mat_b_err = np.abs(mat_b - gt_b)
         mat_a_mean = float(mat_a[mask_np].mean())
         mat_b_mean = float(mat_b[mask_np].mean())
 
@@ -1448,32 +2145,44 @@ def run_decomposition(
 
         Image.fromarray((albedo.clip(0, 1) * 255).astype(np.uint8)).save(
             out_dir / "albedo_est.png")
+        np.save(out_dir / "albedo_est.npy", albedo.astype(np.float32))   # raw, unscaled
+
         # shininess is in [s_min, s_max] — normalize to [0, 1] for 8-bit images
         a_norm = SHININESS_RANGE[1] if (is_phong and a_label == "shininess") else 1.0
         _save_gray(mat_a / a_norm, out_dir / f"{a_label}_est.png")
+        np.save(out_dir / f"{a_label}_est.npy", mat_a.astype(np.float32))   # actual units
         _save_gray(mat_b,          out_dir / f"{b_label}_est.png")
+        np.save(out_dir / f"{b_label}_est.npy", mat_b.astype(np.float32))
         _save_gray(mat_a_err / a_norm * mask_np[:, :, None], out_dir / f"{a_label}_err.png")
+        np.save(out_dir / f"{a_label}_err.npy",
+                (mat_a_err * mask_np[:, :, None]).astype(np.float32))       # actual units
         _save_gray(mat_b_err * mask_np[:, :, None],          out_dir / f"{b_label}_err.png")
+        np.save(out_dir / f"{b_label}_err.npy",
+                (mat_b_err * mask_np[:, :, None]).astype(np.float32))
 
         for k, (s, e) in enumerate(zip(shadings, recon_err)):
-            angle = LIGHT_ANGLES_DEG[k]
+            lk = light_keys[k]
             Image.fromarray((s.clip(0, 1) * 255).astype(np.uint8)).save(
-                recon_dir / f"recon_{angle:02d}deg.png")
+                recon_dir / f"recon_{lk}.png")
+            np.save(recon_dir / f"recon_{lk}.npy", s.astype(np.float32))
             Image.fromarray((e.mean(-1) * 255).clip(0, 255).astype(np.uint8)).save(
-                recon_dir / f"recon_err_{angle:02d}deg.png")
+                recon_dir / f"recon_err_{lk}.png")
+            np.save(recon_dir / f"recon_err_{lk}.npy", e.astype(np.float32))
 
         if shader in ("ct_sh", "phong_sh"):
             np.save(out_dir / "sh_coeffs_est.npy", sh_out_rescaled)
             for k, sh_k in enumerate(sh_out_rescaled):
-                img = (_sh_coeffs_to_env_img(sh_k) * 255).astype(np.uint8)
-                Image.fromarray(img).save(
-                    out_dir / f"sh_env_map_{LIGHT_ANGLES_DEG[k]:02d}deg.png")
+                sh_env_img = _sh_coeffs_to_env_img(sh_k)
+                Image.fromarray((sh_env_img * 255).astype(np.uint8)).save(
+                    out_dir / f"sh_env_map_{light_keys[k]}.png")
+                np.save(out_dir / f"sh_env_map_{light_keys[k]}.npy", sh_env_img.astype(np.float32))
         else:
             np.save(out_dir / "env_maps_est.npy", env_maps_rescaled)
             for k, env_k in enumerate(env_maps_rescaled):
-                img = (_env_flat_to_img(env_k, env_H, env_W) * 255).astype(np.uint8)
-                Image.fromarray(img).save(
-                    out_dir / f"env_map_{LIGHT_ANGLES_DEG[k]:02d}deg.png")
+                env_img = _env_flat_to_img(env_k, env_H, env_W)
+                Image.fromarray((env_img * 255).astype(np.uint8)).save(
+                    out_dir / f"env_map_{light_keys[k]}.png")
+                np.save(out_dir / f"env_map_{light_keys[k]}.npy", env_img.astype(np.float32))
             env_avg_img = _env_flat_to_img(env_maps_rescaled.mean(0), env_H, env_W)
             Image.fromarray((env_avg_img * 255).astype(np.uint8)).save(
                 out_dir / "env_map_avg.png")
@@ -1533,6 +2242,17 @@ def _build_parser():
     p.add_argument("--transforms", default="none",
                    help="Parameter domain transforms: 'none', 'all', or custom 'k=v,...' pairs. "
                         "Default: none (no transforms).")
+    p.add_argument("--light-mode", default="directional",
+                   choices=["directional", "random_sh", "circular"],
+                   help="Lighting mode for dataset generation (default: directional).")
+    p.add_argument("--n-lights",   type=int, default=6,
+                   help="Number of light configurations per scene (default: 6).")
+    p.add_argument("--full-circle", action="store_true",
+                   help="Spread directional lights over full 360° instead of 0–90°.")
+    p.add_argument("--init-from-gt", action="store_true",
+                   help="Initialize optimizable parameters from GT values (phase 2).")
+    p.add_argument("--log-gradients", action="store_true",
+                   help="Log per-step gradient flow snapshots to gradient_flow/ (phase 2).")
     return p
 
 
@@ -1560,7 +2280,10 @@ def main():
             generate_dataset(mesh_name=mesh, width=args.width, height=args.height,
                              shader=args.shader, device=device,
                              skip_existing=skip_existing,
-                             mat_configs_filter=mat_configs_filter)
+                             mat_configs_filter=mat_configs_filter,
+                             light_mode=args.light_mode,
+                             n_lights=args.n_lights,
+                             full_circle=args.full_circle)
     else:
         for mesh in meshes:
             for sh in shaders:
@@ -1576,6 +2299,11 @@ def main():
                     skip_existing      =skip_existing,
                     mat_configs_filter =mat_configs_filter,
                     transforms         =transforms,
+                    light_mode         =args.light_mode,
+                    n_lights           =args.n_lights,
+                    full_circle        =args.full_circle,
+                    init_from_gt       =args.init_from_gt,
+                    log_gradients      =args.log_gradients,
                 )
 
 
