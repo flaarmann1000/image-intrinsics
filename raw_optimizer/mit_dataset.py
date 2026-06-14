@@ -370,9 +370,12 @@ def _build_parser():
     p.add_argument("--height",   type=int,   default=256)
     p.add_argument("--n-iter",   type=int,   default=None)
     p.add_argument("--lr",       type=float, default=None)
-    p.add_argument("--sbatch",   type=int,   default=64,
-                   help="Env-map sample batch size per forward pass (default 16; "
+    p.add_argument("--sbatch",   type=int,   default=1024,
+                   help="Env-map sample batch size per forward pass (default 64; "
                         "reduce if OOM, increase for speed)")
+    p.add_argument("--img-batch", type=int,  default=None,
+                   help="Images per gradient-accumulation step (default: all images at once); "
+                        "set to 1 to process images one-by-one and avoid OOM on large datasets")
     p.add_argument("--device",   default=None)
     p.add_argument("--no-skip", action="store_true",
                    help="Re-run even if metrics.json already exists")
@@ -396,6 +399,7 @@ def main():
 
     overrides = {k: v for k, v in [
         ("n_iter", args.n_iter), ("lr", args.lr), ("sbatch", args.sbatch),
+        ("img_batch", args.img_batch),
     ] if v is not None}
 
     hfov_list = args.hfov  # None, or list of one or more floats

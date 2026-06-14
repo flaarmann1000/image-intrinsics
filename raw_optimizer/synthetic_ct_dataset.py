@@ -1269,7 +1269,11 @@ def _optimize_ct_env(
 
     opt = _make_optimizer(learnable, cfg)
 
-    def _forward():
+    def _forward(img_indices=None):
+        if img_indices is None:
+            img_indices = range(N_imgs)
+        img_indices = list(img_indices)
+        frac = len(img_indices) / N_imgs
         albedo      = _fwd_albedo(albedo_param, tr_ab)
         albedo_m    = albedo.reshape(-1, 3)[flat_mask]
         metallic    = _fwd_metallic(metallic_raw, tr_met)
@@ -1277,7 +1281,7 @@ def _optimize_ct_env(
         metallic_m  = metallic.reshape(-1, 1)[flat_mask]
         roughness_m = roughness.reshape(-1, 1)[flat_mask]
         loss_data = albedo.new_zeros(())
-        for k in range(N_imgs):
+        for k in img_indices:
             env_pix_k = _fwd_env(env_raw_params[k], tr_env)
             recon_m   = shade_ct_env(view_m, N_m, albedo_m,
                                      env_pix_k, env_dirs_t, env_dw_t,
@@ -1286,9 +1290,9 @@ def _optimize_ct_env(
             recon = albedo.new_zeros(H, W, 3)
             recon.reshape(-1, 3)[flat_mask] = recon_m
             loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"])
-        loss_sparse = cfg["lambda_sparse"] * _tv(albedo_param.permute(2, 0, 1))
-        loss_white  = cfg["lambda_white"]  * (_fwd_albedo(albedo_param, tr_ab).mean() - 0.5) ** 2
-        loss_tv     = cfg["lambda_tv"] * (
+        loss_sparse = frac * cfg["lambda_sparse"] * _tv(albedo_param.permute(2, 0, 1))
+        loss_white  = frac * cfg["lambda_white"]  * (_fwd_albedo(albedo_param, tr_ab).mean() - 0.5) ** 2
+        loss_tv     = frac * cfg["lambda_tv"] * (
             _tv(albedo_param.permute(2, 0, 1)) +
             _tv(metallic_raw.permute(2, 0, 1)) +
             _tv(roughness_raw.permute(2, 0, 1))
@@ -1338,10 +1342,22 @@ def _optimize_ct_env(
     print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
           f"  metallic={_im:.3f}  roughness={_ir:.3f}")
     t0 = time.perf_counter()
+    img_batch = cfg.get("img_batch", N_imgs) or N_imgs
     for i in range(cfg["n_iter"]):
         if log_gradients:
             pre_raw = {n: p.data.clone() for n, p in named_params.items()}
-        loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        if img_batch >= N_imgs or log_gradients:
+            loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        else:
+            opt.zero_grad()
+            totals = [0.0] * 5
+            for _b in range(0, N_imgs, img_batch):
+                _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
+                _vals[0].backward()
+                for _j, _v in enumerate(_vals):
+                    totals[_j] += float(_v)
+            opt.step()
+            loss, l_d, l_s, l_w, l_tv = totals
         if log_gradients and grad_log_dir is not None:
             _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
                             _forward_components,
@@ -1801,13 +1817,17 @@ def _optimize_phong_env(
 
     opt = _make_optimizer(learnable, cfg)
 
-    def _forward():
+    def _forward(img_indices=None):
+        if img_indices is None:
+            img_indices = range(N_imgs)
+        img_indices = list(img_indices)
+        frac = len(img_indices) / N_imgs
         albedo      = _fwd_albedo(albedo_param, tr_ab)
         albedo_m    = albedo.reshape(-1, 3)[flat_mask]
         shininess_m = _fwd_shininess(shininess_raw, tr_shin, s_min, s_max).reshape(-1, 1)[flat_mask]
         ks_m        = _fwd_ks(ks_raw, tr_ks).reshape(-1, 1)[flat_mask]
         loss_data   = albedo.new_zeros(())
-        for k in range(N_imgs):
+        for k in img_indices:
             env_pix_k = _fwd_env(env_raw_params[k], tr_env)
             recon_m   = shade_phong_env(view_m, N_m, albedo_m,
                                         env_pix_k, env_dirs_t, env_dw_t,
@@ -1816,9 +1836,9 @@ def _optimize_phong_env(
             recon = albedo.new_zeros(H, W, 3)
             recon.reshape(-1, 3)[flat_mask] = recon_m
             loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"])
-        loss_sparse = cfg["lambda_sparse"] * _tv(albedo_param.permute(2, 0, 1))
-        loss_white  = cfg["lambda_white"]  * (_fwd_albedo(albedo_param, tr_ab).mean() - 0.5) ** 2
-        loss_tv     = cfg["lambda_tv"] * (
+        loss_sparse = frac * cfg["lambda_sparse"] * _tv(albedo_param.permute(2, 0, 1))
+        loss_white  = frac * cfg["lambda_white"]  * (_fwd_albedo(albedo_param, tr_ab).mean() - 0.5) ** 2
+        loss_tv     = frac * cfg["lambda_tv"] * (
             _tv(albedo_param.permute(2, 0, 1)) +
             _tv(shininess_raw.permute(2, 0, 1)) +
             _tv(ks_raw.permute(2, 0, 1))
@@ -1870,10 +1890,22 @@ def _optimize_phong_env(
     print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
           f"  shininess={_is:.1f}  ks={_ik:.3f}")
     t0 = time.perf_counter()
+    img_batch = cfg.get("img_batch", N_imgs) or N_imgs
     for i in range(cfg["n_iter"]):
         if log_gradients:
             pre_raw = {n: p.data.clone() for n, p in named_params.items()}
-        loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        if img_batch >= N_imgs or log_gradients:
+            loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+        else:
+            opt.zero_grad()
+            totals = [0.0] * 5
+            for _b in range(0, N_imgs, img_batch):
+                _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
+                _vals[0].backward()
+                for _j, _v in enumerate(_vals):
+                    totals[_j] += float(_v)
+            opt.step()
+            loss, l_d, l_s, l_w, l_tv = totals
         if log_gradients and grad_log_dir is not None:
             _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
                             _forward_components,
