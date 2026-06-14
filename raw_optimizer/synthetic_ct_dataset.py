@@ -1349,14 +1349,23 @@ def _optimize_ct_env(
         if img_batch >= N_imgs or log_gradients:
             loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
         else:
-            opt.zero_grad()
             totals = [0.0] * 5
-            for _b in range(0, N_imgs, img_batch):
-                _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
-                _vals[0].backward()
-                for _j, _v in enumerate(_vals):
-                    totals[_j] += float(_v)
-            opt.step()
+
+            def _accum():
+                opt.zero_grad()
+                totals[:] = [0.0] * 5
+                for _b in range(0, N_imgs, img_batch):
+                    _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
+                    _vals[0].backward()
+                    for _j, _v in enumerate(_vals):
+                        totals[_j] += float(_v.detach())
+                return torch.tensor(totals[0])
+
+            if cfg.get("optimizer") == "LBFGS":
+                opt.step(_accum)
+            else:
+                _accum()
+                opt.step()
             loss, l_d, l_s, l_w, l_tv = totals
         if log_gradients and grad_log_dir is not None:
             _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
@@ -1897,14 +1906,23 @@ def _optimize_phong_env(
         if img_batch >= N_imgs or log_gradients:
             loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
         else:
-            opt.zero_grad()
             totals = [0.0] * 5
-            for _b in range(0, N_imgs, img_batch):
-                _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
-                _vals[0].backward()
-                for _j, _v in enumerate(_vals):
-                    totals[_j] += float(_v)
-            opt.step()
+
+            def _accum():
+                opt.zero_grad()
+                totals[:] = [0.0] * 5
+                for _b in range(0, N_imgs, img_batch):
+                    _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
+                    _vals[0].backward()
+                    for _j, _v in enumerate(_vals):
+                        totals[_j] += float(_v.detach())
+                return torch.tensor(totals[0])
+
+            if cfg.get("optimizer") == "LBFGS":
+                opt.step(_accum)
+            else:
+                _accum()
+                opt.step()
             loss, l_d, l_s, l_w, l_tv = totals
         if log_gradients and grad_log_dir is not None:
             _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
