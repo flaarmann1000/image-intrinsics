@@ -212,7 +212,26 @@ def run_mit_decomposition(
 
         for reg_name in reg_names:
             reg_cfg       = REG_CONFIGS[reg_name]
-            result_shader = _result_shader_name(shader_name, reg_cfg) + view_suffix
+            ov            = cfg_overrides or {}
+            cfg_suffix    = ""
+            if ov.get("init_spec_zero"):
+                cfg_suffix += "_sz"
+            if ov.get("spec_warmup_steps"):
+                cfg_suffix += f"_sw{ov['spec_warmup_steps']}"
+            if ov.get("optimizer") == "Adam":
+                cfg_suffix += "_adam"
+            if ov.get("lr") is not None:
+                cfg_suffix += f"_lr{ov['lr']}"
+            if ov.get("lr_schedule", "none") != "none":
+                cfg_suffix += f"_{ov['lr_schedule']}"
+                if ov.get("lr_end"):
+                    cfg_suffix += f"_lre{ov['lr_end']}"
+                if ov.get("lr_schedule") == "step":
+                    if ov.get("lr_schedule_step") is not None:
+                        cfg_suffix += f"_s{ov['lr_schedule_step']}"
+                    if ov.get("lr_schedule_gamma") is not None:
+                        cfg_suffix += f"_g{ov['lr_schedule_gamma']}"
+            result_shader = _result_shader_name(shader_name, reg_cfg) + cfg_suffix + view_suffix
             out_dir       = RESULTS_ROOT / transform_folder / dataset / result_shader
             out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -369,13 +388,30 @@ def _build_parser():
     p.add_argument("--width",    type=int,   default=384)
     p.add_argument("--height",   type=int,   default=256)
     p.add_argument("--n-iter",   type=int,   default=None)
-    p.add_argument("--lr",       type=float, default=None)
+    p.add_argument("--lr",        type=float, default=None)
+    p.add_argument("--optimizer", default=None, choices=["Adam", "LBFGS"])
     p.add_argument("--sbatch",   type=int,   default=1024,
                    help="Env-map sample batch size per forward pass (default 64; "
                         "reduce if OOM, increase for speed)")
     p.add_argument("--img-batch", type=int,  default=None,
                    help="Images per gradient-accumulation step (default: all images at once); "
                         "set to 1 to process images one-by-one and avoid OOM on large datasets")
+    p.add_argument("--spec-warmup", type=int, default=None,
+                   help="Freeze specular contribution for this many steps (metallic=0/roughness=1 "
+                        "for CT, ks=0 for Phong); useful to stabilise albedo before fitting specularity")
+    p.add_argument("--init-spec-zero", action="store_true",
+                   help="Init specular params to their 'off' state (metallic=0/roughness=1 for CT, "
+                        "ks=0 for Phong) instead of the default mid-range values")
+    p.add_argument("--lr-end", type=float, default=None,
+                   help="Final LR for cosine / linear / exponential schedules (default 0)")
+    p.add_argument("--lr-schedule", default=None,
+                   choices=["cosine", "step", "linear", "exponential"],
+                   help="LR schedule for Adam (ignored for LBFGS): cosine annealing, "
+                        "step decay, linear decay, or exponential decay")
+    p.add_argument("--lr-schedule-step", type=int, default=None,
+                   help="Step size (iters) for --lr-schedule step (default 50)")
+    p.add_argument("--lr-schedule-gamma", type=float, default=None,
+                   help="Decay factor for --lr-schedule step (default 0.5)")
     p.add_argument("--device",   default=None)
     p.add_argument("--no-skip", action="store_true",
                    help="Re-run even if metrics.json already exists")
@@ -398,8 +434,17 @@ def main():
     tr     = _parse_transforms(args.transforms)
 
     overrides = {k: v for k, v in [
-        ("n_iter", args.n_iter), ("lr", args.lr), ("sbatch", args.sbatch),
-        ("img_batch", args.img_batch),
+        ("n_iter",            args.n_iter),
+        ("lr",                args.lr),
+        ("sbatch",            args.sbatch),
+        ("img_batch",         args.img_batch),
+        ("spec_warmup_steps", args.spec_warmup),
+        ("init_spec_zero",    True if args.init_spec_zero else None),
+        ("lr_end",            args.lr_end),
+        ("lr_schedule",       args.lr_schedule),
+        ("lr_schedule_step",  args.lr_schedule_step),
+        ("lr_schedule_gamma", args.lr_schedule_gamma),
+        ("optimizer",         args.optimizer),
     ] if v is not None}
 
     hfov_list = args.hfov  # None, or list of one or more floats
