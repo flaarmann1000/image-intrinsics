@@ -892,7 +892,7 @@ def _save_grad_step(
             val = fwd_map[name](p.data)
             val_np = val.detach().cpu().numpy()
             data[f"{name}_value"] = val_np
-            if name in gt_map:
+            if name in gt_map and gt_map[name] is not None:
                 gt_np = np.broadcast_to(gt_map[name], val_np.shape)
                 data[f"{name}_gt_error"] = val_np - gt_np
 
