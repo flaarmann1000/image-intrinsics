@@ -441,10 +441,22 @@ def decompose_scene(
 
     # ── wandb run ─────────────────────────────────────────────────────────────
     scene_name = Path(scene_dir).parent.name + "/" + Path(scene_dir).name
-    lt = cfg.get("lambda_tv", 0.0)
+    _SKIP = frozenset({
+        "n_iter", "lbfgs_max_iter", "log_every", "sbatch",
+        "lr", "lr_end", "lr_schedule", "lr_schedule_step", "lr_schedule_gamma",
+        "loss", "optimizer",
+        "shininess_min", "shininess_max",
+    })
+    def _fmt(v):
+        return f"{v:g}" if isinstance(v, float) else str(v)
+    override_tags = "_".join(
+        f"{k}={_fmt(v)}"
+        for k, v in (cfg_overrides or {}).items()
+        if k not in _SKIP and v != DEFAULT_CFG.get(k)
+    )
     run_name = (f"{scene_name}_{shader}"
                 + ("_noshadow" if no_shadow else "")
-                + (f"_lt={lt}" if lt else ""))
+                + (f"_{override_tags}" if override_tags else ""))
     run = wandb.init(
         entity  =wandb_entity,
         project =wandb_project,

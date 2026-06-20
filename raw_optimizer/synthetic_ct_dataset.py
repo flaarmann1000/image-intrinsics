@@ -123,8 +123,9 @@ DEFAULT_CFG = dict(
     loss           = "L2",
     shininess_min  = SHININESS_RANGE[0],
     shininess_max  = SHININESS_RANGE[1],
-    spec_warmup_steps = 0,
-    init_spec_zero    = False,
+    spec_warmup_steps    = 0,
+    init_spec_zero       = False,
+    lambda_metallic_l1   = 0.0,
     lr_end            = 0.0,
     lr_schedule       = "none",
     lr_schedule_step  = 50,
@@ -1085,6 +1086,7 @@ def _optimize_ct_sh(
     opt   = _make_optimizer(learnable, cfg)
     sched = _make_scheduler(opt, cfg, cfg["n_iter"])
     _step = [0]
+    _loss_ml = [torch.zeros((), device=dev)]  # metallic L1 loss, updated each _forward call
 
     def _forward():
         _spec_warmup = _step[0] < cfg.get("spec_warmup_steps", 0)
@@ -1111,7 +1113,9 @@ def _optimize_ct_sh(
             _tv(metallic_raw.permute(2, 0, 1)) +
             _tv(roughness_raw.permute(2, 0, 1))
         )
-        return loss_data + loss_sparse + loss_white + loss_tv, loss_data, loss_sparse, loss_white, loss_tv
+        loss_metallic_l1 = cfg.get("lambda_metallic_l1", 0.0) * metallic.reshape(-1, 1)[flat_mask].abs().mean()
+        _loss_ml[0] = loss_metallic_l1.detach()
+        return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1, loss_data, loss_sparse, loss_white, loss_tv
 
     def _forward_components():
         with torch.no_grad():
@@ -1205,6 +1209,7 @@ def _optimize_ct_sh(
             "roughness_mean":      _ir,
             "metallic_err_mean":   abs(_im - gt_metallic),
             "roughness_err_mean":  abs(_ir - gt_roughness),
+            "loss_metallic_l1":    float(_loss_ml[0]),
             **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
             "lr": opt.param_groups[0]["lr"],
         }, step=-1)
@@ -1262,6 +1267,7 @@ def _optimize_ct_sh(
                     "roughness_mean":     rou,
                     "metallic_err_mean":  abs(met - gt_metallic),
                     "roughness_err_mean": abs(rou - gt_roughness),
+                    "loss_metallic_l1":   float(_loss_ml[0]),
                     **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
                     "lr": opt.param_groups[0]["lr"],
                 }, step=i)
@@ -1404,6 +1410,7 @@ def _optimize_ct_env(
     opt   = _make_optimizer(learnable, cfg)
     sched = _make_scheduler(opt, cfg, cfg["n_iter"])
     _step = [0]
+    _loss_ml = [torch.zeros((), device=dev)]  # metallic L1 loss, updated each _forward call
 
     def _forward(img_indices=None):
         if img_indices is None:
@@ -1437,7 +1444,9 @@ def _optimize_ct_env(
             _tv(metallic_raw.permute(2, 0, 1)) +
             _tv(roughness_raw.permute(2, 0, 1))
         )
-        return loss_data + loss_sparse + loss_white + loss_tv, loss_data, loss_sparse, loss_white, loss_tv
+        loss_metallic_l1 = frac * cfg.get("lambda_metallic_l1", 0.0) * metallic.reshape(-1, 1)[flat_mask].abs().mean()
+        _loss_ml[0] = loss_metallic_l1.detach()
+        return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1, loss_data, loss_sparse, loss_white, loss_tv
 
     def _forward_components():
         with torch.no_grad():
@@ -1515,6 +1524,7 @@ def _optimize_ct_env(
             "roughness_mean":     _ir,
             "metallic_err_mean":  abs(_im - gt_metallic),
             "roughness_err_mean": abs(_ir - gt_roughness),
+            "loss_metallic_l1":   float(_loss_ml[0]),
             "lr": opt.param_groups[0]["lr"],
         }, step=-1)
     t0 = time.perf_counter()
@@ -1596,6 +1606,7 @@ def _optimize_ct_env(
                     "roughness_mean":     rou,
                     "metallic_err_mean":  abs(met - gt_metallic),
                     "roughness_err_mean": abs(rou - gt_roughness),
+                    "loss_metallic_l1":   float(_loss_ml[0]),
                     "lr": opt.param_groups[0]["lr"],
                 }, step=i)
 
