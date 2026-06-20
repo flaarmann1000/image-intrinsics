@@ -1142,6 +1142,33 @@ def _optimize_ct_sh(
         grad_log_dir.mkdir(parents=True, exist_ok=True)
 
     history = []
+
+    # Precompute flat GT tensors for per-step RMSE logging
+    _flat_mask_np = flat_mask.cpu().numpy()
+    _gt_ab_m = (torch.from_numpy(
+                    np.asarray(gt_albedo, np.float32).reshape(-1, 3)[_flat_mask_np]
+                ).to(dev) if gt_albedo is not None else None)
+    _gt_met_arr = np.asarray(gt_metallic, np.float32)
+    _gt_met_m = torch.from_numpy(
+        _gt_met_arr.reshape(-1, 1)[_flat_mask_np] if _gt_met_arr.ndim > 0
+        else np.full((int(flat_mask.sum()), 1), float(_gt_met_arr), np.float32)
+    ).to(dev)
+    _gt_rou_arr = np.asarray(gt_roughness, np.float32)
+    _gt_rou_m = torch.from_numpy(
+        _gt_rou_arr.reshape(-1, 1)[_flat_mask_np] if _gt_rou_arr.ndim > 0
+        else np.full((int(flat_mask.sum()), 1), float(_gt_rou_arr), np.float32)
+    ).to(dev)
+
+    def _gt_rmse_metrics(ab_m, met_m, rou_m):
+        """Pixel-level RMSE against GT intrinsics (only when GT is available)."""
+        out = {}
+        if _gt_ab_m is not None:
+            scale = (_gt_ab_m * ab_m).sum(0) / (ab_m * ab_m).sum(0).clamp(1e-8)
+            out["albedo_rmse"] = float((ab_m * scale - _gt_ab_m).pow(2).mean().sqrt())
+        out["metallic_rmse"]  = float((met_m - _gt_met_m).pow(2).mean().sqrt())
+        out["roughness_rmse"] = float((rou_m - _gt_rou_m).pow(2).mean().sqrt())
+        return out
+
     with torch.no_grad():
         _il, _ild, _ils, _ilw, _iltv = _forward()
         _im = float(_fwd_metallic(metallic_raw, tr_met)[mask_hw].mean())
@@ -1178,6 +1205,7 @@ def _optimize_ct_sh(
             "roughness_mean":      _ir,
             "metallic_err_mean":   abs(_im - gt_metallic),
             "roughness_err_mean":  abs(_ir - gt_roughness),
+            **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
             "lr": opt.param_groups[0]["lr"],
         }, step=-1)
     t0 = time.perf_counter()
@@ -1234,6 +1262,7 @@ def _optimize_ct_sh(
                     "roughness_mean":     rou,
                     "metallic_err_mean":  abs(met - gt_metallic),
                     "roughness_err_mean": abs(rou - gt_roughness),
+                    **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
                     "lr": opt.param_groups[0]["lr"],
                 }, step=i)
     total_time = time.perf_counter() - t0

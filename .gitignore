@@ -28,3 +28,5 @@ node_modules/
 
 real_scene_results
 datasets/3D-Front/
+
+results/
