@@ -56,11 +56,54 @@ _WANDB_PROJECT = "3dfront_ct_decomp"
 
 _REPO_ROOT = Path(__file__).parent.parent
 
+# ─────────────────────────────────────── image helpers ──────────────────────
+
+
+def srgb_to_linear(img: np.ndarray) -> np.ndarray:
+    """float32 [0,1] sRGB → float32 [0,1] linear light (IEC 61966-2-1 EOTF)."""
+    img = np.clip(img, 0.0, 1.0).astype(np.float32)
+    return np.where(img <= 0.04045, img / 12.92, ((img + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(img: np.ndarray) -> np.ndarray:
+    """float32 [0,1] linear light → float32 [0,1] sRGB (IEC 61966-2-1 OETF)."""
+    img = np.clip(img, 0.0, 1.0).astype(np.float32)
+    return np.where(img <= 0.0031308, img * 12.92, 1.055 * img ** (1.0 / 2.4) - 0.055)
+
+
+def load_exr(path: Path) -> np.ndarray:
+    """Load an EXR file as (H, W, 3) float32 linear-light RGB.
+
+    Tries imageio (requires imageio-freeimage or OpenEXR) then falls back to
+    OpenCV (cv2), which supports EXR natively on most platforms.
+    """
+    path = Path(path)
+    try:
+        import imageio
+        img = np.asarray(imageio.imread(str(path))).astype(np.float32)
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        return img[:, :, :3]
+    except Exception:
+        import cv2  # noqa: PLC0415
+        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
+        if img is None:
+            raise IOError(f"Could not read EXR (tried imageio and cv2): {path}")
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        return img[:, :, :3][:, :, ::-1].astype(np.float32)  # BGR→RGB
+
+
 # ─────────────────────────────────────── data loading ───────────────────────
 
 
 def load_scene(scene_dir: Path, no_shadow: bool = False) -> dict:
     """Load all maps from a 3D-Front scene directory.
+
+    Reads config.json (if present) to determine the image variant:
+      "linear" (default) — light_NNN.png loaded as float32 [0,1]
+      "srgb"             — light_NNN.png loaded and sRGB-linearized
+      "exr"              — light_NNN.npy loaded as float32 (may be HDR)
 
     Returns a dict with keys:
       normals_np   (H, W, 3) float32, unit length
@@ -68,14 +111,23 @@ def load_scene(scene_dir: Path, no_shadow: bool = False) -> dict:
       albedo_np    (H, W, 3) float32 [0,1]
       metallic_np  (H, W, 1) float32 [0,1]
       roughness_np (H, W, 1) float32 [0,1]
-      images       list of (H, W, 3) float32 [0,1]
+      images       list of (H, W, 3) float32
       light_keys   list of str  (e.g. ["light_000", ...])
       H, W         ints
 
     no_shadow: if True and light_NNN_no_shadow.png files exist, load those
                instead of the standard light_NNN.png renders.
+               (Ignored for the "exr" variant.)
     """
     scene_dir = Path(scene_dir)
+
+    # Auto-detect variant from config.json
+    cfg_path = scene_dir / "config.json"
+    variant = "linear"
+    if cfg_path.exists():
+        with open(cfg_path) as fh:
+            _ds_cfg = json.load(fh)
+        variant = _ds_cfg.get("variant", "linear")
 
     # Normals: uint8 → float [-1,1], then renormalize
     norm_raw = np.array(Image.open(scene_dir / "normals.png"), dtype=np.float32)
@@ -97,23 +149,38 @@ def load_scene(scene_dir: Path, no_shadow: bool = False) -> dict:
     metal = np.array(Image.open(scene_dir / "metallic.png"), dtype=np.float32)
     metal = (metal / 65535.0)[:, :, None]  # (H, W, 1)
 
-    # Rendered images — base keys from light_NNN.png (excluding _no_shadow variants)
-    base_files = sorted(f for f in scene_dir.glob("light_*.png")
-                        if "_no_shadow" not in f.stem)
-    if no_shadow:
-        img_files = []
-        for bf in base_files:
-            ns = bf.with_stem(bf.stem + "_no_shadow")
-            img_files.append(ns if ns.exists() else bf)
+    # Rendered images
+    if variant == "exr":
+        # EXR datasets store images as float32 .npy (possibly HDR, already normalized)
+        npy_files = sorted(
+            (f for f in scene_dir.glob("light_*.npy")),
+            key=lambda p: int(p.stem.split("_")[-1]),
+        )
+        images     = [np.load(f).astype(np.float32) for f in npy_files]
+        light_keys = [f.stem for f in npy_files]
     else:
-        img_files = base_files
+        # PNG datasets (linear or sRGB)
+        base_files = sorted(
+            (f for f in scene_dir.glob("light_*.png")
+             if "_no_shadow" not in f.stem and "_preview" not in f.stem),
+            key=lambda p: int(p.stem.split("_")[-1]),
+        )
+        if no_shadow:
+            img_files = []
+            for bf in base_files:
+                ns = bf.with_stem(bf.stem + "_no_shadow")
+                img_files.append(ns if ns.exists() else bf)
+        else:
+            img_files = base_files
 
-    images = [
-        np.array(Image.open(f), dtype=np.float32)[:, :, :3] / 255.0
-        for f in img_files
-    ]
-    # Always use the base key (light_NNN) regardless of which file was loaded
-    light_keys = [bf.stem for bf in base_files]
+        images = [
+            np.array(Image.open(f), dtype=np.float32)[:, :, :3] / 255.0
+            for f in img_files
+        ]
+        if variant == "srgb":
+            images = [srgb_to_linear(img) for img in images]
+        # Always use the base key (light_NNN) regardless of which file was loaded
+        light_keys = [bf.stem for bf in base_files]
 
     H, W = normals.shape[:2]
     return dict(
@@ -200,6 +267,7 @@ def render_scene(
     az_deg: float = 45.0,
     el_deg: float = 0.0,
     intensity: float = LIGHT_INTENSITY,
+    color: np.ndarray | None = None,
     shader: str = "ct_sh",
     fov_deg: float = 60.0,
     cam_dist: float = 2.0,
@@ -225,7 +293,8 @@ def render_scene(
     )
 
     # Build lighting
-    sh_light = _make_directional_sh(az_deg, el_deg, intensity=intensity)
+    _color = LIGHT_COLOR if color is None else np.asarray(color, dtype=np.float32)
+    sh_light = _make_directional_sh(az_deg, el_deg, color=_color, intensity=intensity)
     sh_coeffs_t = torch.from_numpy(sh_light.coeffs).to(device)  # (9, 3)
 
     # Flatten to masked pixels
@@ -250,7 +319,31 @@ def render_scene(
             sh_coeffs_t,  # (9, 3) — shared across all pixels
             metallic=metal_m, roughness=rough_m, lut=lut,
         )
-    else:  # ct_env
+    elif shader == "ct_env_direct":
+        # Direct env map: borrow the grid layout from the SH env map, then
+        # place all light energy in the single pixel closest to the light
+        # direction.  Dividing by solid_angle makes the integral equal to
+        # the desired color × intensity (same energy as the SH version).
+        az = np.radians(az_deg)
+        el = np.radians(el_deg)
+        light_dir = np.array([
+            np.sin(az) * np.cos(el),
+            np.sin(el),
+            np.cos(az) * np.cos(el),
+        ], dtype=np.float32)
+        env_raw    = EnvMap.from_sh(sh_light)
+        best_idx   = int((env_raw._dirs @ light_dir).argmax())
+        direct_pix = np.zeros_like(env_raw._image_flat)
+        direct_pix[best_idx] = _color * intensity / env_raw._solid_angles[best_idx]
+        env_dirs_t = torch.from_numpy(env_raw._dirs).to(device)
+        env_dw_t   = torch.from_numpy(env_raw._solid_angles).to(device)
+        env_pix_t  = torch.from_numpy(direct_pix).to(device)
+        render_m = shade_ct_env(
+            view_m, normals_m, albedo_m,
+            env_pix_t, env_dirs_t, env_dw_t,
+            metallic=metal_m, roughness=rough_m,
+        )
+    else:  # ct_env — SH reconstructed env map
         env_raw = EnvMap.from_sh(sh_light)
         env_dirs_t = torch.from_numpy(env_raw._dirs).to(device)
         env_dw_t   = torch.from_numpy(env_raw._solid_angles).to(device)
@@ -275,7 +368,7 @@ def render_scene(
 
     light_cfg = {
         "az_deg": az_deg, "el_deg": el_deg,
-        "intensity": intensity, "color": LIGHT_COLOR.tolist(),
+        "intensity": intensity, "color": _color.tolist(),
         "sh_coeffs": sh_light.coeffs.tolist(),
     }
     with open(out_dir / "light_config.json", "w") as fh:
@@ -379,6 +472,89 @@ def render_3dfront_dataset(
         json.dump(cfg, fh, indent=2)
 
     print(f"3D-Front dataset rendered: {n_lights} images -> {out_dir}")
+
+
+# ──────────────────────────────── sun dataset builder ───────────────────────
+
+
+def _sorted_sun_files(src_dir: Path, pattern: str, exclude_suffix: str = "") -> list:
+    """Glob sun render files and sort by numeric index (handles sun_10 > sun_9)."""
+    files = [f for f in src_dir.glob(pattern)
+             if not (exclude_suffix and f.stem.endswith(exclude_suffix))]
+    def _idx(p: Path) -> int:
+        stem = p.stem.replace("_srgb", "")
+        return int(stem.rsplit("_", 1)[-1])
+    return sorted(files, key=_idx)
+
+
+def build_3dfront_sun_dataset(
+    src_dir: Path,
+    out_dir: Path,
+    variant: str = "linear",
+) -> None:
+    """Build a CT decomposition dataset from 3D-Front sun renderings.
+
+    Copies GT material maps (PNG) and converts sun renders to the standard
+    light_NNN format expected by load_scene / decompose_scene.
+
+    variant:
+      "linear"  — sun_N.png   → light_NNN.png  (uint8 linear-light)
+      "srgb"    — sun_N_srgb.png → light_NNN.png  (uint8 sRGB;
+                  linearized automatically by load_scene at decomp time)
+      "exr"     — sun_N.exr   → light_NNN.npy  (float32, HDR;
+                  normalized to 99th-percentile ≈ 1.0)
+
+    The output directory is a valid scene_dir for decompose_scene.
+    """
+    src_dir = Path(src_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # GT material maps always come from PNG
+    for fname in ("albedo.png", "normals.png", "roughness.png", "metallic.png"):
+        shutil.copy2(src_dir / fname, out_dir / fname)
+
+    # Collect sun render files sorted numerically
+    if variant == "linear":
+        sun_files = _sorted_sun_files(src_dir, "sun_*.png", exclude_suffix="_srgb")
+    elif variant == "srgb":
+        sun_files = _sorted_sun_files(src_dir, "sun_*_srgb.png")
+    elif variant == "exr":
+        sun_files = _sorted_sun_files(src_dir, "sun_*.exr")
+    else:
+        raise ValueError(f"variant must be 'linear', 'srgb', or 'exr'; got {variant!r}")
+
+    exr_scale = None
+    if variant == "exr":
+        # Load all EXR images, compute a single normalization scale so that
+        # the 99th-percentile foreground value maps to ~1.0
+        raw_imgs = [load_exr(f) for f in sun_files]
+        all_pos = np.concatenate([img.reshape(-1) for img in raw_imgs])
+        all_pos = all_pos[all_pos > 0]
+        exr_scale = float(np.percentile(all_pos, 99)) if len(all_pos) else 1.0
+        for i, img in enumerate(raw_imgs):
+            img_norm = (img / exr_scale).astype(np.float32)
+            np.save(out_dir / f"light_{i:03d}.npy", img_norm)
+            # Preview PNG (clamped to [0,1]) for quick inspection
+            Image.fromarray((img_norm.clip(0, 1) * 255).astype(np.uint8)).save(
+                out_dir / f"light_{i:03d}_preview.png")
+    else:
+        for i, f in enumerate(sun_files):
+            shutil.copy2(f, out_dir / f"light_{i:03d}.png")
+
+    cfg: dict = {
+        "src_dir": str(src_dir),
+        "variant": variant,
+        "n_lights": len(sun_files),
+        "light_type": "sun",
+    }
+    if exr_scale is not None:
+        cfg["exr_scale"] = exr_scale
+
+    with open(out_dir / "config.json", "w") as fh:
+        json.dump(cfg, fh, indent=2)
+
+    print(f"Built '{variant}' sun dataset: {len(sun_files)} images -> {out_dir}")
 
 
 # ─────────────────────────────────── decomposition ──────────────────────────
