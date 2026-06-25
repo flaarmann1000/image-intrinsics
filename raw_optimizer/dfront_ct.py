@@ -378,6 +378,9 @@ def render_scene(
     return render_np
 
 
+_DEFAULT_SH_LIGHTS_DIR = Path(__file__).parents[1] / "results" / "ref_sh_lighting"
+
+
 def render_3dfront_dataset(
     scene_dir: Path,
     out_dir: Path,
@@ -386,11 +389,15 @@ def render_3dfront_dataset(
     fov_deg: float = 60.0,
     cam_dist: float = 2.0,
     device: str = "cuda",
+    sh_lights_dir: Optional[Path] = _DEFAULT_SH_LIGHTS_DIR,
+    shader: str = "ct_sh",
 ) -> None:
-    """Render 3D-Front GT material maps under n_lights random SH conditions.
+    """Render 3D-Front GT material maps under n_lights SH lighting conditions.
 
-    Uses the same random SH distribution as the synthetic dataset's
-    random_sh light mode (_make_lights_random_sh with sequential seeds).
+    SH lights source (in order of priority):
+      1. sh_lights_dir — directory of precomputed .npy SH coefficient files,
+         used in sorted order (pass None to disable).
+      2. Random SH generation (_make_lights_random_sh) with sequential seeds.
 
     Saves:
       out_dir/albedo.png          — GT albedo (copied from scene_dir)
@@ -406,8 +413,23 @@ def render_3dfront_dataset(
     The output directory doubles as a valid scene_dir for decompose_scene.
     """
     scene_dir = Path(scene_dir)
-    out_dir = Path(out_dir)
+    out_dir   = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build the ordered list of SH coefficient arrays
+    if sh_lights_dir is not None and Path(sh_lights_dir).is_dir():
+        npy_files = sorted(Path(sh_lights_dir).glob("*.npy"))[:n_lights]
+        if not npy_files:
+            raise FileNotFoundError(f"No .npy files found in {sh_lights_dir}")
+        sh_coeffs_list = [np.load(p).astype(np.float32) for p in npy_files]
+        print(f"  Using {len(sh_coeffs_list)} precomputed SH lights from {sh_lights_dir}")
+    else:
+        sh_coeffs_list = [
+            _make_lights_random_sh(seed=seed + i)[3]   # coeffs_np (9, 3)
+            for i in range(n_lights)
+        ]
+
+    n_lights = len(sh_coeffs_list)
 
     # Copy GT material maps so the dataset folder is self-contained
     for fname in ("albedo.png", "normals.png", "roughness.png", "metallic.png"):
@@ -435,16 +457,31 @@ def render_3dfront_dataset(
 
     lut = _get_ggx_sh_lut(device)
 
-    for i in range(n_lights):
-        sh_light, _, _, coeffs_np, _ = _make_lights_random_sh(seed=seed + i)
-        sh_coeffs_t = torch.from_numpy(coeffs_np).to(device)  # (9, 3)
+    # Pre-build env map structure once (same topology for all lights)
+    env_dirs_t = env_dw_t = None
+    if shader == "ct_env":
+        _env_proto = EnvMap.from_sh(SHLighting(np.zeros((9, 3), dtype=np.float32)))
+        env_dirs_t = torch.from_numpy(_env_proto._dirs).to(device)
+        env_dw_t   = torch.from_numpy(_env_proto._solid_angles).to(device)
 
+    for i, coeffs_np in enumerate(sh_coeffs_list):
         with torch.no_grad():
-            render_m = shade_ct_sh(
-                view_m, normals_m, albedo_m,
-                sh_coeffs_t,
-                metallic=metal_m, roughness=rough_m, lut=lut,
-            )
+            if shader == "ct_env":
+                assert env_dirs_t is not None and env_dw_t is not None
+                env_pix = EnvMap.from_sh(SHLighting(coeffs_np))._image_flat
+                env_pix_t = torch.from_numpy(env_pix.astype(np.float32)).to(device)
+                render_m = shade_ct_env(
+                    view_m, normals_m, albedo_m,
+                    env_pix_t, env_dirs_t, env_dw_t,
+                    metallic=metal_m, roughness=rough_m,
+                )
+            else:
+                sh_coeffs_t = torch.from_numpy(coeffs_np).to(device)  # (9, 3)
+                render_m = shade_ct_sh(
+                    view_m, normals_m, albedo_m,
+                    sh_coeffs_t,
+                    metallic=metal_m, roughness=rough_m, lut=lut,
+                )
 
         render_np = np.zeros((H * W, 3), dtype=np.float32)
         render_np[flat_mask.cpu().numpy()] = render_m.clamp(0, 1).float().cpu().numpy()
@@ -462,11 +499,12 @@ def render_3dfront_dataset(
         print(f"  light {i:03d}/{n_lights} done")
 
     cfg = {
-        "scene_dir": str(scene_dir),
-        "n_lights": n_lights,
-        "seed": seed,
-        "fov_deg": fov_deg,
-        "cam_dist": cam_dist,
+        "scene_dir":    str(scene_dir),
+        "n_lights":     n_lights,
+        "sh_lights_dir": str(sh_lights_dir) if sh_lights_dir is not None else None,
+        "seed":         seed,
+        "fov_deg":      fov_deg,
+        "cam_dist":     cam_dist,
     }
     with open(out_dir / "config.json", "w") as fh:
         json.dump(cfg, fh, indent=2)
@@ -477,8 +515,8 @@ def render_3dfront_dataset(
 # ──────────────────────────────── sun dataset builder ───────────────────────
 
 
-def _sorted_sun_files(src_dir: Path, pattern: str, exclude_suffix: str = "") -> list:
-    """Glob sun render files and sort by numeric index (handles sun_10 > sun_9)."""
+def _sorted_lighting_files(src_dir: Path, pattern: str, exclude_suffix: str = "") -> list:
+    """Glob render files and sort by numeric index (handles sun_10 > sun_9)."""
     files = [f for f in src_dir.glob(pattern)
              if not (exclude_suffix and f.stem.endswith(exclude_suffix))]
     def _idx(p: Path) -> int:
@@ -487,14 +525,15 @@ def _sorted_sun_files(src_dir: Path, pattern: str, exclude_suffix: str = "") -> 
     return sorted(files, key=_idx)
 
 
-def build_3dfront_sun_dataset(
+def build_3dfront_dataset(
     src_dir: Path,
     out_dir: Path,
     variant: str = "linear",
+    lighting: str = "sun"
 ) -> None:
-    """Build a CT decomposition dataset from 3D-Front sun renderings.
+    """Build a CT decomposition dataset from 3D-Front renderings.
 
-    Copies GT material maps (PNG) and converts sun renders to the standard
+    Copies GT material maps (PNG) and converts renders to the standard
     light_NNN format expected by load_scene / decompose_scene.
 
     variant:
@@ -516,11 +555,11 @@ def build_3dfront_sun_dataset(
 
     # Collect sun render files sorted numerically
     if variant == "linear":
-        sun_files = _sorted_sun_files(src_dir, "sun_*.png", exclude_suffix="_srgb")
+        lighting_files = _sorted_lighting_files(src_dir, f"{lighting}_*.png", exclude_suffix="_srgb")
     elif variant == "srgb":
-        sun_files = _sorted_sun_files(src_dir, "sun_*_srgb.png")
+        lighting_files = _sorted_lighting_files(src_dir, f"{lighting}_*_srgb.png")
     elif variant == "exr":
-        sun_files = _sorted_sun_files(src_dir, "sun_*.exr")
+        lighting_files = _sorted_lighting_files(src_dir, f"{lighting}_*.exr")
     else:
         raise ValueError(f"variant must be 'linear', 'srgb', or 'exr'; got {variant!r}")
 
@@ -528,7 +567,7 @@ def build_3dfront_sun_dataset(
     if variant == "exr":
         # Load all EXR images, compute a single normalization scale so that
         # the 99th-percentile foreground value maps to ~1.0
-        raw_imgs = [load_exr(f) for f in sun_files]
+        raw_imgs = [load_exr(f) for f in lighting_files]
         all_pos = np.concatenate([img.reshape(-1) for img in raw_imgs])
         all_pos = all_pos[all_pos > 0]
         exr_scale = float(np.percentile(all_pos, 99)) if len(all_pos) else 1.0
@@ -539,14 +578,14 @@ def build_3dfront_sun_dataset(
             Image.fromarray((img_norm.clip(0, 1) * 255).astype(np.uint8)).save(
                 out_dir / f"light_{i:03d}_preview.png")
     else:
-        for i, f in enumerate(sun_files):
+        for i, f in enumerate(lighting_files):
             shutil.copy2(f, out_dir / f"light_{i:03d}.png")
 
     cfg: dict = {
         "src_dir": str(src_dir),
         "variant": variant,
-        "n_lights": len(sun_files),
-        "light_type": "sun",
+        "n_lights": len(lighting_files),
+        "light_type": lighting,
     }
     if exr_scale is not None:
         cfg["exr_scale"] = exr_scale
@@ -554,10 +593,50 @@ def build_3dfront_sun_dataset(
     with open(out_dir / "config.json", "w") as fh:
         json.dump(cfg, fh, indent=2)
 
-    print(f"Built '{variant}' sun dataset: {len(sun_files)} images -> {out_dir}")
+    print(f"Built '{variant}' sun dataset: {len(lighting_files)} images -> {out_dir}")
 
 
 # ─────────────────────────────────── decomposition ──────────────────────────
+
+_RUN_NAME_SKIP = frozenset({
+    "n_iter", "lbfgs_max_iter", "log_every", "sbatch",
+    "lr", "lr_end", "lr_schedule", "lr_schedule_step", "lr_schedule_gamma",
+    "loss", "optimizer",
+    "shininess_min", "shininess_max",
+})
+
+
+def make_run_name(
+    scene_dir: Path,
+    shader: str,
+    cfg_overrides: Optional[dict] = None,
+    no_shadow: bool = False,
+    freeze_intrinsics: bool = False,
+    init_from_gt: bool = False,
+) -> str:
+    """Build a deterministic run / output-directory name from decompose_scene params.
+
+    The name encodes only the non-default, semantically meaningful options so
+    that repeated calls with the same arguments always resolve to the same path.
+    """
+    scene_dir = Path(scene_dir)
+    scene_name = scene_dir.parent.name + "/" + scene_dir.name
+
+    def _fmt(v):
+        return f"{v:g}" if isinstance(v, float) else str(v)
+
+    override_tags = "_".join(
+        f"{k}={_fmt(v)}"
+        for k, v in (cfg_overrides or {}).items()
+        if k not in _RUN_NAME_SKIP and v != DEFAULT_CFG.get(k)
+    )
+    return (
+        f"{scene_name}_{shader}"
+        + ("_noshadow"          if no_shadow          else "")
+        + ("_freeze_intrinsics" if freeze_intrinsics   else "")
+        + ("_init_from_gt"      if init_from_gt        else "")
+        + (f"_{override_tags}"  if override_tags       else "")
+    )
 
 
 def decompose_scene(
@@ -568,6 +647,8 @@ def decompose_scene(
     fov_deg: float = 60.0,
     cam_dist: float = 2.0,
     no_shadow: bool = False,
+    init_from_gt: bool = False,
+    freeze_intrinsics: bool = False,
     log_gradients: bool = False,
     device: str = "cuda",
     wandb_entity: str = _WANDB_ENTITY,
@@ -611,28 +692,19 @@ def decompose_scene(
     _sh_ref  = SHLighting.directional(
         np.array([0, 0, 1], dtype=np.float32), LIGHT_COLOR, intensity=LIGHT_INTENSITY
     )
-    _env_ref = EnvMap.from_sh(_sh_ref)
+    _env_ref = EnvMap.from_sh(_sh_ref, resolution=32)
     env_dirs, env_dw = _env_ref._dirs, _env_ref._solid_angles
     env_H, env_W     = _env_ref.image.shape[:2]
 
     # ── wandb run ─────────────────────────────────────────────────────────────
     scene_name = Path(scene_dir).parent.name + "/" + Path(scene_dir).name
-    _SKIP = frozenset({
-        "n_iter", "lbfgs_max_iter", "log_every", "sbatch",
-        "lr", "lr_end", "lr_schedule", "lr_schedule_step", "lr_schedule_gamma",
-        "loss", "optimizer",
-        "shininess_min", "shininess_max",
-    })
-    def _fmt(v):
-        return f"{v:g}" if isinstance(v, float) else str(v)
-    override_tags = "_".join(
-        f"{k}={_fmt(v)}"
-        for k, v in (cfg_overrides or {}).items()
-        if k not in _SKIP and v != DEFAULT_CFG.get(k)
+    run_name = make_run_name(
+        scene_dir, shader,
+        cfg_overrides=cfg_overrides,
+        no_shadow=no_shadow,
+        freeze_intrinsics=freeze_intrinsics,
+        init_from_gt=init_from_gt,
     )
-    run_name = (f"{scene_name}_{shader}"
-                + ("_noshadow" if no_shadow else "")
-                + (f"_{override_tags}" if override_tags else ""))
     run = wandb.init(
         entity  =wandb_entity,
         project =wandb_project,
@@ -651,12 +723,17 @@ def decompose_scene(
 
     # ── optimize ──────────────────────────────────────────────────────────────
     t0 = time.time()
+    _opt_params_sh  = frozenset({"sh"})  if freeze_intrinsics else None
+    _opt_params_env = frozenset({"env"}) if freeze_intrinsics else None
+
     if shader == "ct_sh":
         albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
             images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
             gt_metallic, gt_roughness, cfg,
             wandb_run=run,
             gt_albedo=gt_albedo,
+            opt_params=_opt_params_sh,
+            init_from_gt=init_from_gt,
             log_gradients=log_gradients,
             grad_log_dir=grad_log_dir,
         )
@@ -666,7 +743,10 @@ def decompose_scene(
             gt_metallic, gt_roughness,
             env_dirs, env_dw, cfg,
             wandb_run=run,
+            env_H=env_H, env_W=env_W,
             gt_albedo=gt_albedo,
+            opt_params=_opt_params_env,
+            init_from_gt=init_from_gt,
             log_gradients=log_gradients,
             grad_log_dir=grad_log_dir,
         )

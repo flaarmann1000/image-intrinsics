@@ -398,7 +398,7 @@ def _fwd_metallic(p: torch.Tensor, t: str) -> torch.Tensor:
     return torch.sigmoid(p) if t == "sigmoid" else p.clamp(0.0, 1.0)
 
 def _fwd_roughness(p: torch.Tensor, t: str) -> torch.Tensor:
-    return 0.05 + 0.9 * torch.sigmoid(p) if t == "sigmoid" else p.clamp(0.05, 1.0)
+    return torch.sigmoid(p) if t == "sigmoid" else p.clamp(0.0, 1.0)
 
 def _fwd_shininess(p: torch.Tensor, t: str, s_min: float, s_max: float) -> torch.Tensor:
     if t == "sigmoid":
@@ -426,12 +426,22 @@ def _init_scalar(val: float, H: int, W: int, t: str,
     dtype = torch.float32
     if t == "sigmoid":
         raw = float(np.log(np.clip(val, 1e-6, 1-1e-6) / (1 - np.clip(val, 1e-6, 1-1e-6))))
-    elif t == "sigmoid_r":  # roughness: 0.05 + 0.9*sigmoid(x) = val
-        r = float(np.clip((val - 0.05) / 0.9, 1e-6, 1-1e-6))
-        raw = float(np.log(r / (1 - r)))
+    elif t == "sigmoid_r":  # kept for compatibility, identical to sigmoid
+        raw = float(np.log(np.clip(val, 1e-6, 1-1e-6) / (1 - np.clip(val, 1e-6, 1-1e-6))))
     else:
         raw = float(val)
     return torch.full((H, W, 1), raw, dtype=dtype, device=dev)
+
+
+def _init_map(arr: np.ndarray, t: str, dev) -> torch.Tensor:
+    """Initialize a (H, W, 1) raw param from a spatial GT map."""
+    x = torch.from_numpy(arr.astype(np.float32)).to(dev)
+    if t == "sigmoid":
+        return torch.logit(x.clamp(1e-6, 1 - 1e-6))
+    elif t == "sigmoid_r":  # kept for compatibility, identical to sigmoid
+        return torch.logit(x.clamp(1e-6, 1 - 1e-6))
+    else:
+        return x.clone()
 
 def _init_env(gt_flat: np.ndarray, t: str, dev) -> torch.Tensor:
     gt_t = torch.from_numpy(gt_flat.astype(np.float32)).to(dev)
@@ -1055,12 +1065,17 @@ def _optimize_ct_sh(
             torch.from_numpy(gt_sh_coeffs[k]).to(dev) for k in range(N_imgs)
         ])
 
-    _gt_met_scalar  = float(np.asarray(gt_metallic).mean())
-    _gt_rou_scalar  = float(np.asarray(gt_roughness).mean())
+    _gt_met_np = np.asarray(gt_metallic, np.float32)
+    _gt_rou_np = np.asarray(gt_roughness, np.float32)
+    _flat_mask_s = flat_mask.cpu().numpy()
+    _gt_met_scalar = float(_gt_met_np.reshape(-1, 1)[_flat_mask_s].mean() if _gt_met_np.ndim > 0
+                           else float(_gt_met_np))
+    _gt_rou_scalar = float(_gt_rou_np.reshape(-1, 1)[_flat_mask_s].mean() if _gt_rou_np.ndim > 0
+                           else float(_gt_rou_np))
 
     if "metallic" in op:
         if init_from_gt:
-            metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev).requires_grad_(True)
+            metallic_raw = _init_map(_gt_met_np.reshape(H, W, 1), tr_met, dev).requires_grad_(True)
         else:
             m0 = (-10.0 if tr_met == "sigmoid" else 0.0) if cfg.get("init_spec_zero", False) \
                  else (0.5 if tr_met != "sigmoid" else 0.0)
@@ -1068,12 +1083,14 @@ def _optimize_ct_sh(
         learnable.append(metallic_raw)
         named_params["metallic"] = metallic_raw
     else:
-        metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
+        if init_from_gt and _gt_met_np.ndim > 0:
+            metallic_raw = _init_map(_gt_met_np.reshape(H, W, 1), tr_met, dev)
+        else:
+            metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
 
     if "roughness" in op:
         if init_from_gt:
-            metallic_raw_tr = "sigmoid_r" if tr_rou == "sigmoid" else tr_rou
-            roughness_raw = _init_scalar(_gt_rou_scalar, H, W, metallic_raw_tr, dev=dev).requires_grad_(True)
+            roughness_raw = _init_map(_gt_rou_np.reshape(H, W, 1), tr_rou, dev).requires_grad_(True)
         else:
             r0 = (10.0 if tr_rou == "sigmoid" else 1.0) if cfg.get("init_spec_zero", False) \
                  else (0.5 if tr_rou != "sigmoid" else 0.0)
@@ -1081,7 +1098,13 @@ def _optimize_ct_sh(
         learnable.append(roughness_raw)
         named_params["roughness"] = roughness_raw
     else:
-        roughness_raw = _init_scalar(_gt_rou_scalar, H, W, "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev)
+        if init_from_gt and _gt_rou_np.ndim > 0:
+            roughness_raw = _init_map(_gt_rou_np.reshape(H, W, 1), tr_rou, dev)
+        else:
+            roughness_raw = _init_scalar(_gt_rou_scalar, H, W, tr_rou, dev=dev)
+
+    def _get_met(): return _fwd_metallic(metallic_raw, tr_met)
+    def _get_rou(): return _fwd_roughness(roughness_raw, tr_rou)
 
     opt   = _make_optimizer(learnable, cfg)
     sched = _make_scheduler(opt, cfg, cfg["n_iter"])
@@ -1092,8 +1115,8 @@ def _optimize_ct_sh(
         _spec_warmup = _step[0] < cfg.get("spec_warmup_steps", 0)
         albedo      = _fwd_albedo(albedo_param, tr_ab)
         albedo_m    = albedo.reshape(-1, 3)[flat_mask]
-        metallic    = _fwd_metallic(metallic_raw, tr_met)
-        roughness   = _fwd_roughness(roughness_raw, tr_rou)
+        metallic    = _get_met()
+        roughness   = _get_rou()
         metallic_m  = metallic.reshape(-1, 1)[flat_mask]
         roughness_m = roughness.reshape(-1, 1)[flat_mask]
         if _spec_warmup:
@@ -1175,14 +1198,14 @@ def _optimize_ct_sh(
 
     with torch.no_grad():
         _il, _ild, _ils, _ilw, _iltv = _forward()
-        _im = float(_fwd_metallic(metallic_raw, tr_met)[mask_hw].mean())
-        _ir = float(_fwd_roughness(roughness_raw, tr_rou)[mask_hw].mean())
+        _im = float(_get_met()[mask_hw].mean())
+        _ir = float(_get_rou()[mask_hw].mean())
     print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
           f"  metallic={_im:.3f}  roughness={_ir:.3f}")
     if wandb_run is not None:
         with torch.no_grad():
-            _met_map = _fwd_metallic(metallic_raw, tr_met).detach()
-            _rou_map = _fwd_roughness(roughness_raw, tr_rou).detach()
+            _met_map = _get_met().detach()
+            _rou_map = _get_rou().detach()
             _est_sh_np = sh_coeffs.detach().cpu().numpy()
             _ab_t  = _fwd_albedo(albedo_param, tr_ab).clamp(0, 1)
             _ab_m  = _ab_t.reshape(-1, 3)[flat_mask]
@@ -1207,8 +1230,8 @@ def _optimize_ct_sh(
             "recon_err_maps":  _errs,
             "metallic_mean":       _im,
             "roughness_mean":      _ir,
-            "metallic_err_mean":   abs(_im - gt_metallic),
-            "roughness_err_mean":  abs(_ir - gt_roughness),
+            "metallic_err_mean":   abs(_im - _gt_met_scalar),
+            "roughness_err_mean":  abs(_ir - _gt_rou_scalar),
             "loss_metallic_l1":    float(_loss_ml[0]),
             **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
             "lr": opt.param_groups[0]["lr"],
@@ -1229,8 +1252,8 @@ def _optimize_ct_sh(
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
-                met_map = _fwd_metallic(metallic_raw, tr_met).detach()
-                rou_map = _fwd_roughness(roughness_raw, tr_rou).detach()
+                met_map = _get_met().detach()
+                rou_map = _get_rou().detach()
                 met = float(met_map[mask_hw].mean())
                 rou = float(rou_map[mask_hw].mean())
             history.append(float(loss))
@@ -1265,8 +1288,8 @@ def _optimize_ct_sh(
                     "recon_err_maps":  _errs,
                     "metallic_mean":      met,
                     "roughness_mean":     rou,
-                    "metallic_err_mean":  abs(met - gt_metallic),
-                    "roughness_err_mean": abs(rou - gt_roughness),
+                    "metallic_err_mean":  abs(met - _gt_met_scalar),
+                    "roughness_err_mean": abs(rou - _gt_rou_scalar),
                     "loss_metallic_l1":   float(_loss_ml[0]),
                     **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
                     "lr": opt.param_groups[0]["lr"],
@@ -1276,8 +1299,8 @@ def _optimize_ct_sh(
     with torch.no_grad():
         albedo_out = _fwd_albedo(albedo_param, tr_ab).clamp(0, 1).cpu().numpy()
         sh_out     = sh_coeffs.cpu().numpy()
-        met_out    = _fwd_metallic(metallic_raw, tr_met).cpu().numpy()
-        rou_out    = _fwd_roughness(roughness_raw, tr_rou).cpu().numpy()
+        met_out    = _get_met().cpu().numpy()
+        rou_out    = _get_rou().cpu().numpy()
         met_m      = torch.from_numpy(met_out).to(dev).reshape(-1, 1)[flat_mask]
         rou_m      = torch.from_numpy(rou_out).to(dev).reshape(-1, 1)[flat_mask]
         albedo_t2  = _fwd_albedo(albedo_param, tr_ab)
@@ -1378,12 +1401,17 @@ def _optimize_ct_env(
         gt_ef_t = torch.from_numpy(gt_ef).to(dev)
         env_raw_params = _softplus_inv(gt_ef_t) if tr_env == "softplus" else gt_ef_t.clone()
 
-    _gt_met_scalar  = float(np.asarray(gt_metallic).mean())
-    _gt_rou_scalar  = float(np.asarray(gt_roughness).mean())
+    _gt_met_np = np.asarray(gt_metallic, np.float32)
+    _gt_rou_np = np.asarray(gt_roughness, np.float32)
+    _flat_mask_s = flat_mask.cpu().numpy()
+    _gt_met_scalar = float(_gt_met_np.reshape(-1, 1)[_flat_mask_s].mean() if _gt_met_np.ndim > 0
+                           else float(_gt_met_np))
+    _gt_rou_scalar = float(_gt_rou_np.reshape(-1, 1)[_flat_mask_s].mean() if _gt_rou_np.ndim > 0
+                           else float(_gt_rou_np))
 
     if "metallic" in op:
         if init_from_gt:
-            metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev).requires_grad_(True)
+            metallic_raw = _init_map(_gt_met_np.reshape(H, W, 1), tr_met, dev).requires_grad_(True)
         else:
             m0 = (-10.0 if tr_met == "sigmoid" else 0.0) if cfg.get("init_spec_zero", False) \
                  else (0.5 if tr_met != "sigmoid" else 0.0)
@@ -1391,12 +1419,14 @@ def _optimize_ct_env(
         learnable.append(metallic_raw)
         named_params["metallic"] = metallic_raw
     else:
-        metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
+        if init_from_gt and _gt_met_np.ndim > 0:
+            metallic_raw = _init_map(_gt_met_np.reshape(H, W, 1), tr_met, dev)
+        else:
+            metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
 
     if "roughness" in op:
         if init_from_gt:
-            roughness_raw = _init_scalar(_gt_rou_scalar, H, W,
-                                         "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev).requires_grad_(True)
+            roughness_raw = _init_map(_gt_rou_np.reshape(H, W, 1), tr_rou, dev).requires_grad_(True)
         else:
             r0 = (10.0 if tr_rou == "sigmoid" else 1.0) if cfg.get("init_spec_zero", False) \
                  else (0.5 if tr_rou != "sigmoid" else 0.0)
@@ -1404,8 +1434,13 @@ def _optimize_ct_env(
         learnable.append(roughness_raw)
         named_params["roughness"] = roughness_raw
     else:
-        roughness_raw = _init_scalar(_gt_rou_scalar, H, W,
-                                     "sigmoid_r" if tr_rou == "sigmoid" else tr_rou, dev=dev)
+        if init_from_gt and _gt_rou_np.ndim > 0:
+            roughness_raw = _init_map(_gt_rou_np.reshape(H, W, 1), tr_rou, dev)
+        else:
+            roughness_raw = _init_scalar(_gt_rou_scalar, H, W, tr_rou, dev=dev)
+
+    def _get_met(): return _fwd_metallic(metallic_raw, tr_met)
+    def _get_rou(): return _fwd_roughness(roughness_raw, tr_rou)
 
     opt   = _make_optimizer(learnable, cfg)
     sched = _make_scheduler(opt, cfg, cfg["n_iter"])
@@ -1420,8 +1455,8 @@ def _optimize_ct_env(
         _spec_warmup = _step[0] < cfg.get("spec_warmup_steps", 0)
         albedo      = _fwd_albedo(albedo_param, tr_ab)
         albedo_m    = albedo.reshape(-1, 3)[flat_mask]
-        metallic    = _fwd_metallic(metallic_raw, tr_met)
-        roughness   = _fwd_roughness(roughness_raw, tr_rou)
+        metallic    = metallic_raw  if (_frozen_gt and not metallic_raw.requires_grad)  else _fwd_metallic(metallic_raw,  tr_met)
+        roughness   = roughness_raw if (_frozen_gt and not roughness_raw.requires_grad) else _fwd_roughness(roughness_raw, tr_rou)
         metallic_m  = metallic.reshape(-1, 1)[flat_mask]
         roughness_m = roughness.reshape(-1, 1)[flat_mask]
         if _spec_warmup:
@@ -1483,11 +1518,36 @@ def _optimize_ct_env(
     if log_gradients and grad_log_dir is not None:
         grad_log_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── GT RMSE helpers (mirrors _optimize_ct_sh) ─────────────────────────────
+    _flat_mask_np = flat_mask.cpu().numpy()
+    _gt_ab_m = (torch.from_numpy(
+                    np.asarray(gt_albedo, np.float32).reshape(-1, 3)[_flat_mask_np]
+                ).to(dev) if gt_albedo is not None else None)
+    _gt_met_arr = np.asarray(gt_metallic, np.float32)
+    _gt_met_m = torch.from_numpy(
+        _gt_met_arr.reshape(-1, 1)[_flat_mask_np] if _gt_met_arr.ndim > 0
+        else np.full((int(flat_mask.sum()), 1), float(_gt_met_arr), np.float32)
+    ).to(dev)
+    _gt_rou_arr = np.asarray(gt_roughness, np.float32)
+    _gt_rou_m = torch.from_numpy(
+        _gt_rou_arr.reshape(-1, 1)[_flat_mask_np] if _gt_rou_arr.ndim > 0
+        else np.full((int(flat_mask.sum()), 1), float(_gt_rou_arr), np.float32)
+    ).to(dev)
+
+    def _gt_rmse_metrics(ab_m, met_m, rou_m):
+        out = {}
+        if _gt_ab_m is not None:
+            scale = (_gt_ab_m * ab_m).sum(0) / (ab_m * ab_m).sum(0).clamp(1e-8)
+            out["albedo_rmse"] = float((ab_m * scale - _gt_ab_m).pow(2).mean().sqrt())
+        out["metallic_rmse"]  = float((met_m - _gt_met_m).pow(2).mean().sqrt())
+        out["roughness_rmse"] = float((rou_m - _gt_rou_m).pow(2).mean().sqrt())
+        return out
+
     history = []
     with torch.no_grad():
         _il, _ild, _ils, _ilw, _iltv = _forward()
-        _im = float(_fwd_metallic(metallic_raw, tr_met)[mask_hw].mean())
-        _ir = float(_fwd_roughness(roughness_raw, tr_rou)[mask_hw].mean())
+        _im = float(_get_met()[mask_hw].mean())
+        _ir = float(_get_rou()[mask_hw].mean())
     print(f"  [init]          loss={float(_il):.3e}  data={float(_ild):.3e}"
           f"  metallic={_im:.3f}  roughness={_ir:.3f}")
     if wandb_run is not None:
@@ -1495,8 +1555,8 @@ def _optimize_ct_env(
             _env_pix_all = _fwd_env(env_raw_params, tr_env).detach()
             _env_imgs_k  = [_env_flat_to_img(_env_pix_all[k].cpu().numpy(), env_H, env_W) for k in range(N_imgs)]
             _env_avg_img = _env_flat_to_img(_env_pix_all.mean(0).cpu().numpy(), env_H, env_W)
-            _met_map = _fwd_metallic(metallic_raw, tr_met).detach()
-            _rou_map = _fwd_roughness(roughness_raw, tr_rou).detach()
+            _met_map = _get_met().detach()
+            _rou_map = _get_rou().detach()
             _ab_t  = _fwd_albedo(albedo_param, tr_ab).clamp(0, 1)
             _ab_m  = _ab_t.reshape(-1, 3)[flat_mask]
             _met_m = _met_map.reshape(-1, 1)[flat_mask]
@@ -1522,9 +1582,10 @@ def _optimize_ct_env(
             "recon_err_maps": _errs,
             "metallic_mean":      _im,
             "roughness_mean":     _ir,
-            "metallic_err_mean":  abs(_im - gt_metallic),
-            "roughness_err_mean": abs(_ir - gt_roughness),
+            "metallic_err_mean":  abs(_im - _gt_met_scalar),
+            "roughness_err_mean": abs(_ir - _gt_rou_scalar),
             "loss_metallic_l1":   float(_loss_ml[0]),
+            **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
             "lr": opt.param_groups[0]["lr"],
         }, step=-1)
     t0 = time.perf_counter()
@@ -1564,8 +1625,8 @@ def _optimize_ct_env(
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
-                met_map = _fwd_metallic(metallic_raw, tr_met).detach()
-                rou_map = _fwd_roughness(roughness_raw, tr_rou).detach()
+                met_map = _get_met().detach()
+                rou_map = _get_rou().detach()
                 met = float(met_map[mask_hw].mean())
                 rou = float(rou_map[mask_hw].mean())
             history.append(float(loss))
@@ -1604,9 +1665,10 @@ def _optimize_ct_env(
                     "recon_err_maps": _errs,
                     "metallic_mean":      met,
                     "roughness_mean":     rou,
-                    "metallic_err_mean":  abs(met - gt_metallic),
-                    "roughness_err_mean": abs(rou - gt_roughness),
+                    "metallic_err_mean":  abs(met - _gt_met_scalar),
+                    "roughness_err_mean": abs(rou - _gt_rou_scalar),
                     "loss_metallic_l1":   float(_loss_ml[0]),
+                    **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
                     "lr": opt.param_groups[0]["lr"],
                 }, step=i)
 

@@ -352,7 +352,8 @@ def _ct_point(frag_pos, N, cam_pos, mat: PBRMat, light: PointLightGPU):
 def _ct_envmap(frag_pos, N, cam_pos, mat: PBRMat, light: EnvMapLightGPU, sbatch=64):
     F0 = _f0_mat(mat.albedo, mat.metallic)
 
-    roughness = max(float(mat.roughness), 0.12)
+    # roughness = max(float(mat.roughness), 0.12)    
+    roughness = float(mat.roughness)
     alpha2 = roughness ** 4
     k = alpha2 / 2.0
 
@@ -724,7 +725,8 @@ def shade_ct_env(
         )
 
     metallic_t  = _as_tensor(metallic)
-    roughness_t = _as_tensor(roughness).clamp(min=0.05)
+    # roughness_t = _as_tensor(roughness).clamp(min=0.05)
+    roughness_t = _as_tensor(roughness)
     alpha2      = roughness_t ** 4
     k_smith     = alpha2 / 2.0
 
