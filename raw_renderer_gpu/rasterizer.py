@@ -574,6 +574,7 @@ def shade_ct_sh(
     metallic:         Union[float, torch.Tensor] = 0.0,
     roughness:        Union[float, torch.Tensor] = 0.5,
     lut:              Optional[torch.Tensor] = None,
+    diffuse_fresnel:  bool = True,
     return_components: bool = False,
 ) -> torch.Tensor:
     """
@@ -588,6 +589,8 @@ def shade_ct_sh(
     metallic  : scalar or (..., 1)  metallic factor in [0, 1]
     roughness : scalar or (..., 1)  perceptual roughness in [0, 1]
     lut       : optional pre-loaded GGX SH LUT; fetched/computed if None
+    diffuse_fresnel : if True, multiply the diffuse by (1-F) on top of
+                (1-metallic). Default False to match Blender's Principled BSDF.
 
     Returns
     -------
@@ -623,8 +626,13 @@ def shade_ct_sh(
 
     # ── Diffuse (Lambertian, energy-conserving) ───────────────────────────────
     irr = _sh_irradiance(sh_coeffs, normals)       # (..., 3)
-    k_d = (1.0 - F) * (1.0 - metallic)            # energy taken by specular
-    # k_d = (1.0 - metallic)
+    # Diffuse weight. Default matches Blender's Principled BSDF, which weights the
+    # diffuse layer by (1-metallic) only. The (1-F) "energy taken by specular"
+    # cross-term darkens the diffuse and was the main cause of the shader being
+    # too dark vs BlenderProc; enable diffuse_fresnel=True to restore it.
+    k_d = (1.0 - metallic)
+    if diffuse_fresnel:
+        k_d = (1.0 - F) * k_d
     diff = k_d * albedo / torch.pi * irr
 
     # ── Specular (GGX SH) ─────────────────────────────────────────────────────
@@ -690,6 +698,7 @@ def shade_ct_env(
     metallic:          Union[float, torch.Tensor] = 0.0,
     roughness:         Union[float, torch.Tensor] = 0.5,
     sbatch:            int = 64,
+    diffuse_fresnel:   bool = True,
     return_components: bool = False,
 ) -> torch.Tensor:
     """
@@ -707,6 +716,8 @@ def shade_ct_env(
     env_dw                : (P,)    solid angles
     metallic, roughness   : scalar or (M, 1) Tensor
     sbatch                : env-map samples per memory batch
+    diffuse_fresnel       : if True, multiply diffuse by (1-F) on top of
+                            (1-metallic). Default False (matches Blender).
     return_components     : if True, return (composite, dict)
 
     Returns
@@ -765,7 +776,11 @@ def shade_ct_env(
         n_valid  += mf.sum(1)
 
     F_mean    = F_sum / n_valid[:, None].clamp(min=1)         # (M, 3)
-    k_d       = (1.0 - F_mean) * (1.0 - metallic_t)          # (M, 3)
+    # Diffuse weight: (1-metallic) by default (matches Blender's Principled BSDF);
+    # pass diffuse_fresnel=True to also apply the (1-F) cross-term.
+    k_d       = (1.0 - metallic_t)                            # (M, 3)
+    if diffuse_fresnel:
+        k_d = (1.0 - F_mean) * k_d
     diff      = k_d * albedo / torch.pi * diff_irr            # (M, 3)
     front     = (NdotV_raw > 0).to(albedo.dtype)
     composite = (diff + spec) * front

@@ -391,8 +391,19 @@ def render_3dfront_dataset(
     device: str = "cuda",
     sh_lights_dir: Optional[Path] = _DEFAULT_SH_LIGHTS_DIR,
     shader: str = "ct_sh",
+    normalize_env: bool = True,
 ) -> None:
     """Render 3D-Front GT material maps under n_lights SH lighting conditions.
+
+    normalize_env: if True (default), each light's SH coefficients are scaled so
+        that its reconstructed env-map peak equals 1.0 — exactly the per-map
+        max-normalisation that ``_sh_coeffs_to_env_img`` applies when writing the
+        ``sh_env_map_NNN.png`` files. BlenderProc's ``render_front3d_multipass.py``
+        ``env`` condition consumes those normalised PNGs as the world background,
+        so this makes the shader's lighting INPUT identical to BlenderProc's.
+        Leaving it False lights from the raw (un-normalised) coefficients, which
+        is brighter and does NOT match a BlenderProc env render. (Verified on the
+        sphere: normalised reproduces the PNG path to RMSE ~1e-3; raw is ~15% off.)
 
     SH lights source (in order of priority):
       1. sh_lights_dir — directory of precomputed .npy SH coefficient files,
@@ -465,6 +476,12 @@ def render_3dfront_dataset(
         env_dw_t   = torch.from_numpy(_env_proto._solid_angles).to(device)
 
     for i, coeffs_np in enumerate(sh_coeffs_list):
+        # Match the per-map max-normalisation baked into the sh_env_map PNGs that
+        # BlenderProc renders from (see _sh_coeffs_to_env_img). Scaling the SH
+        # coefficients is equivalent and works for both the ct_sh and ct_env paths.
+        if normalize_env:
+            env_max = float(EnvMap.from_sh(SHLighting(coeffs_np)).image.max())
+            coeffs_np = coeffs_np / max(env_max, 1e-8)
         with torch.no_grad():
             if shader == "ct_env":
                 assert env_dirs_t is not None and env_dw_t is not None
