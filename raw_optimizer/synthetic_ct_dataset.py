@@ -125,11 +125,19 @@ DEFAULT_CFG = dict(
     shininess_max  = SHININESS_RANGE[1],
     spec_warmup_steps    = 0,
     init_spec_zero       = False,
-    lambda_metallic_l1   = 0.0,
+    lambda_metallic_l1        = 0.0,
+    lambda_metallic_binarize  = 0.0,
     lr_end            = 0.0,
     lr_schedule       = "none",
     lr_schedule_step  = 50,
     lr_schedule_gamma = 0.5,
+    # per-parameter transform ("none" | "sigmoid" | "log" | "softplus")
+    tr_albedo    = "none",
+    tr_metallic  = "none",
+    tr_roughness = "none",
+    tr_env       = "none",
+    # rescale albedo+lighting toward GT after every N steps (0 = disabled)
+    rescale_every = 0,
 )
 
 
@@ -446,6 +454,31 @@ def _init_map(arr: np.ndarray, t: str, dev) -> torch.Tensor:
 def _init_env(gt_flat: np.ndarray, t: str, dev) -> torch.Tensor:
     gt_t = torch.from_numpy(gt_flat.astype(np.float32)).to(dev)
     return _softplus_inv(gt_t) if t == "softplus" else gt_t.clone()
+
+
+def _rescale_albedo_lighting(
+    albedo_param: torch.Tensor,
+    lighting_params: list,
+    tr_ab: str,
+    flat_mask: torch.Tensor,
+    gt_ab_m: torch.Tensor,
+) -> None:
+    """Rescale albedo and lighting in-place to align estimated albedo with GT.
+
+    Computes per-channel scale = argmin_s ||est_albedo * s - gt_albedo|| and
+    applies it: albedo_param *= scale, each lighting tensor /= scale.
+    lighting_params: list of tensors with shape (..., 3) — sh_coeffs or env_maps.
+    """
+    ab_m = _fwd_albedo(albedo_param, tr_ab).reshape(-1, 3)[flat_mask]  # (M, 3)
+    scale = (gt_ab_m * ab_m).sum(0) / (ab_m * ab_m).sum(0).clamp(1e-8)  # (3,)
+    cur_out = _fwd_albedo(albedo_param, tr_ab)                           # (H, W, 3)
+    new_out = (cur_out * scale[None, None, :]).clamp(min=1e-6)
+    if tr_ab == "log":
+        albedo_param.data.copy_(torch.log(new_out))
+    else:
+        albedo_param.data.copy_(new_out)
+    for lp in lighting_params:
+        lp.data /= scale  # (..., 3) / (3,) — broadcasts over all leading dims
 
 
 # Canonical learnable-parameter sets per shader
@@ -1014,9 +1047,13 @@ def _optimize_ct_sh(
     dev    = normals_hw.device
     H, W   = normals_hw.shape[:2]
     N_imgs = len(images)
-    op     = opt_params if opt_params is not None else _CT_SH_PARAMS
-    tr     = transforms if transforms is not None else NAMED_TRANSFORMS["none"]
-    tr_ab, tr_met, tr_rou = tr["albedo"], tr["metallic"], tr["roughness"]
+    op = opt_params if opt_params is not None else _CT_SH_PARAMS
+    if transforms is not None:
+        tr_ab, tr_met, tr_rou = transforms["albedo"], transforms["metallic"], transforms["roughness"]
+    else:
+        tr_ab  = cfg.get("tr_albedo",   "none")
+        tr_met = cfg.get("tr_metallic",  "none")
+        tr_rou = cfg.get("tr_roughness", "none")
 
     def _t(x):
         return torch.from_numpy(np.asarray(x, np.float32)).to(dev) \
@@ -1083,7 +1120,7 @@ def _optimize_ct_sh(
         learnable.append(metallic_raw)
         named_params["metallic"] = metallic_raw
     else:
-        if init_from_gt and _gt_met_np.ndim > 0:
+        if _gt_met_np.ndim > 0:
             metallic_raw = _init_map(_gt_met_np.reshape(H, W, 1), tr_met, dev)
         else:
             metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
@@ -1098,7 +1135,7 @@ def _optimize_ct_sh(
         learnable.append(roughness_raw)
         named_params["roughness"] = roughness_raw
     else:
-        if init_from_gt and _gt_rou_np.ndim > 0:
+        if _gt_rou_np.ndim > 0:
             roughness_raw = _init_map(_gt_rou_np.reshape(H, W, 1), tr_rou, dev)
         else:
             roughness_raw = _init_scalar(_gt_rou_scalar, H, W, tr_rou, dev=dev)
@@ -1106,10 +1143,11 @@ def _optimize_ct_sh(
     def _get_met(): return _fwd_metallic(metallic_raw, tr_met)
     def _get_rou(): return _fwd_roughness(roughness_raw, tr_rou)
 
-    opt   = _make_optimizer(learnable, cfg)
-    sched = _make_scheduler(opt, cfg, cfg["n_iter"])
+    opt   = _make_optimizer(learnable, cfg) if learnable else None
+    sched = _make_scheduler(opt, cfg, cfg["n_iter"]) if opt is not None else None
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev)]  # metallic L1 loss, updated each _forward call
+    _loss_mb = [torch.zeros((), device=dev)]  # metallic binarize loss, updated each _forward call
 
     def _forward():
         _spec_warmup = _step[0] < cfg.get("spec_warmup_steps", 0)
@@ -1136,9 +1174,12 @@ def _optimize_ct_sh(
             _tv(metallic_raw.permute(2, 0, 1)) +
             _tv(roughness_raw.permute(2, 0, 1))
         )
-        loss_metallic_l1 = cfg.get("lambda_metallic_l1", 0.0) * metallic.reshape(-1, 1)[flat_mask].abs().mean()
+        met_m = metallic.reshape(-1, 1)[flat_mask]
+        loss_metallic_l1       = cfg.get("lambda_metallic_l1",       0.0) * met_m.abs().mean()
+        loss_metallic_binarize = cfg.get("lambda_metallic_binarize",  0.0) * (met_m * (1.0 - met_m)).mean()
         _loss_ml[0] = loss_metallic_l1.detach()
-        return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1, loss_data, loss_sparse, loss_white, loss_tv
+        _loss_mb[0] = loss_metallic_binarize.detach()
+        return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1 + loss_metallic_binarize, loss_data, loss_sparse, loss_white, loss_tv
 
     def _forward_components():
         with torch.no_grad():
@@ -1232,23 +1273,34 @@ def _optimize_ct_sh(
             "roughness_mean":      _ir,
             "metallic_err_mean":   abs(_im - _gt_met_scalar),
             "roughness_err_mean":  abs(_ir - _gt_rou_scalar),
-            "loss_metallic_l1":    float(_loss_ml[0]),
+            "loss_metallic_l1":       float(_loss_ml[0]),
+            "loss_metallic_binarize": float(_loss_mb[0]),
             **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-            "lr": opt.param_groups[0]["lr"],
+            "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
         }, step=-1)
+    _rescale_every = cfg.get("rescale_every", 0)
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
         _step[0] = i
-        if log_gradients:
-            pre_raw = {n: p.data.clone() for n, p in named_params.items()}
-        loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
-        if sched is not None:
-            sched.step()
-        if log_gradients and grad_log_dir is not None:
-            _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
-                            _forward_components,
-                            (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
-                            grad_log_dir, flat_mask, H, W)
+        if opt is not None:
+            if log_gradients:
+                pre_raw = {n: p.data.clone() for n, p in named_params.items()}
+            loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+            if sched is not None:
+                sched.step()
+            if (_rescale_every > 0 and (i + 1) % _rescale_every == 0
+                    and "albedo" in op and "sh" in op and _gt_ab_m is not None):
+                with torch.no_grad():
+                    _rescale_albedo_lighting(
+                        albedo_param, [sh_coeffs], tr_ab, flat_mask, _gt_ab_m)
+            if log_gradients and grad_log_dir is not None:
+                _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
+                                _forward_components,
+                                (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
+                                grad_log_dir, flat_mask, H, W)
+        else:
+            with torch.no_grad():
+                loss, l_d, l_s, l_w, l_tv = _forward()
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
@@ -1290,9 +1342,10 @@ def _optimize_ct_sh(
                     "roughness_mean":     rou,
                     "metallic_err_mean":  abs(met - _gt_met_scalar),
                     "roughness_err_mean": abs(rou - _gt_rou_scalar),
-                    "loss_metallic_l1":   float(_loss_ml[0]),
+                    "loss_metallic_l1":       float(_loss_ml[0]),
+                    "loss_metallic_binarize": float(_loss_mb[0]),
                     **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-                    "lr": opt.param_groups[0]["lr"],
+                    "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
                 }, step=i)
     total_time = time.perf_counter() - t0
 
@@ -1345,9 +1398,14 @@ def _optimize_ct_env(
     H, W   = normals_hw.shape[:2]
     N_imgs = len(images)
     P      = env_dirs.shape[0]
-    op     = opt_params if opt_params is not None else _CT_ENV_PARAMS
-    tr     = transforms if transforms is not None else NAMED_TRANSFORMS["none"]
-    tr_ab, tr_met, tr_rou, tr_env = tr["albedo"], tr["metallic"], tr["roughness"], tr["env"]
+    op = opt_params if opt_params is not None else _CT_ENV_PARAMS
+    if transforms is not None:
+        tr_ab, tr_met, tr_rou, tr_env = transforms["albedo"], transforms["metallic"], transforms["roughness"], transforms["env"]
+    else:
+        tr_ab  = cfg.get("tr_albedo",   "none")
+        tr_met = cfg.get("tr_metallic",  "none")
+        tr_rou = cfg.get("tr_roughness", "none")
+        tr_env = cfg.get("tr_env",       "none")
 
     def _t(x):
         return torch.from_numpy(np.asarray(x, np.float32)).to(dev) \
@@ -1419,7 +1477,7 @@ def _optimize_ct_env(
         learnable.append(metallic_raw)
         named_params["metallic"] = metallic_raw
     else:
-        if init_from_gt and _gt_met_np.ndim > 0:
+        if _gt_met_np.ndim > 0:
             metallic_raw = _init_map(_gt_met_np.reshape(H, W, 1), tr_met, dev)
         else:
             metallic_raw = _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev)
@@ -1434,7 +1492,7 @@ def _optimize_ct_env(
         learnable.append(roughness_raw)
         named_params["roughness"] = roughness_raw
     else:
-        if init_from_gt and _gt_rou_np.ndim > 0:
+        if _gt_rou_np.ndim > 0:
             roughness_raw = _init_map(_gt_rou_np.reshape(H, W, 1), tr_rou, dev)
         else:
             roughness_raw = _init_scalar(_gt_rou_scalar, H, W, tr_rou, dev=dev)
@@ -1442,10 +1500,11 @@ def _optimize_ct_env(
     def _get_met(): return _fwd_metallic(metallic_raw, tr_met)
     def _get_rou(): return _fwd_roughness(roughness_raw, tr_rou)
 
-    opt   = _make_optimizer(learnable, cfg)
-    sched = _make_scheduler(opt, cfg, cfg["n_iter"])
+    opt   = _make_optimizer(learnable, cfg) if learnable else None
+    sched = _make_scheduler(opt, cfg, cfg["n_iter"]) if opt is not None else None
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev)]  # metallic L1 loss, updated each _forward call
+    _loss_mb = [torch.zeros((), device=dev)]  # metallic binarize loss, updated each _forward call
 
     def _forward(img_indices=None):
         if img_indices is None:
@@ -1479,9 +1538,11 @@ def _optimize_ct_env(
             _tv(metallic_raw.permute(2, 0, 1)) +
             _tv(roughness_raw.permute(2, 0, 1))
         )
-        loss_metallic_l1 = frac * cfg.get("lambda_metallic_l1", 0.0) * metallic.reshape(-1, 1)[flat_mask].abs().mean()
+        met_m = metallic.reshape(-1, 1)[flat_mask]
+        loss_metallic_l1       = frac * cfg.get("lambda_metallic_l1",       0.0) * met_m.abs().mean()
+        loss_metallic_binarize = frac * cfg.get("lambda_metallic_binarize",  0.0) * (met_m * (1.0 - met_m)).mean()
         _loss_ml[0] = loss_metallic_l1.detach()
-        return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1, loss_data, loss_sparse, loss_white, loss_tv
+        return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1 + loss_metallic_binarize, loss_data, loss_sparse, loss_white, loss_tv
 
     def _forward_components():
         with torch.no_grad():
@@ -1586,42 +1647,52 @@ def _optimize_ct_env(
             "roughness_err_mean": abs(_ir - _gt_rou_scalar),
             "loss_metallic_l1":   float(_loss_ml[0]),
             **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-            "lr": opt.param_groups[0]["lr"],
+            "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
         }, step=-1)
+    _rescale_every = cfg.get("rescale_every", 0)
     t0 = time.perf_counter()
     img_batch = cfg.get("img_batch", N_imgs) or N_imgs
     for i in range(cfg["n_iter"]):
         _step[0] = i
-        if log_gradients:
-            pre_raw = {n: p.data.clone() for n, p in named_params.items()}
-        if img_batch >= N_imgs or log_gradients:
-            loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
-        else:
-            totals = [0.0] * 5
-
-            def _accum():
-                opt.zero_grad()
-                totals[:] = [0.0] * 5
-                for _b in range(0, N_imgs, img_batch):
-                    _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
-                    _vals[0].backward()
-                    for _j, _v in enumerate(_vals):
-                        totals[_j] += float(_v.detach())
-                return torch.tensor(totals[0])
-
-            if cfg.get("optimizer") == "LBFGS":
-                opt.step(_accum)
+        if opt is not None:
+            if log_gradients:
+                pre_raw = {n: p.data.clone() for n, p in named_params.items()}
+            if img_batch >= N_imgs or log_gradients:
+                loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
             else:
-                _accum()
-                opt.step()
-            loss, l_d, l_s, l_w, l_tv = totals
-        if sched is not None:
-            sched.step()
-        if log_gradients and grad_log_dir is not None:
-            _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
-                            _forward_components,
-                            (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
-                            grad_log_dir, flat_mask, H, W)
+                totals = [0.0] * 5
+
+                def _accum():
+                    opt.zero_grad()
+                    totals[:] = [0.0] * 5
+                    for _b in range(0, N_imgs, img_batch):
+                        _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
+                        _vals[0].backward()
+                        for _j, _v in enumerate(_vals):
+                            totals[_j] += float(_v.detach())
+                    return torch.tensor(totals[0])
+
+                if cfg.get("optimizer") == "LBFGS":
+                    opt.step(_accum)
+                else:
+                    _accum()
+                    opt.step()
+                loss, l_d, l_s, l_w, l_tv = totals
+            if sched is not None:
+                sched.step()
+            if (_rescale_every > 0 and (i + 1) % _rescale_every == 0
+                    and "albedo" in op and "env" in op and _gt_ab_m is not None):
+                with torch.no_grad():
+                    _rescale_albedo_lighting(
+                        albedo_param, [env_maps], tr_ab, flat_mask, _gt_ab_m)
+            if log_gradients and grad_log_dir is not None:
+                _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
+                                _forward_components,
+                                (float(loss), float(l_d), float(l_s), float(l_w), float(l_tv)),
+                                grad_log_dir, flat_mask, H, W)
+        else:
+            with torch.no_grad():
+                loss, l_d, l_s, l_w, l_tv = _forward()
         if i % cfg["log_every"] == 0:
             elapsed = time.perf_counter() - t0
             with torch.no_grad():
@@ -1667,9 +1738,10 @@ def _optimize_ct_env(
                     "roughness_mean":     rou,
                     "metallic_err_mean":  abs(met - _gt_met_scalar),
                     "roughness_err_mean": abs(rou - _gt_rou_scalar),
-                    "loss_metallic_l1":   float(_loss_ml[0]),
+                    "loss_metallic_l1":       float(_loss_ml[0]),
+                    "loss_metallic_binarize": float(_loss_mb[0]),
                     **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-                    "lr": opt.param_groups[0]["lr"],
+                    "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
                 }, step=i)
 
     total_time = time.perf_counter() - t0
@@ -1925,7 +1997,7 @@ def _optimize_phong_sh(
             "ks_mean":            _ik,
             "shininess_err_mean": abs(_is - _gt_shin_mean),
             "ks_err_mean":        abs(_ik - _gt_ks_mean),
-            "lr": opt.param_groups[0]["lr"],
+            "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
         }, step=-1)
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
@@ -1982,7 +2054,7 @@ def _optimize_phong_sh(
                     "ks_mean":            ks_val,
                     "shininess_err_mean": abs(shin_val - _gt_shin_mean),
                     "ks_err_mean":        abs(ks_val   - _gt_ks_mean),
-                    "lr": opt.param_groups[0]["lr"],
+                    "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
                 }, step=i)
     total_time = time.perf_counter() - t0
 
@@ -2264,7 +2336,7 @@ def _optimize_phong_env(
             "ks_mean":            _ik,
             "shininess_err_mean": abs(_is - _gt_shin_mean),
             "ks_err_mean":        abs(_ik - _gt_ks_mean),
-            "lr": opt.param_groups[0]["lr"],
+            "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
         }, step=-1)
     t0 = time.perf_counter()
     img_batch = cfg.get("img_batch", N_imgs) or N_imgs
@@ -2346,7 +2418,7 @@ def _optimize_phong_env(
                     "ks_mean":            ks_val,
                     "shininess_err_mean": abs(shin_val - _gt_shin_mean),
                     "ks_err_mean":        abs(ks_val   - _gt_ks_mean),
-                    "lr": opt.param_groups[0]["lr"],
+                    "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
                 }, step=i)
     total_time = time.perf_counter() - t0
 

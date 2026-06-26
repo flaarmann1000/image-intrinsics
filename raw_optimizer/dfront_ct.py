@@ -46,6 +46,7 @@ from raw_optimizer.synthetic_ct_dataset import (
     _env_flat_to_img,
     _make_lights_random_sh,
     DEFAULT_CFG,
+    NAMED_TRANSFORMS,
     LIGHT_COLOR,
     LIGHT_INTENSITY,
 )
@@ -55,6 +56,24 @@ _WANDB_ENTITY  = "DLVC-intrinsics"
 _WANDB_PROJECT = "3dfront_ct_decomp"
 
 _REPO_ROOT = Path(__file__).parent.parent
+
+
+def transforms_cfg(name: str) -> dict:
+    """Convert a named transform preset to individual cfg_overrides keys.
+
+    Usage::
+        decompose_scene(..., cfg_overrides={**transforms_cfg("all"), "lambda_tv": 1e-3})
+
+    Available presets: "none", "all", "only_softplus", "only_shininess"
+    """
+    tr = NAMED_TRANSFORMS[name]
+    return {
+        "tr_albedo":   tr["albedo"],
+        "tr_metallic": tr["metallic"],
+        "tr_roughness": tr["roughness"],
+        "tr_env":      tr["env"],
+    }
+
 
 # ─────────────────────────────────────── image helpers ──────────────────────
 
@@ -183,6 +202,16 @@ def load_scene(scene_dir: Path, no_shadow: bool = False) -> dict:
         light_keys = [bf.stem for bf in base_files]
 
     H, W = normals.shape[:2]
+
+    # Load precomputed SH coefficients if present (one .npy per light)
+    sh_coeffs_list = []
+    for lk in light_keys:
+        idx = int(lk.split("_")[-1])
+        sh_path = scene_dir / f"sh_{idx:03d}.npy"
+        if sh_path.exists():
+            sh_coeffs_list.append(np.load(sh_path).astype(np.float32))
+    sh_coeffs = sh_coeffs_list if len(sh_coeffs_list) == len(light_keys) else None
+
     return dict(
         normals_np=normals,
         mask_np=mask,
@@ -192,6 +221,7 @@ def load_scene(scene_dir: Path, no_shadow: bool = False) -> dict:
         images=images,
         light_keys=light_keys,
         H=H, W=W,
+        sh_coeffs=sh_coeffs,
     )
 
 
@@ -630,6 +660,7 @@ def make_run_name(
     no_shadow: bool = False,
     freeze_intrinsics: bool = False,
     init_from_gt: bool = False,
+    opt_params: Optional[frozenset] = None,
 ) -> str:
     """Build a deterministic run / output-directory name from decompose_scene params.
 
@@ -647,11 +678,17 @@ def make_run_name(
         for k, v in (cfg_overrides or {}).items()
         if k not in _RUN_NAME_SKIP and v != DEFAULT_CFG.get(k)
     )
+
+    opt_tag = ""
+    if opt_params is not None:
+        opt_tag = "_only_" + "+".join(sorted(opt_params))
+
     return (
         f"{scene_name}_{shader}"
         + ("_noshadow"          if no_shadow          else "")
         + ("_freeze_intrinsics" if freeze_intrinsics   else "")
         + ("_init_from_gt"      if init_from_gt        else "")
+        + opt_tag
         + (f"_{override_tags}"  if override_tags       else "")
     )
 
@@ -666,6 +703,7 @@ def decompose_scene(
     no_shadow: bool = False,
     init_from_gt: bool = False,
     freeze_intrinsics: bool = False,
+    opt_params: Optional[frozenset] = None,
     log_gradients: bool = False,
     device: str = "cuda",
     wandb_entity: str = _WANDB_ENTITY,
@@ -686,7 +724,15 @@ def decompose_scene(
     out_dir   = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = {**DEFAULT_CFG, **(cfg_overrides or {})}
+    # Allow opt_params to be specified inside cfg_overrides as a list or frozenset
+    cfg_overrides = dict(cfg_overrides or {})
+    if opt_params is None and "opt_params" in cfg_overrides:
+        _op = cfg_overrides.pop("opt_params")
+        opt_params = frozenset(_op) if not isinstance(_op, frozenset) else _op
+    else:
+        cfg_overrides.pop("opt_params", None)  # discard if kwarg already given
+
+    cfg = {**DEFAULT_CFG, **cfg_overrides}
 
     scene = load_scene(scene_dir, no_shadow=no_shadow)
     H, W = scene["H"], scene["W"]
@@ -702,6 +748,7 @@ def decompose_scene(
     gt_metallic  = scene["metallic_np"]   # (H, W, 1)
     gt_roughness = scene["roughness_np"]  # (H, W, 1)
     gt_albedo    = scene["albedo_np"]     # (H, W, 3)
+    gt_sh_coeffs = scene.get("sh_coeffs")  # list of (9,3) arrays or None
 
     grad_log_dir = out_dir / "gradient_flow" if log_gradients else None
 
@@ -721,7 +768,27 @@ def decompose_scene(
         no_shadow=no_shadow,
         freeze_intrinsics=freeze_intrinsics,
         init_from_gt=init_from_gt,
+        opt_params=opt_params,
     )
+
+    def _fmt(v):
+        return f"{v:g}" if isinstance(v, float) else str(v)
+
+    wandb_tags = [shader]
+    if freeze_intrinsics:
+        wandb_tags.append("freeze_intrinsics")
+    if init_from_gt:
+        wandb_tags.append("init_from_gt")
+    if no_shadow:
+        wandb_tags.append("noshadow")
+    if opt_params is not None:
+        wandb_tags.append("only_" + "+".join(sorted(opt_params)))
+    wandb_tags += [
+        f"{k}={_fmt(v)}"
+        for k, v in (cfg_overrides or {}).items()
+        if k not in _RUN_NAME_SKIP and v != DEFAULT_CFG.get(k)
+    ]
+
     run = wandb.init(
         entity  =wandb_entity,
         project =wandb_project,
@@ -729,6 +796,7 @@ def decompose_scene(
                       fov_deg=fov_deg, cam_dist=cam_dist, no_shadow=no_shadow,
                       n_images=len(images), H=H, W=W),
         name    =run_name,
+        tags    =wandb_tags,
         reinit  =True,
     )
     run.log({
@@ -740,16 +808,29 @@ def decompose_scene(
 
     # ── optimize ──────────────────────────────────────────────────────────────
     t0 = time.time()
-    _opt_params_sh  = frozenset({"sh"})  if freeze_intrinsics else None
-    _opt_params_env = frozenset({"env"}) if freeze_intrinsics else None
+
+    # Resolve effective opt_params:
+    # - explicit opt_params overrides everything
+    # - freeze_intrinsics falls back to the legacy "only optimize lighting" behaviour
+    # - None means optimize everything
+    if opt_params is not None:
+        _eff_op_sh  = opt_params
+        _eff_op_env = opt_params
+    elif freeze_intrinsics:
+        _eff_op_sh  = frozenset({"sh"})
+        _eff_op_env = frozenset({"env"})
+    else:
+        _eff_op_sh  = None
+        _eff_op_env = None
 
     if shader == "ct_sh":
         albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
             images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
             gt_metallic, gt_roughness, cfg,
             wandb_run=run,
+            gt_sh_coeffs=gt_sh_coeffs,
             gt_albedo=gt_albedo,
-            opt_params=_opt_params_sh,
+            opt_params=_eff_op_sh,
             init_from_gt=init_from_gt,
             log_gradients=log_gradients,
             grad_log_dir=grad_log_dir,
@@ -761,8 +842,9 @@ def decompose_scene(
             env_dirs, env_dw, cfg,
             wandb_run=run,
             env_H=env_H, env_W=env_W,
+            gt_sh_coeffs=gt_sh_coeffs,
             gt_albedo=gt_albedo,
-            opt_params=_opt_params_env,
+            opt_params=_eff_op_env,
             init_from_gt=init_from_gt,
             log_gradients=log_gradients,
             grad_log_dir=grad_log_dir,
