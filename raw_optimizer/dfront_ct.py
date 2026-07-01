@@ -116,7 +116,7 @@ def load_exr(path: Path) -> np.ndarray:
 # ─────────────────────────────────────── data loading ───────────────────────
 
 
-def load_scene(scene_dir: Path, no_shadow: bool = False) -> dict:
+def load_scene(scene_dir: Path, no_shadow: bool = False, use_npy: bool = False) -> dict:
     """Load all maps from a 3D-Front scene directory.
 
     Reads config.json (if present) to determine the image variant:
@@ -192,12 +192,24 @@ def load_scene(scene_dir: Path, no_shadow: bool = False) -> dict:
         else:
             img_files = base_files
 
-        images = [
-            np.array(Image.open(f), dtype=np.float32)[:, :, :3] / 255.0
-            for f in img_files
-        ]
-        if variant == "srgb":
-            images = [srgb_to_linear(img) for img in images]
+        if use_npy:
+            npy_files = [bf.with_suffix(".npy") for bf in base_files]
+            if all(f.exists() for f in npy_files):
+                images = [np.load(f).astype(np.float32) for f in npy_files]
+            else:
+                images = [
+                    np.array(Image.open(f), dtype=np.float32)[:, :, :3] / 255.0
+                    for f in img_files
+                ]
+                if variant == "srgb":
+                    images = [srgb_to_linear(img) for img in images]
+        else:
+            images = [
+                np.array(Image.open(f), dtype=np.float32)[:, :, :3] / 255.0
+                for f in img_files
+            ]
+            if variant == "srgb":
+                images = [srgb_to_linear(img) for img in images]
         # Always use the base key (light_NNN) regardless of which file was loaded
         light_keys = [bf.stem for bf in base_files]
 
@@ -234,6 +246,7 @@ def make_proxy_geometry(
     fov_deg: float = 60.0,
     cam_dist: float = 2.0,
     device: str = "cuda",
+    dtype: torch.dtype = torch.float32,
 ) -> tuple:
     """Return (normals_hw, frag_pos_hw, mask_hw, cam_pos) tensors on device.
 
@@ -257,16 +270,17 @@ def make_proxy_geometry(
         np.zeros((H, W), dtype=np.float32),
     ], axis=-1)  # (H, W, 3)
 
-    cam_pos = np.array([0.0, 0.0, cam_dist], dtype=np.float32)
+    np_fdtype = np.float64 if dtype == torch.float64 else np.float32
+    cam_pos = np.array([0.0, 0.0, cam_dist], dtype=np_fdtype)
 
-    def _t(x):
-        return torch.from_numpy(x).to(device)
+    def _tf(x: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(x.astype(np_fdtype)).to(device, dtype)
 
     return (
-        _t(normals_np),
-        _t(frag_pos),
-        _t(mask_np),
-        _t(cam_pos),
+        _tf(normals_np),
+        _tf(frag_pos),
+        torch.from_numpy(mask_np.astype(np.bool_)).to(device),
+        _tf(cam_pos),
     )
 
 
@@ -386,11 +400,13 @@ def render_scene(
 
     # Scatter back to full image
     render_np = np.zeros((H * W, 3), dtype=np.float32)
-    render_np[flat_mask.cpu().numpy()] = render_m.clamp(0, 1).float().cpu().numpy()
+    render_np[flat_mask.cpu().numpy()] = render_m.float().cpu().numpy()
     render_np = render_np.reshape(H, W, 3)
 
-    # Save
-    Image.fromarray((render_np * 255).astype(np.uint8)).save(out_dir / "render.png")
+    # Save. PNG is 8-bit: clip to [0,1] (raw render may fall outside, which would
+    # overflow-wrap uint8) and round rather than truncate (halves quantization
+    # error and removes the ~0.5/255 dark bias). The .npy keeps the raw float.
+    Image.fromarray((np.clip(render_np, 0, 1) * 255).round().astype(np.uint8)).save(out_dir / "render.png")
     np.save(out_dir / "render.npy", render_np)
 
     sh_env_img = _sh_coeffs_to_env_img(sh_light.coeffs)
@@ -414,7 +430,7 @@ _DEFAULT_SH_LIGHTS_DIR = Path(__file__).parents[1] / "results" / "ref_sh_lightin
 def render_3dfront_dataset(
     scene_dir: Path,
     out_dir: Path,
-    n_lights: int = 16,
+    n_lights: Optional[int] = None,
     seed: int = 0,
     fov_deg: float = 60.0,
     cam_dist: float = 2.0,
@@ -423,7 +439,12 @@ def render_3dfront_dataset(
     shader: str = "ct_sh",
     normalize_env: bool = True,
 ) -> None:
-    """Render 3D-Front GT material maps under n_lights SH lighting conditions.
+    """Render 3D-Front GT material maps under SH lighting conditions.
+
+    n_lights: total number of lights to render.
+      - None (default): use all lights found in sh_lights_dir, no random supplement.
+      - int: load up to n_lights from sh_lights_dir, then fill the remainder with
+        randomly generated SH coefficients (seeds: seed, seed+1, ...).
 
     normalize_env: if True (default), each light's SH coefficients are scaled so
         that its reconstructed env-map peak equals 1.0 — exactly the per-map
@@ -435,10 +456,11 @@ def render_3dfront_dataset(
         is brighter and does NOT match a BlenderProc env render. (Verified on the
         sphere: normalised reproduces the PNG path to RMSE ~1e-3; raw is ~15% off.)
 
-    SH lights source (in order of priority):
+    SH lights source:
       1. sh_lights_dir — directory of precomputed .npy SH coefficient files,
-         used in sorted order (pass None to disable).
-      2. Random SH generation (_make_lights_random_sh) with sequential seeds.
+         used in sorted order (pass None to skip).
+      2. Random SH generation (_make_lights_random_sh) with sequential seeds,
+         used only when n_lights exceeds the number of precomputed files.
 
     Saves:
       out_dir/albedo.png          — GT albedo (copied from scene_dir)
@@ -457,19 +479,29 @@ def render_3dfront_dataset(
     out_dir   = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build the ordered list of SH coefficient arrays
+    # Load precomputed lights
+    precomputed: list[np.ndarray] = []
     if sh_lights_dir is not None and Path(sh_lights_dir).is_dir():
-        npy_files = sorted(Path(sh_lights_dir).glob("*.npy"))[:n_lights]
+        npy_files = sorted(Path(sh_lights_dir).glob("*.npy"))
+        cap = n_lights if n_lights is not None else len(npy_files)
+        npy_files = npy_files[:cap]
         if not npy_files:
             raise FileNotFoundError(f"No .npy files found in {sh_lights_dir}")
-        sh_coeffs_list = [np.load(p).astype(np.float32) for p in npy_files]
-        print(f"  Using {len(sh_coeffs_list)} precomputed SH lights from {sh_lights_dir}")
-    else:
-        sh_coeffs_list = [
-            _make_lights_random_sh(seed=seed + i)[3]   # coeffs_np (9, 3)
-            for i in range(n_lights)
-        ]
+        precomputed = [np.load(p).astype(np.float32) for p in npy_files]
+        print(f"  Loaded {len(precomputed)} precomputed SH lights from {sh_lights_dir}")
 
+    # Supplement with random lights if a target was given and not yet reached
+    n_random = max(0, n_lights - len(precomputed)) if n_lights is not None else 0
+    random_lights: list[np.ndarray] = [
+        _make_lights_random_sh(seed=seed + i)[3]
+        for i in range(n_random)
+    ]
+    if n_random:
+        print(f"  Generating {n_random} random SH lights (seed {seed}–{seed + n_random - 1})")
+
+    sh_coeffs_list = precomputed + random_lights
+    if not sh_coeffs_list:
+        raise ValueError("No lights available: sh_lights_dir is empty or None and n_lights is None.")
     n_lights = len(sh_coeffs_list)
 
     # Copy GT material maps so the dataset folder is self-contained
@@ -531,10 +563,13 @@ def render_3dfront_dataset(
                 )
 
         render_np = np.zeros((H * W, 3), dtype=np.float32)
-        render_np[flat_mask.cpu().numpy()] = render_m.clamp(0, 1).float().cpu().numpy()
+        render_np[flat_mask.cpu().numpy()] = render_m.float().cpu().numpy()
         render_np = render_np.reshape(H, W, 3)
 
-        Image.fromarray((render_np * 255).astype(np.uint8)).save(
+        # PNG is 8-bit/display only: clip to [0,1] (raw render may fall outside,
+        # which would overflow-wrap uint8) and round instead of truncate. The
+        # .npy below keeps the raw float values and is the lossless target.
+        Image.fromarray((np.clip(render_np, 0, 1) * 255).round().astype(np.uint8)).save(
             out_dir / f"light_{i:03d}.png")
         np.save(out_dir / f"light_{i:03d}.npy", render_np)
         np.save(out_dir / f"sh_{i:03d}.npy", coeffs_np)
@@ -600,7 +635,7 @@ def build_3dfront_dataset(
     for fname in ("albedo.png", "normals.png", "roughness.png", "metallic.png"):
         shutil.copy2(src_dir / fname, out_dir / fname)
 
-    # Collect sun render files sorted numerically
+    # Collect render files sorted numerically
     if variant == "linear":
         lighting_files = _sorted_lighting_files(src_dir, f"{lighting}_*.png", exclude_suffix="_srgb")
     elif variant == "srgb":
@@ -620,8 +655,7 @@ def build_3dfront_dataset(
         exr_scale = float(np.percentile(all_pos, 99)) if len(all_pos) else 1.0
         for i, img in enumerate(raw_imgs):
             img_norm = (img / exr_scale).astype(np.float32)
-            np.save(out_dir / f"light_{i:03d}.npy", img_norm)
-            # Preview PNG (clamped to [0,1]) for quick inspection
+            np.save(out_dir / f"light_{i:03d}.npy", img_norm)            
             Image.fromarray((img_norm.clip(0, 1) * 255).astype(np.uint8)).save(
                 out_dir / f"light_{i:03d}_preview.png")
     else:
@@ -650,23 +684,36 @@ _RUN_NAME_SKIP = frozenset({
     "lr", "lr_end", "lr_schedule", "lr_schedule_step", "lr_schedule_gamma",
     "loss", "optimizer",
     "shininess_min", "shininess_max",
+    # meta-params handled specially by make_run_name / decompose_scene
+    "shader", "no_shadow", "init_from_gt", "freeze_intrinsics",
+    "use_npy", "double", "opt_params", "n_images",
 })
 
 
 def make_run_name(
     scene_dir: Path,
-    shader: str,
     cfg_overrides: Optional[dict] = None,
-    no_shadow: bool = False,
-    freeze_intrinsics: bool = False,
-    init_from_gt: bool = False,
-    opt_params: Optional[frozenset] = None,
 ) -> str:
     """Build a deterministic run / output-directory name from decompose_scene params.
 
-    The name encodes only the non-default, semantically meaningful options so
-    that repeated calls with the same arguments always resolve to the same path.
+    All options — including shader, no_shadow, freeze_intrinsics, init_from_gt,
+    use_npy, double, n_images, opt_params — can be passed inside cfg_overrides.
+    The name encodes only the non-default, semantically meaningful options.
     """
+    cfg = dict(cfg_overrides or {})
+    shader            = cfg.get("shader",            "ct_sh")
+    no_shadow         = cfg.get("no_shadow",         False)
+    freeze_intrinsics = cfg.get("freeze_intrinsics", False)
+    init_from_gt      = cfg.get("init_from_gt",      False)
+    use_npy           = cfg.get("use_npy",            False)
+    double            = cfg.get("double",             False)
+    n_images          = cfg.get("n_images",           None)
+    opt_params_raw    = cfg.get("opt_params",         None)
+    if opt_params_raw is not None and not isinstance(opt_params_raw, frozenset):
+        opt_params = frozenset(opt_params_raw)
+    else:
+        opt_params = opt_params_raw
+
     scene_dir = Path(scene_dir)
     scene_name = scene_dir.parent.name + "/" + scene_dir.name
 
@@ -675,7 +722,7 @@ def make_run_name(
 
     override_tags = "_".join(
         f"{k}={_fmt(v)}"
-        for k, v in (cfg_overrides or {}).items()
+        for k, v in cfg.items()
         if k not in _RUN_NAME_SKIP and v != DEFAULT_CFG.get(k)
     )
 
@@ -688,6 +735,9 @@ def make_run_name(
         + ("_noshadow"          if no_shadow          else "")
         + ("_freeze_intrinsics" if freeze_intrinsics   else "")
         + ("_init_from_gt"      if init_from_gt        else "")
+        + ("_npy"               if use_npy             else "")
+        + ("_f64"               if double              else "")
+        + (f"_N{n_images}"      if n_images is not None else "")
         + opt_tag
         + (f"_{override_tags}"  if override_tags       else "")
     )
@@ -705,6 +755,9 @@ def decompose_scene(
     freeze_intrinsics: bool = False,
     opt_params: Optional[frozenset] = None,
     log_gradients: bool = False,
+    use_npy: bool = False,
+    double: bool = False,
+    n_images: Optional[int] = None,
     device: str = "cuda",
     wandb_entity: str = _WANDB_ENTITY,
     wandb_project: str = _WANDB_PROJECT,
@@ -724,8 +777,17 @@ def decompose_scene(
     out_dir   = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Allow opt_params to be specified inside cfg_overrides as a list or frozenset
+    # Allow meta-params and opt_params to be specified inside cfg_overrides.
+    # cfg_overrides wins if the same key is also passed as an explicit kwarg.
     cfg_overrides = dict(cfg_overrides or {})
+    shader            = cfg_overrides.pop("shader",            shader)
+    no_shadow         = cfg_overrides.pop("no_shadow",         no_shadow)
+    init_from_gt      = cfg_overrides.pop("init_from_gt",      init_from_gt)
+    freeze_intrinsics = cfg_overrides.pop("freeze_intrinsics", freeze_intrinsics)
+    use_npy           = cfg_overrides.pop("use_npy",           use_npy)
+    double            = cfg_overrides.pop("double",            double)
+    n_images          = cfg_overrides.pop("n_images",          n_images)
+
     if opt_params is None and "opt_params" in cfg_overrides:
         _op = cfg_overrides.pop("opt_params")
         opt_params = frozenset(_op) if not isinstance(_op, frozenset) else _op
@@ -734,21 +796,29 @@ def decompose_scene(
 
     cfg = {**DEFAULT_CFG, **cfg_overrides}
 
-    scene = load_scene(scene_dir, no_shadow=no_shadow)
+    torch_dtype = torch.float64 if double else torch.float32
+
+    scene = load_scene(scene_dir, no_shadow=no_shadow, use_npy=use_npy)
     H, W = scene["H"], scene["W"]
     images     = scene["images"]
     light_keys = scene["light_keys"]
     mask_np    = scene["mask_np"]
 
+    if n_images is not None:
+        images     = images[:n_images]
+        light_keys = light_keys[:n_images]
+
     normals_hw, frag_pos_hw, mask_hw, cam_pos = make_proxy_geometry(
         scene["normals_np"], mask_np,
-        fov_deg=fov_deg, cam_dist=cam_dist, device=device,
+        fov_deg=fov_deg, cam_dist=cam_dist, device=device, dtype=torch_dtype,
     )
 
     gt_metallic  = scene["metallic_np"]   # (H, W, 1)
     gt_roughness = scene["roughness_np"]  # (H, W, 1)
     gt_albedo    = scene["albedo_np"]     # (H, W, 3)
     gt_sh_coeffs = scene.get("sh_coeffs")  # list of (9,3) arrays or None
+    if n_images is not None and gt_sh_coeffs is not None:
+        gt_sh_coeffs = gt_sh_coeffs[:n_images]
 
     grad_log_dir = out_dir / "gradient_flow" if log_gradients else None
 
@@ -762,14 +832,17 @@ def decompose_scene(
 
     # ── wandb run ─────────────────────────────────────────────────────────────
     scene_name = Path(scene_dir).parent.name + "/" + Path(scene_dir).name
-    run_name = make_run_name(
-        scene_dir, shader,
-        cfg_overrides=cfg_overrides,
-        no_shadow=no_shadow,
-        freeze_intrinsics=freeze_intrinsics,
-        init_from_gt=init_from_gt,
-        opt_params=opt_params,
+
+    # Build a merged dict that make_run_name reads (meta-params + optimizer overrides)
+    _meta = dict(
+        shader=shader, no_shadow=no_shadow, init_from_gt=init_from_gt,
+        freeze_intrinsics=freeze_intrinsics, use_npy=use_npy, double=double,
     )
+    if n_images is not None:
+        _meta["n_images"] = n_images
+    if opt_params is not None:
+        _meta["opt_params"] = opt_params
+    run_name = make_run_name(scene_dir, {**_meta, **cfg_overrides})
 
     def _fmt(v):
         return f"{v:g}" if isinstance(v, float) else str(v)
@@ -781,20 +854,30 @@ def decompose_scene(
         wandb_tags.append("init_from_gt")
     if no_shadow:
         wandb_tags.append("noshadow")
+    if use_npy:
+        wandb_tags.append("npy")
+    if double:
+        wandb_tags.append("f64")
     if opt_params is not None:
         wandb_tags.append("only_" + "+".join(sorted(opt_params)))
     wandb_tags += [
         f"{k}={_fmt(v)}"
-        for k, v in (cfg_overrides or {}).items()
-        if k not in _RUN_NAME_SKIP and v != DEFAULT_CFG.get(k)
+        for k, v in cfg_overrides.items()
+        if k not in _RUN_NAME_SKIP
     ]
 
     run = wandb.init(
         entity  =wandb_entity,
         project =wandb_project,
-        config  =dict(**cfg, shader=shader, scene=str(scene_dir),
-                      fov_deg=fov_deg, cam_dist=cam_dist, no_shadow=no_shadow,
-                      n_images=len(images), H=H, W=W),
+        config  =dict(
+            **cfg,
+            shader=shader, scene=str(scene_dir),
+            fov_deg=fov_deg, cam_dist=cam_dist,
+            no_shadow=no_shadow, init_from_gt=init_from_gt,
+            freeze_intrinsics=freeze_intrinsics, use_npy=use_npy, double=double,
+            opt_params=sorted(opt_params) if opt_params is not None else None,
+            n_images=len(images), H=H, W=W,
+        ),
         name    =run_name,
         tags    =wandb_tags,
         reinit  =True,

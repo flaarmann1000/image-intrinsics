@@ -214,8 +214,8 @@ def _sh_irradiance(coeffs_t, N):
         2*torch.pi/3, 2*torch.pi/3, 2*torch.pi/3,
         torch.pi/4,   torch.pi/4,   torch.pi/4, torch.pi/4, torch.pi/4,
     ])
-    return ((A * Y) @ coeffs_t)       # (..., 3)
-    # return ((A * Y) @ coeffs_t).clamp(min=0)       # (..., 3)
+    # return ((A * Y) @ coeffs_t)       # (..., 3)
+    return ((A * Y) @ coeffs_t).clamp(min=0)       # (..., 3)
 
 
 def _sh_phong_filtered_radiance(coeffs_t, dirs, shininess):
