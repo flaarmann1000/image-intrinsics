@@ -436,7 +436,9 @@ def _fwd_env(p: torch.Tensor, t: str) -> torch.Tensor:
 
 def _init_albedo(base: torch.Tensor, t: str) -> torch.Tensor:
     """base: (H,W,3). Returns raw param in transform space."""
-    return torch.log(base) if t == "log" else base.clone()
+    if t == "log":     return torch.log(base)
+    if t == "sigmoid": return torch.logit(base.clamp(1e-6, 1 - 1e-6))
+    return base.clone()
 
 def _init_scalar(val: float, H: int, W: int, t: str,
                  squeeze_fn=None, dev=None) -> torch.Tensor:
@@ -496,6 +498,8 @@ def _rescale_albedo_lighting(
     new_out = (cur_out * scale[None, None, :])
     if tr_ab == "log":
         albedo_param.data.copy_(torch.log(new_out))
+    elif tr_ab == "sigmoid":
+        albedo_param.data.copy_(torch.logit(new_out.clamp(1e-6, 1 - 1e-6)))
     else:
         albedo_param.data.copy_(new_out)
     for lp in lighting_params:
