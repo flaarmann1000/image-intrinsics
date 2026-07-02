@@ -402,7 +402,9 @@ def _parse_transforms(spec: str) -> dict:
 
 
 def _fwd_albedo(p: torch.Tensor, t: str) -> torch.Tensor:
-    return torch.exp(p) if t == "log" else p
+    if t == "sigmoid": return torch.sigmoid(p) 
+    if t == "log": return torch.exp(p) 
+    return  p
 
 def _fwd_metallic(p: torch.Tensor, t: str) -> torch.Tensor:
     if t == "sigmoid":    return torch.sigmoid(p)
@@ -1585,8 +1587,8 @@ def _optimize_ct_env(
         _spec_warmup = _step[0] < cfg.get("spec_warmup_steps", 0)
         albedo      = _fwd_albedo(albedo_param, tr_ab)
         albedo_m    = albedo.reshape(-1, 3)[flat_mask]
-        metallic    = metallic_raw  if (_frozen_gt and not metallic_raw.requires_grad)  else _fwd_metallic(metallic_raw,  tr_met)
-        roughness   = roughness_raw if (_frozen_gt and not roughness_raw.requires_grad) else _fwd_roughness(roughness_raw, tr_rou)
+        metallic    = _fwd_metallic(metallic_raw,  tr_met)
+        roughness   = _fwd_roughness(roughness_raw, tr_rou)
         metallic_m  = metallic.reshape(-1, 1)[flat_mask]
         roughness_m = roughness.reshape(-1, 1)[flat_mask]
         if _spec_warmup:
