@@ -140,6 +140,10 @@ DEFAULT_CFG = dict(
     tr_env       = "none",
     # rescale albedo+lighting toward GT after every N steps (0 = disabled)
     rescale_every = 0,
+    # accumulate gradients over chunks of this many images per step (0 = all
+    # images in one autograd graph). Bounds peak memory to ~img_batch images;
+    # numerically identical to full-batch up to float summation order.
+    img_batch = 0,
 )
 
 
@@ -1053,6 +1057,40 @@ def _opt_step(opt, forward_fn, cfg):
         return result
 
 
+def _opt_step_img_batched(opt, forward_fn, cfg, n_imgs, img_batch):
+    """Single optimizer step with gradient accumulation over image chunks.
+
+    Behaves like _opt_step, but each closure evaluation runs forward+backward
+    on `img_batch` images at a time, so the autograd graph only ever holds one
+    chunk. The summed loss/gradients equal the full-batch ones up to float
+    summation order — NOT stochastic mini-batching, so it is safe under LBFGS.
+
+    forward_fn must accept an iterable of image indices (or None for all) and
+    scale its image-independent loss terms by len(indices)/n_imgs.
+    """
+    def closure():
+        opt.zero_grad()
+        total = 0.0
+        for b in range(0, n_imgs, img_batch):
+            loss_b, *_ = forward_fn(range(b, min(b + img_batch, n_imgs)))
+            loss_b.backward()
+            total += float(loss_b.detach())
+        return torch.tensor(total)
+
+    if cfg["optimizer"] == "LBFGS":
+        try:
+            opt.step(closure)
+        except (IndexError, TypeError):
+            opt.state.clear()  # line search failed; reset LBFGS state so next iter starts fresh
+    else:
+        closure()
+        opt.step()
+    # re-evaluate at the accepted parameters for accurate logging (graph-free,
+    # so memory stays bounded regardless of n_imgs)
+    with torch.no_grad():
+        return forward_fn(None)
+
+
 # ─────────────────────────────────────── Phase 2: SH optimizer ───────────────
 
 def _optimize_ct_sh(
@@ -1192,7 +1230,13 @@ def _optimize_ct_sh(
     _loss_ml = [torch.zeros((), device=dev, dtype=ftype)]
     _loss_mb = [torch.zeros((), device=dev, dtype=ftype)]
 
-    def _forward():
+    def _forward(img_indices=None):
+        # img_indices: iterable of image indices for gradient-accumulation
+        # chunks (None = all images). Image-independent loss terms are scaled
+        # by the chunk fraction so the chunk losses sum to the full-batch loss.
+        idx   = None if img_indices is None else list(img_indices)
+        n_sel = N_imgs if idx is None else len(idx)
+        frac  = n_sel / N_imgs
         _spec_warmup = _step[0] < cfg.get("spec_warmup_steps", 0)
         albedo      = _fwd_albedo(albedo_param, tr_ab)                # (H, W, 3)
         albedo_m    = albedo.reshape(-1, 3)[flat_mask]                 # (M, 3)
@@ -1219,28 +1263,30 @@ def _optimize_ct_sh(
         B0, B1, B2 = Bvals[..., 0:1], Bvals[..., 1:2], Bvals[..., 2:3]
         BY = torch.cat([B0, B1, B1, B1, B2, B2, B2, B2, B2], dim=-1) * _Y_R  # (M, 9)
 
-        # ── batch SH projection over all N images ─────────────────────────
-        # (1, M, 9) @ (N, 9, 3) → (N, M, 3) via broadcast matmul
-        irr_all    = (_AY.unsqueeze(0) @ sh_coeffs).clamp(min=0)      # (N, M, 3)
-        L_spec_all = (BY.unsqueeze(0)  @ sh_coeffs).clamp(min=0)      # (N, M, 3)
+        # ── batch SH projection over the selected images ───────────────────
+        # (1, M, 9) @ (n, 9, 3) → (n, M, 3) via broadcast matmul
+        sh_sel   = sh_coeffs if idx is None else sh_coeffs[idx]       # (n, 9, 3)
+        imgs_sel = _imgs_m   if idx is None else _imgs_m[idx]         # (n, M, 3)
+        irr_all    = (_AY.unsqueeze(0) @ sh_sel).clamp(min=0)         # (n, M, 3)
+        L_spec_all = (BY.unsqueeze(0)  @ sh_sel).clamp(min=0)         # (n, M, 3)
 
-        diff_m  = k_d * albedo_m / torch.pi * irr_all                 # (N, M, 3)
-        spec_m  = F * G1 * L_spec_all / 4.0                           # (N, M, 3)
-        recon_m = (diff_m + spec_m) * _front                          # (N, M, 3)
+        diff_m  = k_d * albedo_m / torch.pi * irr_all                 # (n, M, 3)
+        spec_m  = F * G1 * L_spec_all / 4.0                           # (n, M, 3)
+        recon_m = (diff_m + spec_m) * _front                          # (n, M, 3)
 
         # ── loss in masked pixel space (scatter back not needed) ──────────
-        err       = (recon_m - _imgs_m).abs() if cfg["loss"] == "L1" else (recon_m - _imgs_m) ** 2
-        loss_data = err.mean() * N_imgs
+        err       = (recon_m - imgs_sel).abs() if cfg["loss"] == "L1" else (recon_m - imgs_sel) ** 2
+        loss_data = err.mean() * n_sel
 
-        loss_sparse = cfg["lambda_sparse"] * _tv(albedo.permute(2, 0, 1))
-        loss_white  = cfg["lambda_white"]  * (albedo.mean() - 0.5) ** 2
-        loss_tv     = cfg["lambda_tv"] * (
+        loss_sparse = frac * cfg["lambda_sparse"] * _tv(albedo.permute(2, 0, 1))
+        loss_white  = frac * cfg["lambda_white"]  * (albedo.mean() - 0.5) ** 2
+        loss_tv     = frac * cfg["lambda_tv"] * (
             _tv(albedo.permute(2, 0, 1)) +
             _tv(metallic.permute(2, 0, 1)) +
             _tv(roughness.permute(2, 0, 1))
         )
-        loss_metallic_l1       = cfg.get("lambda_metallic_l1",       0.0) * met_m_true.abs().mean()
-        loss_metallic_binarize = cfg.get("lambda_metallic_binarize",  0.0) * (met_m_true * (1.0 - met_m_true)).mean()
+        loss_metallic_l1       = frac * cfg.get("lambda_metallic_l1",       0.0) * met_m_true.abs().mean()
+        loss_metallic_binarize = frac * cfg.get("lambda_metallic_binarize",  0.0) * (met_m_true * (1.0 - met_m_true)).mean()
         _loss_ml[0] = loss_metallic_l1.detach()
         _loss_mb[0] = loss_metallic_binarize.detach()
         return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1 + loss_metallic_binarize, loss_data, loss_sparse, loss_white, loss_tv
@@ -1350,13 +1396,22 @@ def _optimize_ct_sh(
             "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
         }, step=-1)
     _rescale_every = cfg.get("rescale_every", 0)
+    _img_batch = int(cfg.get("img_batch", 0) or 0)
+    _use_img_batch = 0 < _img_batch < N_imgs
+    if _use_img_batch and log_gradients:
+        print("  [img_batch] disabled: incompatible with log_gradients")
+        _use_img_batch = False
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
         _step[0] = i
         if opt is not None:
             if log_gradients:
                 pre_raw = {n: p.data.clone() for n, p in named_params.items()}
-            loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+            if _use_img_batch:
+                loss, l_d, l_s, l_w, l_tv = _opt_step_img_batched(
+                    opt, _forward, cfg, N_imgs, _img_batch)
+            else:
+                loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
             if sched is not None:
                 sched.step()
             if (_rescale_every > 0 and (i + 1) % _rescale_every == 0
@@ -1736,41 +1791,29 @@ def _optimize_ct_env(
             "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
         }, step=-1)
     _rescale_every = cfg.get("rescale_every", 0)
+    _img_batch = int(cfg.get("img_batch", 0) or 0)
+    _use_img_batch = 0 < _img_batch < N_imgs
+    if _use_img_batch and log_gradients:
+        print("  [img_batch] disabled: incompatible with log_gradients")
+        _use_img_batch = False
     t0 = time.perf_counter()
-    img_batch = cfg.get("img_batch", N_imgs) or N_imgs
     for i in range(cfg["n_iter"]):
         _step[0] = i
         if opt is not None:
             if log_gradients:
                 pre_raw = {n: p.data.clone() for n, p in named_params.items()}
-            if img_batch >= N_imgs or log_gradients:
-                loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
+            if _use_img_batch:
+                loss, l_d, l_s, l_w, l_tv = _opt_step_img_batched(
+                    opt, _forward, cfg, N_imgs, _img_batch)
             else:
-                totals = [0.0] * 5
-
-                def _accum():
-                    opt.zero_grad()
-                    totals[:] = [0.0] * 5
-                    for _b in range(0, N_imgs, img_batch):
-                        _vals = _forward(range(_b, min(_b + img_batch, N_imgs)))
-                        _vals[0].backward()
-                        for _j, _v in enumerate(_vals):
-                            totals[_j] += float(_v.detach())
-                    return torch.tensor(totals[0])
-
-                if cfg.get("optimizer") == "LBFGS":
-                    opt.step(_accum)
-                else:
-                    _accum()
-                    opt.step()
-                loss, l_d, l_s, l_w, l_tv = totals
+                loss, l_d, l_s, l_w, l_tv = _opt_step(opt, _forward, cfg)
             if sched is not None:
                 sched.step()
             if (_rescale_every > 0 and (i + 1) % _rescale_every == 0
                     and "albedo" in op and "env" in op and _gt_ab_m is not None):
                 with torch.no_grad():
                     _rescale_albedo_lighting(
-                        albedo_param, [env_maps], tr_ab, flat_mask, _gt_ab_m)
+                        albedo_param, [env_raw_params], tr_ab, flat_mask, _gt_ab_m)
             if log_gradients and grad_log_dir is not None:
                 _save_grad_step(i, named_params, pre_raw, gt_map_grad, fwd_map_grad,
                                 _forward_components,
