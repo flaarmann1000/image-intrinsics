@@ -28,7 +28,7 @@ Example (GCE VM):
   WANDB_API_KEY=... python run_decomposition.py \
       --datasets_root /data/decomp/datasets --runs_root /data/decomp/runs \
       --sh_orders 2 3 --n_train 100 --n_val 28 \
-      --wandb_project 3dfront-batch-decomposition --wandb_entity DLVC-intrinsics
+      --wandb_project 3dfront-batch-decomposition-gc --wandb_entity DLVC-intrinsics
 """
 import argparse
 import json
@@ -56,7 +56,7 @@ def build_parser():
                    help="Where per-run outputs + the summary CSV are written.")
     p.add_argument("--view_filter", nargs="*", default=None,
                    help="Only view_keys starting with one of these prefixes.")
-    p.add_argument("--dataset_filter", nargs="*", default=None,
+    p.add_argument("--dataset_filter", nargs="*", default='ct-ct_sh',
                    help="Only dataset dirs whose name starts with one of these (e.g. 'blender_' 'ct-ct_sh').")
     p.add_argument("--downsample", type=int, default=4,
                    help="Decompose downsample for datasets NOT already pre-reduced (blender).")
@@ -68,17 +68,19 @@ def build_parser():
                    choices=["ct_sh", "ct_env", "ct_env_imp"])
     p.add_argument("--diffuse_fresnel", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
                    default=True, help="Optimizer diffuse-Fresnel (default True = always ON).")
-    p.add_argument("--n_iter", type=int, default=600)
+    p.add_argument("--n_iter", type=int, default=300)
     p.add_argument("--lbfgs_max_iter", type=int, default=20)
     p.add_argument("--log_every", type=int, default=10)
-    p.add_argument("--lambda_tv", type=float, default=1e-3)
-    p.add_argument("--lambda_metallic_binarize", type=float, default=1e-3)
+    p.add_argument("--lambda_tv", type=float, default=1e-4)
+    p.add_argument("--lambda_metallic_binarize", type=float, default=1e-4)
     p.add_argument("--double", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
                    default=True, help="float64 (fp64 is slow on T4/L4; float32 is fine for ct_sh).")
     p.add_argument("--spec_samples", type=int, default=128)
     p.add_argument("--wandb_max_images", type=int, default=6,
                    help="Cap per-image wandb previews (scalars still use all images).")
-    p.add_argument("--wandb_project", default="3dfront-batch-decomposition")
+    p.add_argument("--log_gt_recon_images", action="store_true",
+                   help="Also log GT input images + recon error maps to wandb (final step only).")
+    p.add_argument("--wandb_project", default="3dfront-batch-decomposition-gc")
     p.add_argument("--wandb_entity", default="DLVC-intrinsics")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true", help="Redo runs even if metrics.json exists.")
@@ -176,6 +178,7 @@ def main():
         "tr_metallic": "sigmoid", "tr_roughness": "sigmoid", "tr_albedo": "sigmoid",
         "init_roughness_zero": True, "double": args.double,
         "wandb_max_images": args.wandb_max_images, "diffuse_fresnel": args.diffuse_fresnel,
+        "log_gt_recon_images": args.log_gt_recon_images,
     }
 
     rows, done = [], 0

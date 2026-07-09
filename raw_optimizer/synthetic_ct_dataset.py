@@ -1130,6 +1130,39 @@ def _opt_step_img_batched(opt, forward_fn, cfg, n_imgs, img_batch):
         return forward_fn(None)
 
 
+# ─────────────────────────────────────── wandb log helper ────────────────────
+
+def _structured_scalar_log(*, loss, l_d, l_s, l_w, l_tv, loss_ml, loss_mb,
+                           scale3, gt_metrics, relight, recon_rmse, recon_mae, lr):
+    """Per-step wandb scalars grouped into three sections by name prefix:
+      loss/*  — loss terms + albedo scales
+      rmse/*  — intrinsics (albedo/roughness/metallic) + recon + relight RMSE
+      mae/*   — the same, MAE
+    """
+    d = {
+        "loss/total": float(loss), "loss/data": float(l_d),
+        "loss/tv": float(l_tv), "loss/sparse": float(l_s), "loss/white": float(l_w),
+        "loss/metallic_l1": float(loss_ml), "loss/metallic_binarize": float(loss_mb),
+        "lr": float(lr),
+    }
+    if recon_rmse is not None:
+        d["rmse/recon"] = float(recon_rmse)
+    if recon_mae is not None:
+        d["mae/recon"] = float(recon_mae)
+    if scale3 is not None:
+        d["loss/albedo_scale_r"] = float(scale3[0])
+        d["loss/albedo_scale_g"] = float(scale3[1])
+        d["loss/albedo_scale_b"] = float(scale3[2])
+        d["loss/albedo_scale_mean"] = float(sum(float(x) for x in scale3) / 3.0)
+    for k, v in (gt_metrics or {}).items():          # e.g. albedo_rmse -> rmse/albedo
+        base, kind = k.rsplit("_", 1)
+        d[f"{kind}/{base}"] = v
+    for k, v in (relight or {}).items():             # relight_rmse -> rmse/relight
+        base, kind = k.rsplit("_", 1)
+        d[f"{kind}/{base}"] = v
+    return d
+
+
 # ─────────────────────────────────────── Phase 2: SH optimizer ───────────────
 
 def _optimize_ct_sh(
@@ -1287,6 +1320,8 @@ def _optimize_ct_sh(
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev, dtype=ftype)]
     _loss_mb = [torch.zeros((), device=dev, dtype=ftype)]
+    _recon_rmse = [0.0]           # per-image recon RMSE/MAE, stashed by _forward
+    _recon_mae  = [0.0]
 
     def _forward(img_indices=None):
         # img_indices: iterable of image indices for gradient-accumulation
@@ -1344,6 +1379,10 @@ def _optimize_ct_sh(
 
         # ── loss in masked pixel space (scatter back not needed) ──────────
         resid = recon_m - imgs_sel
+        with torch.no_grad():                        # per-image recon RMSE/MAE (for logging)
+            _rd = resid.detach()
+            _recon_rmse[0] = float(_rd.pow(2).mean(dim=(-2, -1)).sqrt().mean())
+            _recon_mae[0]  = float(_rd.abs().mean(dim=(-2, -1)).mean())
         if cfg["loss"] == "L1":
             err = resid.abs()
         elif cfg["loss"] == "huber":
@@ -1425,7 +1464,9 @@ def _optimize_ct_sh(
             out["albedo_rmse"] = float((ab_m * scale - _gt_ab_m).pow(2).mean().sqrt())
             out["albedo_mae"]  = float((ab_m * scale - _gt_ab_m).abs().mean())
         out["metallic_rmse"]  = float((met_m - _gt_met_m).pow(2).mean().sqrt())
+        out["metallic_mae"]   = float((met_m - _gt_met_m).abs().mean())
         out["roughness_rmse"] = float((rou_m - _gt_rou_m).pow(2).mean().sqrt())
+        out["roughness_mae"]  = float((rou_m - _gt_rou_m).abs().mean())
         return out
 
     # ── held-out relighting metric ────────────────────────────────────────────
@@ -1460,48 +1501,20 @@ def _optimize_ct_sh(
           f"  metallic={_im:.3f}  roughness={_ir:.3f}")
     if wandb_run is not None:
         with torch.no_grad():
-            _met_map = _get_met().detach()
-            _rou_map = _get_rou().detach()
-            _est_sh_np = sh_coeffs.detach().cpu().numpy()
             _ab_t  = _fwd_albedo(albedo_param, tr_ab).detach()
             _ab_m  = _ab_t.reshape(-1, 3)[flat_mask]
-            _met_m = _met_map.reshape(-1, 1)[flat_mask]
-            _rou_m = _rou_map.reshape(-1, 1)[flat_mask]
-            _recons, _errs = [], []
-            for _k in range(_n_log):
-                _r = _ab_t.new_zeros(H, W, 3)
-                _r.reshape(-1, 3)[flat_mask] = shade_ct_sh(
-                    view_m, N_m, _ab_m, sh_coeffs[_k], _met_m, _rou_m, lut=lut,
-                    diffuse_fresnel=_diffuse_fresnel)
-                _r *= mask_t
-                _recons.append(wandb.Image(_r.float().cpu().numpy()))
-                _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
+            _met_m = _get_met().detach().reshape(-1, 1)[flat_mask]
+            _rou_m = _get_rou().detach().reshape(-1, 1)[flat_mask]
             _init_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                            if _gt_ab_m is not None else None)
-        wandb_run.log({
-            "loss": float(_il), "loss_data": float(_ild), "data_rmse": float(_ild) ** 0.5,
-            "loss_sparse": float(_ils), "loss_white": float(_ilw), "loss_tv": float(_iltv),
-            "pred_albedo":     wandb.Image(_ab_t.float().cpu().numpy()),
-            "pred_metallic":   wandb.Image(_met_map.float().squeeze(-1).cpu().numpy()),
-            "pred_roughness":  wandb.Image(_rou_map.float().squeeze(-1).cpu().numpy()),
-            "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(_est_sh_np[k])) for k in range(_n_log)],
-            "recons":          _recons,
-            "recon_err_maps":  _errs,
-            "metallic_mean":       _im,
-            "roughness_mean":      _ir,
-            "metallic_err_mean":   abs(_im - _gt_met_scalar),
-            "roughness_err_mean":  abs(_ir - _gt_rou_scalar),
-            "loss_metallic_l1":       float(_loss_ml[0]),
-            "loss_metallic_binarize": float(_loss_mb[0]),
-            **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-            **_relight_metrics(_ab_m, _met_m, _rou_m),
-            **( {"albedo_scale_r": float(_init_scale[0]),
-                 "albedo_scale_g": float(_init_scale[1]),
-                 "albedo_scale_b": float(_init_scale[2]),
-                 "albedo_scale_mean": float(_init_scale.mean())}
-                if _init_scale is not None else {} ),
-            "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
-        }, step=-1)
+        wandb_run.log(_structured_scalar_log(
+            loss=_il, l_d=_ild, l_s=_ils, l_w=_ilw, l_tv=_iltv,
+            loss_ml=_loss_ml[0], loss_mb=_loss_mb[0], scale3=_init_scale,
+            gt_metrics=_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+            relight=_relight_metrics(_ab_m, _met_m, _rou_m),
+            recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
+            lr=opt.param_groups[0]["lr"] if opt is not None else 0.0,
+        ), step=-1)
     _rescale_every = cfg.get("rescale_every", 0)
     _img_batch = int(cfg.get("img_batch", 0) or 0)
     _use_img_batch = 0 < _img_batch < N_imgs
@@ -1545,50 +1558,22 @@ def _optimize_ct_sh(
             print(f"  [{i:4d}] {elapsed:6.1f}s  loss={float(loss):.3e}  data={float(l_d):.3e}"
                   f"  metallic={met:.3f}  roughness={rou:.3f}")
             if wandb_run is not None:
-                est_sh_np = sh_coeffs.detach().cpu().numpy()
                 with torch.no_grad():
                     _ab_t  = _fwd_albedo(albedo_param, tr_ab).detach()
                     _ab_m  = _ab_t.reshape(-1, 3)[flat_mask]
                     _met_m = met_map.reshape(-1, 1)[flat_mask]
                     _rou_m = rou_map.reshape(-1, 1)[flat_mask]
-                    _recons, _errs = [], []
-                    for _k in range(_n_log):
-                        _r = _ab_t.new_zeros(H, W, 3)
-                        _r.reshape(-1, 3)[flat_mask] = shade_ct_sh(
-                            view_m, N_m, _ab_m, sh_coeffs[_k], _met_m, _rou_m, lut=lut,
-                            diffuse_fresnel=_diffuse_fresnel)
-                        _r *= mask_t
-                        _recons.append(wandb.Image(_r.float().cpu().numpy()))
-                        _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
                     _step_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                                    if _gt_ab_m is not None else None)
-                wandb_run.log({
-                    "loss": float(loss), "loss_data": float(l_d), "data_rmse": float(l_d) ** 0.5,
-                    "loss_sparse": float(l_s), "loss_white": float(l_w), "loss_tv": float(l_tv),
-                    "elapsed_s": elapsed,
-                    "pred_albedo":     wandb.Image(
-                        _fwd_albedo(albedo_param, tr_ab).detach().float().cpu().numpy()),
-                    "pred_metallic":   wandb.Image(met_map.float().squeeze(-1).cpu().numpy()),
-                    "pred_roughness":  wandb.Image(rou_map.float().squeeze(-1).cpu().numpy()),
-                    "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(est_sh_np[k]))
-                                        for k in range(_n_log)],
-                    "recons":          _recons,
-                    "recon_err_maps":  _errs,
-                    "metallic_mean":      met,
-                    "roughness_mean":     rou,
-                    "metallic_err_mean":  abs(met - _gt_met_scalar),
-                    "roughness_err_mean": abs(rou - _gt_rou_scalar),
-                    "loss_metallic_l1":       float(_loss_ml[0]),
-                    "loss_metallic_binarize": float(_loss_mb[0]),
-                    **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-            **_relight_metrics(_ab_m, _met_m, _rou_m),
-                    **( {"albedo_scale_r": float(_step_scale[0]),
-                         "albedo_scale_g": float(_step_scale[1]),
-                         "albedo_scale_b": float(_step_scale[2]),
-                         "albedo_scale_mean": float(_step_scale.mean())}
-                        if _step_scale is not None else {} ),
-                    "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
-                }, step=i)
+                _payload = _structured_scalar_log(
+                    loss=loss, l_d=l_d, l_s=l_s, l_w=l_w, l_tv=l_tv,
+                    loss_ml=_loss_ml[0], loss_mb=_loss_mb[0], scale3=_step_scale,
+                    gt_metrics=_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+                    relight=_relight_metrics(_ab_m, _met_m, _rou_m),
+                    recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
+                    lr=opt.param_groups[0]["lr"] if opt is not None else 0.0)
+                _payload["elapsed_s"] = elapsed
+                wandb_run.log(_payload, step=i)
     total_time = time.perf_counter() - t0
 
     with torch.no_grad():
@@ -1750,6 +1735,8 @@ def _optimize_ct_env(
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev, dtype=ftype)]
     _loss_mb = [torch.zeros((), device=dev, dtype=ftype)]
+    _recon_rmse = [0.0]           # per-image recon RMSE/MAE, stashed by _forward
+    _recon_mae  = [0.0]
 
     def _forward(img_indices=None):
         if img_indices is None:
@@ -1769,6 +1756,8 @@ def _optimize_ct_env(
         if _step[0] < cfg.get("min_metallic_steps", 0):
             metallic_m = metallic_m.clamp(min=0.1)
         loss_data = albedo.new_zeros(())
+        _rr_sum = 0.0
+        _ra_sum = 0.0
         for k in img_indices:
             env_pix_k = _fwd_env(env_raw_params[k], tr_env)
             recon_m   = shade_ct_env(view_m, N_m, albedo_m,
@@ -1781,9 +1770,16 @@ def _optimize_ct_env(
             recon.reshape(-1, 3)[flat_mask] = recon_m
             loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"],
                                              cfg.get("huber_delta", 0.05))
+            with torch.no_grad():
+                _rd = (recon_m - imgs_t[k].reshape(-1, 3)[flat_mask]).detach()
+                _rr_sum += float(_rd.pow(2).mean().sqrt())
+                _ra_sum += float(_rd.abs().mean())
         # mean over images (chunks sum to the full-batch value): loss_data is
         # comparable across dataset sizes. Regularizer lambdas stay absolute.
         loss_data = loss_data / N_imgs
+        _n_sel = max(len(img_indices), 1)
+        _recon_rmse[0] = _rr_sum / _n_sel
+        _recon_mae[0]  = _ra_sum / _n_sel
         loss_sparse = frac * cfg["lambda_sparse"] * _tv(albedo_param.permute(2, 0, 1))
         loss_white  = frac * cfg["lambda_white"]  * (_fwd_albedo(albedo_param, tr_ab).mean() - 0.5) ** 2
         loss_tv     = frac * cfg["lambda_tv"] * (
@@ -1795,6 +1791,7 @@ def _optimize_ct_env(
         loss_metallic_l1       = frac * cfg.get("lambda_metallic_l1",       0.0) * met_m.abs().mean()
         loss_metallic_binarize = frac * cfg.get("lambda_metallic_binarize",  0.0) * (met_m * (1.0 - met_m)).mean()
         _loss_ml[0] = loss_metallic_l1.detach()
+        _loss_mb[0] = loss_metallic_binarize.detach()
         return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1 + loss_metallic_binarize, loss_data, loss_sparse, loss_white, loss_tv
 
     def _forward_components():
@@ -1858,6 +1855,8 @@ def _optimize_ct_env(
             out["albedo_mae"]  = float((ab_m * scale - _gt_ab_m).abs().mean())
         out["metallic_rmse"]  = float((met_m - _gt_met_m).pow(2).mean().sqrt())
         out["roughness_rmse"] = float((rou_m - _gt_rou_m).pow(2).mean().sqrt())
+        out["metallic_mae"]   = float((met_m - _gt_met_m).abs().mean())
+        out["roughness_mae"]  = float((rou_m - _gt_rou_m).abs().mean())
         return out
 
     # ── held-out relighting metric ────────────────────────────────────────────
@@ -1900,52 +1899,20 @@ def _optimize_ct_env(
           f"  metallic={_im:.3f}  roughness={_ir:.3f}")
     if wandb_run is not None:
         with torch.no_grad():
-            _env_pix_all = _fwd_env(env_raw_params, tr_env).detach()
-            _env_imgs_k  = [_env_flat_to_img(_env_pix_all[k].cpu().numpy(), env_H, env_W) for k in range(_n_log)]
-            _env_avg_img = _env_flat_to_img(_env_pix_all.mean(0).cpu().numpy(), env_H, env_W)
-            _met_map = _get_met().detach()
-            _rou_map = _get_rou().detach()
             _ab_t  = _fwd_albedo(albedo_param, tr_ab).detach()
             _ab_m  = _ab_t.reshape(-1, 3)[flat_mask]
-            _met_m = _met_map.reshape(-1, 1)[flat_mask]
-            _rou_m = _rou_map.reshape(-1, 1)[flat_mask]
-            _recons, _errs = [], []
-            for _k in range(_n_log):
-                _r = _ab_t.new_zeros(H, W, 3)
-                _r.reshape(-1, 3)[flat_mask] = shade_ct_env(
-                    view_m, N_m, _ab_m, _env_pix_all[_k], env_dirs_t, env_dw_t,
-                    _met_m, _rou_m, sbatch=cfg.get("sbatch", 64),
-                                     spec_importance=cfg.get("spec_importance", False),
-                                     spec_samples=cfg.get("spec_samples", 64), diffuse_fresnel=_diffuse_fresnel)
-                _r *= mask_t
-                _recons.append(wandb.Image(_r.float().cpu().numpy()))
-                _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
+            _met_m = _get_met().detach().reshape(-1, 1)[flat_mask]
+            _rou_m = _get_rou().detach().reshape(-1, 1)[flat_mask]
             _init_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                            if _gt_ab_m is not None else None)
-        wandb_run.log({
-            "loss": float(_il), "loss_data": float(_ild), "data_rmse": float(_ild) ** 0.5,
-            "loss_sparse": float(_ils), "loss_white": float(_ilw), "loss_tv": float(_iltv),
-            "pred_albedo":    wandb.Image(_ab_t.float().cpu().numpy()),
-            "pred_metallic":  wandb.Image(_met_map.float().squeeze(-1).cpu().numpy()),
-            "pred_roughness": wandb.Image(_rou_map.float().squeeze(-1).cpu().numpy()),
-            "est_env_maps":   [wandb.Image(img) for img in _env_imgs_k],
-            "env_map_avg":    wandb.Image(_env_avg_img),
-            "recons":         _recons,
-            "recon_err_maps": _errs,
-            "metallic_mean":      _im,
-            "roughness_mean":     _ir,
-            "metallic_err_mean":  abs(_im - _gt_met_scalar),
-            "roughness_err_mean": abs(_ir - _gt_rou_scalar),
-            "loss_metallic_l1":   float(_loss_ml[0]),
-            **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-            **_relight_metrics(_ab_m, _met_m, _rou_m),
-            **( {"albedo_scale_r": float(_init_scale[0]),
-                 "albedo_scale_g": float(_init_scale[1]),
-                 "albedo_scale_b": float(_init_scale[2]),
-                 "albedo_scale_mean": float(_init_scale.mean())}
-                if _init_scale is not None else {} ),
-            "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
-        }, step=-1)
+        wandb_run.log(_structured_scalar_log(
+            loss=_il, l_d=_ild, l_s=_ils, l_w=_ilw, l_tv=_iltv,
+            loss_ml=_loss_ml[0], loss_mb=_loss_mb[0], scale3=_init_scale,
+            gt_metrics=_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+            relight=_relight_metrics(_ab_m, _met_m, _rou_m),
+            recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
+            lr=opt.param_groups[0]["lr"] if opt is not None else 0.0,
+        ), step=-1)
     _rescale_every = cfg.get("rescale_every", 0)
     _img_batch = int(cfg.get("img_batch", 0) or 0)
     _use_img_batch = 0 < _img_batch < N_imgs
@@ -1990,54 +1957,21 @@ def _optimize_ct_env(
                   f"  metallic={met:.3f}  roughness={rou:.3f}")
             if wandb_run is not None:
                 with torch.no_grad():
-                    env_pix_all = _fwd_env(env_raw_params, tr_env).detach()
-                    env_imgs_k  = [_env_flat_to_img(env_pix_all[k].cpu().numpy(), env_H, env_W)
-                                   for k in range(_n_log)]
-                    env_avg_img = _env_flat_to_img(env_pix_all.mean(0).cpu().numpy(), env_H, env_W)
                     _ab_t  = _fwd_albedo(albedo_param, tr_ab).detach()
                     _ab_m  = _ab_t.reshape(-1, 3)[flat_mask]
                     _met_m = met_map.reshape(-1, 1)[flat_mask]
                     _rou_m = rou_map.reshape(-1, 1)[flat_mask]
-                    _recons, _errs = [], []
-                    for _k in range(_n_log):
-                        _r = _ab_t.new_zeros(H, W, 3)
-                        _r.reshape(-1, 3)[flat_mask] = shade_ct_env(
-                            view_m, N_m, _ab_m, env_pix_all[_k], env_dirs_t, env_dw_t,
-                            _met_m, _rou_m, sbatch=cfg.get("sbatch", 64),
-                                     spec_importance=cfg.get("spec_importance", False),
-                                     spec_samples=cfg.get("spec_samples", 64), diffuse_fresnel=_diffuse_fresnel)
-                        _r *= mask_t
-                        _recons.append(wandb.Image(_r.float().cpu().numpy()))
-                        _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
                     _step_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                                    if _gt_ab_m is not None else None)
-                wandb_run.log({
-                    "loss": float(loss), "loss_data": float(l_d), "data_rmse": float(l_d) ** 0.5,
-                    "loss_sparse": float(l_s), "loss_white": float(l_w), "loss_tv": float(l_tv),
-                    "elapsed_s": elapsed,
-                    "pred_albedo":    wandb.Image(
-                        _fwd_albedo(albedo_param, tr_ab).detach().float().cpu().numpy()),
-                    "pred_metallic":  wandb.Image(met_map.float().squeeze(-1).cpu().numpy()),
-                    "pred_roughness": wandb.Image(rou_map.float().squeeze(-1).cpu().numpy()),
-                    "est_env_maps":   [wandb.Image(img) for img in env_imgs_k],
-                    "env_map_avg":    wandb.Image(env_avg_img),
-                    "recons":         _recons,
-                    "recon_err_maps": _errs,
-                    "metallic_mean":      met,
-                    "roughness_mean":     rou,
-                    "metallic_err_mean":  abs(met - _gt_met_scalar),
-                    "roughness_err_mean": abs(rou - _gt_rou_scalar),
-                    "loss_metallic_l1":       float(_loss_ml[0]),
-                    "loss_metallic_binarize": float(_loss_mb[0]),
-                    **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-            **_relight_metrics(_ab_m, _met_m, _rou_m),
-                    **( {"albedo_scale_r": float(_step_scale[0]),
-                         "albedo_scale_g": float(_step_scale[1]),
-                         "albedo_scale_b": float(_step_scale[2]),
-                         "albedo_scale_mean": float(_step_scale.mean())}
-                        if _step_scale is not None else {} ),
-                    "lr": opt.param_groups[0]["lr"] if opt is not None else 0.0,
-                }, step=i)
+                _payload = _structured_scalar_log(
+                    loss=loss, l_d=l_d, l_s=l_s, l_w=l_w, l_tv=l_tv,
+                    loss_ml=_loss_ml[0], loss_mb=_loss_mb[0], scale3=_step_scale,
+                    gt_metrics=_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+                    relight=_relight_metrics(_ab_m, _met_m, _rou_m),
+                    recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
+                    lr=opt.param_groups[0]["lr"] if opt is not None else 0.0)
+                _payload["elapsed_s"] = elapsed
+                wandb_run.log(_payload, step=i)
 
     total_time = time.perf_counter() - t0
 

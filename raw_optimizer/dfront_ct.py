@@ -760,6 +760,7 @@ _RUN_NAME_SKIP = frozenset({
     # meta-params handled specially by make_run_name / decompose_scene
     "shader", "no_shadow", "init_from_gt", "freeze_intrinsics",
     "use_npy", "double", "opt_params", "n_images",
+    "log_gt_recon_images",
 })
 
 
@@ -985,12 +986,9 @@ def decompose_scene(
         tags    =wandb_tags,
         reinit  =True,
     )
-    run.log({
-        "gt_images":    [wandb.Image(img) for img in images],
-        "gt_albedo":    wandb.Image(gt_albedo),
-        "gt_metallic":  wandb.Image(gt_metallic[:, :, 0]),
-        "gt_roughness": wandb.Image(gt_roughness[:, :, 0]),
-    }, step=0)
+    _log_gt_recon = bool(cfg.get("log_gt_recon_images", False))
+    if _log_gt_recon:
+        run.log({"gt_images": [wandb.Image(img) for img in images]}, step=0)
 
     # ── optimize ──────────────────────────────────────────────────────────────
     t0 = time.time()
@@ -1214,16 +1212,15 @@ def decompose_scene(
         light_imgs_wandb = [wandb.Image(e) for e in env_imgs]
 
     # ── wandb final summary ────────────────────────────────────────────────────
-    run.log({
-        "albedo_est":      wandb.Image(albedo.clip(0, 1)),
+    # Intrinsics estimations (albedo shown scaled only) + GT, side by side — no
+    # error maps. GT input images and recon error maps only when explicitly asked.
+    _final = {
         "albedo_scaled":   wandb.Image(albedo_scaled),
-        "albedo_err":      wandb.Image(albedo_err.mean(-1)),
         "metallic_est":    wandb.Image(mat_a.squeeze(-1)),
         "roughness_est":   wandb.Image(mat_b.squeeze(-1)),
-        "metallic_err":    wandb.Image(mat_a_err.squeeze(-1) * mask_np),
-        "roughness_err":   wandb.Image(mat_b_err.squeeze(-1) * mask_np),
-        "reconstructions": [wandb.Image(s.clip(0, 1)) for s in shadings],
-        "recon_errors":    [wandb.Image(e.mean(-1)) for e in recon_err],
+        "gt_albedo":       wandb.Image(gt_albedo),
+        "gt_metallic":     wandb.Image(gt_metallic[:, :, 0]),
+        "gt_roughness":    wandb.Image(gt_roughness[:, :, 0]),
         light_img_key:     light_imgs_wandb,
         "albedo_rmse":     rmse,
         "albedo_mae":      albedo_mae,
@@ -1231,7 +1228,11 @@ def decompose_scene(
         "final_loss":      history[-1],
         "elapsed_s":       elapsed,
         **relight,
-    }, step=cfg["n_iter"])
+    }
+    if _log_gt_recon:
+        _final["gt_images"]      = [wandb.Image(img) for img in images]
+        _final["recon_err_maps"] = [wandb.Image(e.mean(-1)) for e in recon_err]
+    run.log(_final, step=cfg["n_iter"])
     run.finish()
 
     with open(out_dir / "metrics.json", "w") as fh:
