@@ -141,18 +141,30 @@ def load_obj(path: str, normalize: bool = True) -> Mesh:
 
 # ─────────────────────────────────────────── SH helpers ──────────────────────
 
-def build_sh_basis(dirs: np.ndarray) -> np.ndarray:
-    """Order-2 real SH basis. dirs: (..., 3) → (..., 9)"""
+def build_sh_basis(dirs: np.ndarray, order: int = 2) -> np.ndarray:
+    """Real SH basis. dirs: (..., 3) → (..., 9) for order 2, (..., 16) for order 3.
+    Band ordering matches raw_renderer_gpu.rasterizer._sh_basis."""
     dirs = np.asarray(dirs, dtype=np.float32)
     x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
-    return np.stack([
+    terms = [
         np.full_like(x, 0.282095),
         0.488603 * y, 0.488603 * z, 0.488603 * x,
         1.092548 * x * y, 1.092548 * y * z,
         0.315392 * (3.0 * z * z - 1.0),
         1.092548 * x * z,
         0.546274 * (x * x - y * y),
-    ], axis=-1).astype(np.float32)
+    ]
+    if order >= 3:
+        terms += [
+            0.590044 * y * (3.0 * x * x - y * y),
+            2.890611 * x * y * z,
+            0.457046 * y * (5.0 * z * z - 1.0),
+            0.373176 * z * (5.0 * z * z - 3.0),
+            0.457046 * x * (5.0 * z * z - 1.0),
+            1.445306 * z * (x * x - y * y),
+            0.590044 * x * (x * x - 3.0 * y * y),
+        ]
+    return np.stack(terms, axis=-1).astype(np.float32)
 
 
 # ─────────────────────────────────────────── EnvMap ──────────────────────────
@@ -192,19 +204,42 @@ class EnvMap:
         img = np.full((resolution // 2, resolution, 3), color, dtype=np.float32)
         return cls(img)
 
-    @classmethod
-    def from_sh(cls, sh: "SHLighting", resolution: int = 64) -> "EnvMap":
+    @staticmethod
+    def _sh_grid_dirs(resolution: int) -> np.ndarray:
         H, W = resolution // 2, resolution
         theta = np.pi * (np.arange(H, dtype=np.float32) + 0.5) / H
         phi   = 2 * np.pi * (np.arange(W, dtype=np.float32) + 0.5) / W - np.pi
         sin_t = np.sin(theta)[:, None]
-        dirs  = np.stack([
+        return np.stack([
             sin_t * np.cos(phi)[None, :],
             np.broadcast_to(np.cos(theta)[:, None], (H, W)).copy(),
             sin_t * np.sin(phi)[None, :],
         ], axis=-1)                                          # (H, W, 3)
-        raw = build_sh_basis(dirs) @ sh.coeffs               # (H, W, 3)
+
+    @classmethod
+    def from_sh(cls, sh: "SHLighting", resolution: int = 64) -> "EnvMap":
+        raw = build_sh_basis(cls._sh_grid_dirs(resolution)) @ sh.coeffs  # (H, W, 3)
         return cls(np.maximum(raw, 0.0).astype(np.float32))
+
+    @classmethod
+    def from_sh_dc_lifted(cls, sh: "SHLighting", resolution: int = 64,
+                          eps: float = 1e-4) -> tuple:
+        """SH → non-negative equirect env map WITHOUT rectification: instead of
+        clipping negative lobes (max(·,0), which injects >order-2 content the
+        SH lighting model cannot represent), the DC coefficient is lifted per
+        channel until the whole map is ≥ eps. The result stays EXACTLY
+        order-2, so the returned lifted coefficients are the true GT SH of
+        the map.
+
+        Returns (EnvMap, lifted_coeffs (9,3)). The minimum is taken on a dense
+        512-wide grid so coarser render grids are safely non-negative.
+        """
+        coeffs = sh.coeffs.astype(np.float32).copy()
+        dense = build_sh_basis(cls._sh_grid_dirs(512)) @ coeffs
+        lift = np.maximum(0.0, eps - dense.min(axis=(0, 1))) / 0.282095  # per-channel DC lift
+        coeffs[0] += lift.astype(np.float32)
+        img = (build_sh_basis(cls._sh_grid_dirs(resolution)) @ coeffs).astype(np.float32)
+        return cls(img), coeffs
 
     @classmethod
     def point_like(cls, direction: np.ndarray, color: tuple = (1.0, 1.0, 1.0),

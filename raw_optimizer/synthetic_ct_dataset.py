@@ -144,6 +144,34 @@ DEFAULT_CFG = dict(
     # images in one autograd graph). Bounds peak memory to ~img_batch images;
     # numerically identical to full-batch up to float summation order.
     img_batch = 0,
+    # SH lighting order for the ct_sh shader: 2 (9 coeffs, default) or 3
+    # (16 coeffs). Band 3 has zero Lambertian irradiance weight, so order 3
+    # only sharpens the SPECULAR term. GT SH given as (9,3) is zero-padded.
+    sh_order = 2,
+    # integer stride for downsampling images + GT maps before optimization
+    # (nearest/strided, keeps GT crisp). 1 = full resolution.
+    downsample = 1,
+    # cap on the number of PER-IMAGE wandb previews (recons, env maps, err maps)
+    # logged each step. Scalar metrics still use ALL images; this only limits the
+    # image uploads, which otherwise dominate runtime for large N. None = all.
+    wandb_max_images = None,
+    # diffuse Fresnel: multiply the diffuse by (1-F) on top of (1-metallic).
+    # MUST match the data generator + final shadings + relight (all default True,
+    # i.e. shade_ct_sh/shade_ct_env default), or recon_rmse decouples from the
+    # data loss. True = energy-conserving (specular takes energy from diffuse).
+    diffuse_fresnel = True,
+    # Huber transition point (linear radiance), used when loss == "huber"
+    huber_delta = 0.05,
+    # ct_env only: compute the specular term by GGX importance sampling
+    # (deterministic, valid at all roughness) instead of the texel-grid
+    # Riemann sum, which aliases below roughness ~0.3 on the 32x64 grid.
+    spec_importance = False,
+    spec_samples    = 64,
+    # hold out the last N images as a validation set: they are excluded from
+    # optimization and, at every log step, re-rendered with the CURRENT
+    # intrinsics + their GT lighting -> "relight_rmse"/"relight_mae".
+    # Requires GT SH (sh_XXX.npy) in the scene dir. 0 = off.
+    val_images = 0,
 )
 
 
@@ -179,8 +207,11 @@ def _make_lights(angle_deg: float):
 
 
 def _sh_coeffs_to_env_img(coeffs: np.ndarray, resolution: int = 64) -> np.ndarray:
-    """(9,3) SH coefficients → (H,W,3) float32 image normalized to [0,1]."""
-    img = EnvMap.from_sh(SHLighting(coeffs), resolution=resolution).image  # (H,W,3)
+    """(9|16,3) SH coefficients → (H,W,3) float32 image normalized to [0,1]."""
+    coeffs = np.asarray(coeffs, np.float32)
+    order = 3 if coeffs.shape[0] == 16 else 2
+    dirs = EnvMap._sh_grid_dirs(resolution)
+    img = np.maximum(build_sh_basis(dirs, order=order) @ coeffs, 0.0)
     mx = float(img.max())
     return img / max(mx, 1e-8)
 
@@ -1030,8 +1061,16 @@ def _make_scheduler(opt, cfg, n_steps):
     return None
 
 
-def _loss_fn(recon, target, mask_t, mode):
-    diff = (recon - target).abs() if mode == "L1" else (recon - target) ** 2
+def _loss_fn(recon, target, mask_t, mode, huber_delta=0.05):
+    resid = recon - target
+    if mode == "L1":
+        diff = resid.abs()
+    elif mode == "huber":
+        a = resid.abs()
+        diff = torch.where(a <= huber_delta, 0.5 * resid ** 2,
+                           huber_delta * (a - 0.5 * huber_delta))
+    else:
+        diff = resid ** 2
     return diff[mask_t.expand_as(diff)].mean()
 
 
@@ -1110,6 +1149,8 @@ def _optimize_ct_sh(
     init_from_gt: bool = False,
     log_gradients: bool = False,
     grad_log_dir: Optional[Path] = None,
+    val_images:   Optional[list] = None,
+    val_sh_coeffs: Optional[list] = None,
 ) -> tuple:
     dev    = normals_hw.device
     ftype  = normals_hw.dtype
@@ -1127,12 +1168,26 @@ def _optimize_ct_sh(
         return torch.from_numpy(np.asarray(x, np.float32)).to(dev, ftype) \
             if not isinstance(x, torch.Tensor) else x.to(dev, ftype)
 
+    _sh_ord = int(cfg.get("sh_order", 2))
+    if _sh_ord not in (2, 3):
+        raise ValueError(f"sh_order must be 2 or 3, got {_sh_ord}")
+    n_sh = (_sh_ord + 1) ** 2                     # 9 or 16
+    _diffuse_fresnel = bool(cfg.get("diffuse_fresnel", True))
+    _n_log = N_imgs if cfg.get("wandb_max_images") is None else min(N_imgs, int(cfg["wandb_max_images"]))
+
+    def _pad_sh(arr):
+        """(9,3) GT coefficients → (n_sh,3), zero-padding band 3 if needed."""
+        arr = np.asarray(arr, np.float32)
+        if arr.shape[0] < n_sh:
+            arr = np.concatenate([arr, np.zeros((n_sh - arr.shape[0], 3), np.float32)])
+        return arr
+
     imgs_t    = torch.stack([_t(img) for img in images])
     flat_mask = mask_hw.reshape(-1)
     N_m       = normals_hw.reshape(-1, 3)[flat_mask]
     fp_m      = frag_pos_hw.reshape(-1, 3)[flat_mask]
     view_m    = _norm(cam_pos.unsqueeze(0) - fp_m)
-    lut       = _get_ggx_sh_lut(dev).to(ftype)
+    lut       = _get_ggx_sh_lut(dev, n_bands=_sh_ord + 1).to(ftype)
     mask_t    = mask_hw.unsqueeze(-1).to(dev)
 
     learnable    = []
@@ -1157,17 +1212,17 @@ def _optimize_ct_sh(
     if "sh" in op:
         if init_from_gt and gt_sh_coeffs is not None:
             sh_coeffs = torch.stack([
-                torch.from_numpy(gt_sh_coeffs[k]).to(dev, ftype) for k in range(N_imgs)
+                torch.from_numpy(_pad_sh(gt_sh_coeffs[k])).to(dev, ftype) for k in range(N_imgs)
             ]).requires_grad_(True)
         else:
-            sh_init = torch.zeros(N_imgs, 9, 3, device=dev, dtype=ftype)
+            sh_init = torch.zeros(N_imgs, n_sh, 3, device=dev, dtype=ftype)
             sh_init[:, 0, :] = 1.5
             sh_coeffs = sh_init.clone().requires_grad_(True)
         learnable.append(sh_coeffs)
         named_params["sh"] = sh_coeffs
     else:
         sh_coeffs = torch.stack([
-            torch.from_numpy(gt_sh_coeffs[k]).to(dev, ftype) for k in range(N_imgs)
+            torch.from_numpy(_pad_sh(gt_sh_coeffs[k])).to(dev, ftype) for k in range(N_imgs)
         ])
 
     _gt_met_np = np.asarray(gt_metallic, np.float32)
@@ -1211,16 +1266,19 @@ def _optimize_ct_sh(
 
     # ── Precompute geometry-only terms (never change during optimisation) ─────
     with torch.no_grad():
-        _A = N_m.new_tensor([
+        _A_vals = [
             torch.pi,
             2*torch.pi/3, 2*torch.pi/3, 2*torch.pi/3,
             torch.pi/4,   torch.pi/4,   torch.pi/4, torch.pi/4, torch.pi/4,
-        ])
-        _AY        = _A * _sh_basis(N_m)                              # (M, 9)
+        ]
+        if _sh_ord >= 3:
+            _A_vals += [0.0] * 7        # Lambertian ZH weight of band 3 is zero
+        _A = N_m.new_tensor(_A_vals)
+        _AY        = _A * _sh_basis(N_m, order=_sh_ord)               # (M, n_sh)
         _NdotV_raw = (N_m * view_m).sum(-1, keepdim=True)             # (M, 1)
         _NdotV     = _NdotV_raw.clamp(min=0.0)                        # (M, 1)
         _R         = _norm(2.0 * _NdotV_raw * N_m - view_m)           # (M, 3)
-        _Y_R       = _sh_basis(_R)                                     # (M, 9)
+        _Y_R       = _sh_basis(_R, order=_sh_ord)                     # (M, n_sh)
         _front     = (_NdotV_raw > 0).to(ftype)                       # (M, 1)
         _imgs_m    = imgs_t.reshape(N_imgs, -1, 3)[:, flat_mask, :]   # (N, M, 3)
 
@@ -1256,12 +1314,22 @@ def _optimize_ct_sh(
         F    = f0 + (1.0 - f0) * (1.0 - _NdotV).pow(5)               # (M, 3)
         alpha = roughness_m ** 2
         G1    = _NdotV / (_NdotV * (1.0 - alpha**2/2.0) + alpha**2/2.0 + 1e-6)  # (M, 1)
+        # Diffuse weight. Must match the data generator (shade_ct_sh) and the
+        # final shadings/relight, or recon_rmse decouples from the data loss and
+        # the inverse crime can't reach 0. diffuse_fresnel=True multiplies by
+        # (1-F) (energy taken by specular); default True = shade_ct_sh default.
         k_d   = 1.0 - metallic_m                                       # (M, 1)
+        if _diffuse_fresnel:
+            k_d = (1.0 - F) * k_d                                      # (M, 3)
 
         # ── specular SH filter B (roughness-dependent, recomputed each step) ─
-        Bvals = _lut_lookup(lut, roughness_m.squeeze(-1))              # (M, 3)
-        B0, B1, B2 = Bvals[..., 0:1], Bvals[..., 1:2], Bvals[..., 2:3]
-        BY = torch.cat([B0, B1, B1, B1, B2, B2, B2, B2, B2], dim=-1) * _Y_R  # (M, 9)
+        Bvals = _lut_lookup(lut, roughness_m.squeeze(-1))              # (M, n_bands)
+        _bp = [Bvals[..., 0:1],
+               Bvals[..., 1:2].expand(-1, 3),
+               Bvals[..., 2:3].expand(-1, 5)]
+        if _sh_ord >= 3:
+            _bp.append(Bvals[..., 3:4].expand(-1, 7))
+        BY = torch.cat(_bp, dim=-1) * _Y_R                             # (M, n_sh)
 
         # ── batch SH projection over the selected images ───────────────────
         # (1, M, 9) @ (n, 9, 3) → (n, M, 3) via broadcast matmul
@@ -1275,8 +1343,19 @@ def _optimize_ct_sh(
         recon_m = (diff_m + spec_m) * _front                          # (n, M, 3)
 
         # ── loss in masked pixel space (scatter back not needed) ──────────
-        err       = (recon_m - imgs_sel).abs() if cfg["loss"] == "L1" else (recon_m - imgs_sel) ** 2
-        loss_data = err.mean() * n_sel
+        resid = recon_m - imgs_sel
+        if cfg["loss"] == "L1":
+            err = resid.abs()
+        elif cfg["loss"] == "huber":
+            _d = cfg.get("huber_delta", 0.05)
+            _a = resid.abs()
+            err = torch.where(_a <= _d, 0.5 * resid ** 2, _d * (_a - 0.5 * _d))
+        else:
+            err = resid ** 2
+        # mean over images (n_sel/N_imgs lets gradient-accumulation chunks sum
+        # to the full-batch value): loss_data is comparable across dataset
+        # sizes. Regularizer lambdas are absolute (not divided by N).
+        loss_data = err.mean() * (n_sel / N_imgs)
 
         loss_sparse = frac * cfg["lambda_sparse"] * _tv(albedo.permute(2, 0, 1))
         loss_white  = frac * cfg["lambda_white"]  * (albedo.mean() - 0.5) ** 2
@@ -1299,13 +1378,14 @@ def _optimize_ct_sh(
             result = []
             for k in range(N_imgs):
                 _, comps = shade_ct_sh(view_m, N_m, albedo_m, sh_coeffs[k],
-                                       metallic_m, roughness_m, lut=lut, return_components=True)
+                                       metallic_m, roughness_m, lut=lut,
+                                       diffuse_fresnel=_diffuse_fresnel, return_components=True)
                 result.append(comps)
         return result
 
     gt_map_grad = {
         "albedo":    np.broadcast_to(np.asarray(gt_albedo,   np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
-        "sh":        np.stack(gt_sh_coeffs).astype(np.float32) if gt_sh_coeffs is not None else None,
+        "sh":        np.stack([_pad_sh(s) for s in gt_sh_coeffs]).astype(np.float32) if gt_sh_coeffs is not None else None,
         "metallic":  np.broadcast_to(np.asarray(gt_metallic,  np.float32), (H, W, 1)).copy(),
         "roughness": np.broadcast_to(np.asarray(gt_roughness, np.float32), (H, W, 1)).copy(),
     }
@@ -1338,14 +1418,39 @@ def _optimize_ct_sh(
     ).to(dev, ftype)
 
     def _gt_rmse_metrics(ab_m, met_m, rou_m):
-        """Pixel-level RMSE against GT intrinsics (only when GT is available)."""
+        """Pixel-level RMSE/MAE against GT intrinsics (only when GT is available)."""
         out = {}
         if _gt_ab_m is not None:
             scale = (_gt_ab_m * ab_m).sum(0) / (ab_m * ab_m).sum(0).clamp(1e-8)
             out["albedo_rmse"] = float((ab_m * scale - _gt_ab_m).pow(2).mean().sqrt())
+            out["albedo_mae"]  = float((ab_m * scale - _gt_ab_m).abs().mean())
         out["metallic_rmse"]  = float((met_m - _gt_met_m).pow(2).mean().sqrt())
         out["roughness_rmse"] = float((rou_m - _gt_rou_m).pow(2).mean().sqrt())
         return out
+
+    # ── held-out relighting metric ────────────────────────────────────────────
+    _val_imgs_m = _val_sh = None
+    if val_images and val_sh_coeffs is not None:
+        _val_imgs_m = torch.stack([_t(v) for v in val_images]) \
+            .reshape(len(val_images), -1, 3)[:, flat_mask, :]              # (V, M, 3)
+        _val_sh = torch.stack([
+            torch.from_numpy(_pad_sh(s)).to(dev, ftype)
+            for s in val_sh_coeffs])                                       # (V, n_sh, 3)
+
+    def _relight_metrics(ab_m, met_m, rou_m):
+        """Render the held-out images with CURRENT intrinsics + their GT
+        lighting; report the per-image error vs the observed val images."""
+        if _val_imgs_m is None:
+            return {}
+        rs, ms = [], []
+        with torch.no_grad():
+            for k in range(_val_imgs_m.shape[0]):
+                recon = shade_ct_sh(view_m, N_m, ab_m, _val_sh[k],
+                                    met_m, rou_m, lut=lut, diffuse_fresnel=_diffuse_fresnel)
+                d = recon - _val_imgs_m[k]
+                rs.append(float(d.pow(2).mean().sqrt()))
+                ms.append(float(d.abs().mean()))
+        return {"relight_rmse": float(np.mean(rs)), "relight_mae": float(np.mean(ms))}
 
     with torch.no_grad():
         _il, _ild, _ils, _ilw, _iltv = _forward()
@@ -1363,22 +1468,23 @@ def _optimize_ct_sh(
             _met_m = _met_map.reshape(-1, 1)[flat_mask]
             _rou_m = _rou_map.reshape(-1, 1)[flat_mask]
             _recons, _errs = [], []
-            for _k in range(N_imgs):
+            for _k in range(_n_log):
                 _r = _ab_t.new_zeros(H, W, 3)
                 _r.reshape(-1, 3)[flat_mask] = shade_ct_sh(
-                    view_m, N_m, _ab_m, sh_coeffs[_k], _met_m, _rou_m, lut=lut)
+                    view_m, N_m, _ab_m, sh_coeffs[_k], _met_m, _rou_m, lut=lut,
+                    diffuse_fresnel=_diffuse_fresnel)
                 _r *= mask_t
                 _recons.append(wandb.Image(_r.float().cpu().numpy()))
                 _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
             _init_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                            if _gt_ab_m is not None else None)
         wandb_run.log({
-            "loss": float(_il), "loss_data": float(_ild),
+            "loss": float(_il), "loss_data": float(_ild), "data_rmse": float(_ild) ** 0.5,
             "loss_sparse": float(_ils), "loss_white": float(_ilw), "loss_tv": float(_iltv),
             "pred_albedo":     wandb.Image(_ab_t.float().cpu().numpy()),
             "pred_metallic":   wandb.Image(_met_map.float().squeeze(-1).cpu().numpy()),
             "pred_roughness":  wandb.Image(_rou_map.float().squeeze(-1).cpu().numpy()),
-            "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(_est_sh_np[k])) for k in range(N_imgs)],
+            "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(_est_sh_np[k])) for k in range(_n_log)],
             "recons":          _recons,
             "recon_err_maps":  _errs,
             "metallic_mean":       _im,
@@ -1388,6 +1494,7 @@ def _optimize_ct_sh(
             "loss_metallic_l1":       float(_loss_ml[0]),
             "loss_metallic_binarize": float(_loss_mb[0]),
             **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+            **_relight_metrics(_ab_m, _met_m, _rou_m),
             **( {"albedo_scale_r": float(_init_scale[0]),
                  "albedo_scale_g": float(_init_scale[1]),
                  "albedo_scale_b": float(_init_scale[2]),
@@ -1445,17 +1552,18 @@ def _optimize_ct_sh(
                     _met_m = met_map.reshape(-1, 1)[flat_mask]
                     _rou_m = rou_map.reshape(-1, 1)[flat_mask]
                     _recons, _errs = [], []
-                    for _k in range(N_imgs):
+                    for _k in range(_n_log):
                         _r = _ab_t.new_zeros(H, W, 3)
                         _r.reshape(-1, 3)[flat_mask] = shade_ct_sh(
-                            view_m, N_m, _ab_m, sh_coeffs[_k], _met_m, _rou_m, lut=lut)
+                            view_m, N_m, _ab_m, sh_coeffs[_k], _met_m, _rou_m, lut=lut,
+                            diffuse_fresnel=_diffuse_fresnel)
                         _r *= mask_t
                         _recons.append(wandb.Image(_r.float().cpu().numpy()))
                         _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
                     _step_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                                    if _gt_ab_m is not None else None)
                 wandb_run.log({
-                    "loss": float(loss), "loss_data": float(l_d),
+                    "loss": float(loss), "loss_data": float(l_d), "data_rmse": float(l_d) ** 0.5,
                     "loss_sparse": float(l_s), "loss_white": float(l_w), "loss_tv": float(l_tv),
                     "elapsed_s": elapsed,
                     "pred_albedo":     wandb.Image(
@@ -1463,7 +1571,7 @@ def _optimize_ct_sh(
                     "pred_metallic":   wandb.Image(met_map.float().squeeze(-1).cpu().numpy()),
                     "pred_roughness":  wandb.Image(rou_map.float().squeeze(-1).cpu().numpy()),
                     "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(est_sh_np[k]))
-                                        for k in range(N_imgs)],
+                                        for k in range(_n_log)],
                     "recons":          _recons,
                     "recon_err_maps":  _errs,
                     "metallic_mean":      met,
@@ -1473,6 +1581,7 @@ def _optimize_ct_sh(
                     "loss_metallic_l1":       float(_loss_ml[0]),
                     "loss_metallic_binarize": float(_loss_mb[0]),
                     **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+            **_relight_metrics(_ab_m, _met_m, _rou_m),
                     **( {"albedo_scale_r": float(_step_scale[0]),
                          "albedo_scale_g": float(_step_scale[1]),
                          "albedo_scale_b": float(_step_scale[2]),
@@ -1494,7 +1603,7 @@ def _optimize_ct_sh(
         for k in range(N_imgs):
             albedo_m = albedo_t2.reshape(-1, 3)[flat_mask]
             recon_m  = shade_ct_sh(view_m, N_m, albedo_m, sh_coeffs[k],
-                                   met_m, rou_m, lut=lut)
+                                   met_m, rou_m, lut=lut, diffuse_fresnel=_diffuse_fresnel)
             s = albedo_t2.new_zeros(H, W, 3)
             s.reshape(-1, 3)[flat_mask] = recon_m
             s *= mask_t
@@ -1526,13 +1635,17 @@ def _optimize_ct_env(
     init_from_gt: bool = False,
     log_gradients: bool = False,
     grad_log_dir: Optional[Path] = None,
+    val_images:   Optional[list] = None,
+    val_sh_coeffs: Optional[list] = None,
 ) -> tuple:
     dev    = normals_hw.device
     ftype  = normals_hw.dtype
     H, W   = normals_hw.shape[:2]
     N_imgs = len(images)
     P      = env_dirs.shape[0]
+    _n_log = N_imgs if cfg.get("wandb_max_images") is None else min(N_imgs, int(cfg["wandb_max_images"]))
     op = opt_params if opt_params is not None else _CT_ENV_PARAMS
+    _diffuse_fresnel = bool(cfg.get("diffuse_fresnel", True))
     if transforms is not None:
         tr_ab, tr_met, tr_rou, tr_env = transforms["albedo"], transforms["metallic"], transforms["roughness"], transforms["env"]
     else:
@@ -1661,10 +1774,16 @@ def _optimize_ct_env(
             recon_m   = shade_ct_env(view_m, N_m, albedo_m,
                                      env_pix_k, env_dirs_t, env_dw_t,
                                      metallic_m, roughness_m,
-                                     sbatch=cfg.get("sbatch", 64))
+                                     sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64), diffuse_fresnel=_diffuse_fresnel)
             recon = albedo.new_zeros(H, W, 3)
             recon.reshape(-1, 3)[flat_mask] = recon_m
-            loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"])
+            loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"],
+                                             cfg.get("huber_delta", 0.05))
+        # mean over images (chunks sum to the full-batch value): loss_data is
+        # comparable across dataset sizes. Regularizer lambdas stay absolute.
+        loss_data = loss_data / N_imgs
         loss_sparse = frac * cfg["lambda_sparse"] * _tv(albedo_param.permute(2, 0, 1))
         loss_white  = frac * cfg["lambda_white"]  * (_fwd_albedo(albedo_param, tr_ab).mean() - 0.5) ** 2
         loss_tv     = frac * cfg["lambda_tv"] * (
@@ -1689,7 +1808,9 @@ def _optimize_ct_env(
                 _, comps = shade_ct_env(view_m, N_m, albedo_m,
                                         env_pix_k, env_dirs_t, env_dw_t,
                                         metallic_m, roughness_m,
-                                        sbatch=cfg.get("sbatch", 64), return_components=True)
+                                        sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64), return_components=True)
                 result.append(comps)
         return result
 
@@ -1734,9 +1855,41 @@ def _optimize_ct_env(
         if _gt_ab_m is not None:
             scale = (_gt_ab_m * ab_m).sum(0) / (ab_m * ab_m).sum(0).clamp(1e-8)
             out["albedo_rmse"] = float((ab_m * scale - _gt_ab_m).pow(2).mean().sqrt())
+            out["albedo_mae"]  = float((ab_m * scale - _gt_ab_m).abs().mean())
         out["metallic_rmse"]  = float((met_m - _gt_met_m).pow(2).mean().sqrt())
         out["roughness_rmse"] = float((rou_m - _gt_rou_m).pow(2).mean().sqrt())
         return out
+
+    # ── held-out relighting metric ────────────────────────────────────────────
+    # GT lighting expressed on the optimizer's env grid (rectified SH radiance,
+    # the representation this shader lights with).
+    _val_imgs_m = _val_env = None
+    if val_images and val_sh_coeffs is not None:
+        _val_imgs_m = torch.stack([_t(v) for v in val_images]) \
+            .reshape(len(val_images), -1, 3)[:, flat_mask, :]              # (V, M, 3)
+        _val_env = torch.stack([
+            torch.from_numpy(np.maximum(
+                build_sh_basis(env_dirs) @ np.asarray(s, np.float32), 0.0)
+            ).to(dev, ftype)
+            for s in val_sh_coeffs])                                       # (V, P, 3)
+
+    def _relight_metrics(ab_m, met_m, rou_m):
+        """Render the held-out images with CURRENT intrinsics + their GT
+        lighting; report the per-image error vs the observed val images."""
+        if _val_imgs_m is None:
+            return {}
+        rs, ms = [], []
+        with torch.no_grad():
+            for k in range(_val_imgs_m.shape[0]):
+                recon = shade_ct_env(view_m, N_m, ab_m, _val_env[k],
+                                     env_dirs_t, env_dw_t, met_m, rou_m,
+                                     sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64), diffuse_fresnel=_diffuse_fresnel)
+                d = recon - _val_imgs_m[k]
+                rs.append(float(d.pow(2).mean().sqrt()))
+                ms.append(float(d.abs().mean()))
+        return {"relight_rmse": float(np.mean(rs)), "relight_mae": float(np.mean(ms))}
 
     history = []
     with torch.no_grad():
@@ -1748,7 +1901,7 @@ def _optimize_ct_env(
     if wandb_run is not None:
         with torch.no_grad():
             _env_pix_all = _fwd_env(env_raw_params, tr_env).detach()
-            _env_imgs_k  = [_env_flat_to_img(_env_pix_all[k].cpu().numpy(), env_H, env_W) for k in range(N_imgs)]
+            _env_imgs_k  = [_env_flat_to_img(_env_pix_all[k].cpu().numpy(), env_H, env_W) for k in range(_n_log)]
             _env_avg_img = _env_flat_to_img(_env_pix_all.mean(0).cpu().numpy(), env_H, env_W)
             _met_map = _get_met().detach()
             _rou_map = _get_rou().detach()
@@ -1757,18 +1910,20 @@ def _optimize_ct_env(
             _met_m = _met_map.reshape(-1, 1)[flat_mask]
             _rou_m = _rou_map.reshape(-1, 1)[flat_mask]
             _recons, _errs = [], []
-            for _k in range(N_imgs):
+            for _k in range(_n_log):
                 _r = _ab_t.new_zeros(H, W, 3)
                 _r.reshape(-1, 3)[flat_mask] = shade_ct_env(
                     view_m, N_m, _ab_m, _env_pix_all[_k], env_dirs_t, env_dw_t,
-                    _met_m, _rou_m, sbatch=cfg.get("sbatch", 64))
+                    _met_m, _rou_m, sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64), diffuse_fresnel=_diffuse_fresnel)
                 _r *= mask_t
                 _recons.append(wandb.Image(_r.float().cpu().numpy()))
                 _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
             _init_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                            if _gt_ab_m is not None else None)
         wandb_run.log({
-            "loss": float(_il), "loss_data": float(_ild),
+            "loss": float(_il), "loss_data": float(_ild), "data_rmse": float(_ild) ** 0.5,
             "loss_sparse": float(_ils), "loss_white": float(_ilw), "loss_tv": float(_iltv),
             "pred_albedo":    wandb.Image(_ab_t.float().cpu().numpy()),
             "pred_metallic":  wandb.Image(_met_map.float().squeeze(-1).cpu().numpy()),
@@ -1783,6 +1938,7 @@ def _optimize_ct_env(
             "roughness_err_mean": abs(_ir - _gt_rou_scalar),
             "loss_metallic_l1":   float(_loss_ml[0]),
             **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+            **_relight_metrics(_ab_m, _met_m, _rou_m),
             **( {"albedo_scale_r": float(_init_scale[0]),
                  "albedo_scale_g": float(_init_scale[1]),
                  "albedo_scale_b": float(_init_scale[2]),
@@ -1836,25 +1992,27 @@ def _optimize_ct_env(
                 with torch.no_grad():
                     env_pix_all = _fwd_env(env_raw_params, tr_env).detach()
                     env_imgs_k  = [_env_flat_to_img(env_pix_all[k].cpu().numpy(), env_H, env_W)
-                                   for k in range(N_imgs)]
+                                   for k in range(_n_log)]
                     env_avg_img = _env_flat_to_img(env_pix_all.mean(0).cpu().numpy(), env_H, env_W)
                     _ab_t  = _fwd_albedo(albedo_param, tr_ab).detach()
                     _ab_m  = _ab_t.reshape(-1, 3)[flat_mask]
                     _met_m = met_map.reshape(-1, 1)[flat_mask]
                     _rou_m = rou_map.reshape(-1, 1)[flat_mask]
                     _recons, _errs = [], []
-                    for _k in range(N_imgs):
+                    for _k in range(_n_log):
                         _r = _ab_t.new_zeros(H, W, 3)
                         _r.reshape(-1, 3)[flat_mask] = shade_ct_env(
                             view_m, N_m, _ab_m, env_pix_all[_k], env_dirs_t, env_dw_t,
-                            _met_m, _rou_m, sbatch=cfg.get("sbatch", 64))
+                            _met_m, _rou_m, sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64), diffuse_fresnel=_diffuse_fresnel)
                         _r *= mask_t
                         _recons.append(wandb.Image(_r.float().cpu().numpy()))
                         _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
                     _step_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                                    if _gt_ab_m is not None else None)
                 wandb_run.log({
-                    "loss": float(loss), "loss_data": float(l_d),
+                    "loss": float(loss), "loss_data": float(l_d), "data_rmse": float(l_d) ** 0.5,
                     "loss_sparse": float(l_s), "loss_white": float(l_w), "loss_tv": float(l_tv),
                     "elapsed_s": elapsed,
                     "pred_albedo":    wandb.Image(
@@ -1872,6 +2030,7 @@ def _optimize_ct_env(
                     "loss_metallic_l1":       float(_loss_ml[0]),
                     "loss_metallic_binarize": float(_loss_mb[0]),
                     **_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+            **_relight_metrics(_ab_m, _met_m, _rou_m),
                     **( {"albedo_scale_r": float(_step_scale[0]),
                          "albedo_scale_g": float(_step_scale[1]),
                          "albedo_scale_b": float(_step_scale[2]),
@@ -1896,7 +2055,11 @@ def _optimize_ct_env(
             env_pix_k = torch.from_numpy(env_maps_out[k]).to(dev)
             recon_m   = shade_ct_env(view_m, N_m, albedo_m,
                                      env_pix_k, env_dirs_t, env_dw_t,
-                                     met_m, rou_m)
+                                     met_m, rou_m,
+                                     sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64),
+                                     diffuse_fresnel=_diffuse_fresnel)
             s = albedo_t2.new_zeros(H, W, 3)
             s.reshape(-1, 3)[flat_mask] = recon_m
             s *= mask_t
@@ -1930,6 +2093,7 @@ def _optimize_phong_sh(
     dev    = normals_hw.device
     H, W   = normals_hw.shape[:2]
     N_imgs = len(images)
+    _n_log = N_imgs if cfg.get("wandb_max_images") is None else min(N_imgs, int(cfg["wandb_max_images"]))
     s_min  = cfg.get("shininess_min", DEFAULT_CFG["shininess_min"])
     s_max  = cfg.get("shininess_max", DEFAULT_CFG["shininess_max"])
     op     = opt_params if opt_params is not None else _PHONG_SH_PARAMS
@@ -2080,7 +2244,7 @@ def _optimize_phong_sh(
 
     gt_map_grad = {
         "albedo":    np.broadcast_to(np.asarray(gt_albedo, np.float32), (H, W, 3)).copy() if gt_albedo is not None else None,
-        "sh":        np.stack(gt_sh_coeffs).astype(np.float32) if gt_sh_coeffs is not None else None,
+        "sh":        np.stack([_pad_sh(s) for s in gt_sh_coeffs]).astype(np.float32) if gt_sh_coeffs is not None else None,
         "shininess": np.broadcast_to(np.asarray(gt_shininess, np.float32), (H, W, 1)).copy(),
         "ks":        np.broadcast_to(np.asarray(gt_ks, np.float32), (H, W, 1)).copy(),
     }
@@ -2113,7 +2277,7 @@ def _optimize_phong_sh(
             _shin_m = _shin_map.reshape(-1, 1)[flat_mask]
             _ks_m   = _ks_map.reshape(-1, 1)[flat_mask]
             _recons, _errs = [], []
-            for _k in range(N_imgs):
+            for _k in range(_n_log):
                 _r = _ab_t.new_zeros(H, W, 3)
                 _r.reshape(-1, 3)[flat_mask] = shade_phong_sh(
                     view_m, N_m, ka, kd, _ks_m, _shin_m, _ab_m, sh_coeffs[_k])
@@ -2121,12 +2285,12 @@ def _optimize_phong_sh(
                 _recons.append(wandb.Image(_r.float().cpu().numpy()))
                 _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
         wandb_run.log({
-            "loss": float(_il), "loss_data": float(_ild),
+            "loss": float(_il), "loss_data": float(_ild), "data_rmse": float(_ild) ** 0.5,
             "loss_sparse": float(_ils), "loss_white": float(_ilw), "loss_tv": float(_iltv),
             "pred_albedo":     wandb.Image(_ab_t.float().cpu().numpy()),
             "pred_shininess":  wandb.Image((_shin_map / s_max).squeeze(-1).cpu().numpy()),
             "pred_ks":         wandb.Image(_ks_map.squeeze(-1).cpu().numpy()),
-            "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(_est_sh_np[k])) for k in range(N_imgs)],
+            "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(_est_sh_np[k])) for k in range(_n_log)],
             "recons":          _recons,
             "recon_err_maps":  _errs,
             "shininess_mean":     _is,
@@ -2166,7 +2330,7 @@ def _optimize_phong_sh(
                     _shin_m = shin_map.reshape(-1, 1)[flat_mask]
                     _ks_m   = ks_map.reshape(-1, 1)[flat_mask]
                     _recons, _errs = [], []
-                    for _k in range(N_imgs):
+                    for _k in range(_n_log):
                         _r = _ab_t.new_zeros(H, W, 3)
                         _r.reshape(-1, 3)[flat_mask] = shade_phong_sh(
                             view_m, N_m, ka, kd, _ks_m, _shin_m, _ab_m, sh_coeffs[_k])
@@ -2174,7 +2338,7 @@ def _optimize_phong_sh(
                         _recons.append(wandb.Image(_r.float().cpu().numpy()))
                         _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
                 wandb_run.log({
-                    "loss": float(loss), "loss_data": float(l_d),
+                    "loss": float(loss), "loss_data": float(l_d), "data_rmse": float(l_d) ** 0.5,
                     "loss_sparse": float(l_s), "loss_white": float(l_w), "loss_tv": float(l_tv),
                     "elapsed_s": elapsed,
                     "pred_albedo":     wandb.Image(
@@ -2183,7 +2347,7 @@ def _optimize_phong_sh(
                         (shin_map / s_max).squeeze(-1).cpu().numpy()),
                     "pred_ks":         wandb.Image(ks_map.squeeze(-1).cpu().numpy()),
                     "est_sh_env_maps": [wandb.Image(_sh_coeffs_to_env_img(est_sh_np[k]))
-                                        for k in range(N_imgs)],
+                                        for k in range(_n_log)],
                     "recons":          _recons,
                     "recon_err_maps":  _errs,
                     "shininess_mean":     shin_val,
@@ -2244,6 +2408,7 @@ def _optimize_phong_env(
     dev    = normals_hw.device
     H, W   = normals_hw.shape[:2]
     N_imgs = len(images)
+    _n_log = N_imgs if cfg.get("wandb_max_images") is None else min(N_imgs, int(cfg["wandb_max_images"]))
     P      = env_dirs.shape[0]
     s_min  = cfg.get("shininess_min", DEFAULT_CFG["shininess_min"])
     s_max  = cfg.get("shininess_max", DEFAULT_CFG["shininess_max"])
@@ -2381,7 +2546,9 @@ def _optimize_phong_env(
             recon_m   = shade_phong_env(view_m, N_m, albedo_m,
                                         env_pix_k, env_dirs_t, env_dw_t,
                                         ka, kd, ks_m, shininess_m,
-                                        sbatch=cfg.get("sbatch", 64))
+                                        sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64))
             recon = albedo.new_zeros(H, W, 3)
             recon.reshape(-1, 3)[flat_mask] = recon_m
             loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"])
@@ -2405,7 +2572,9 @@ def _optimize_phong_env(
                 _, comps = shade_phong_env(view_m, N_m, albedo_m,
                                            env_pix_k, env_dirs_t, env_dw_t,
                                            ka, kd, ks_m, shininess_m,
-                                           sbatch=cfg.get("sbatch", 64), return_components=True)
+                                           sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64), return_components=True)
                 result.append(comps)
         return result
 
@@ -2441,7 +2610,7 @@ def _optimize_phong_env(
     if wandb_run is not None:
         with torch.no_grad():
             _env_pix_all = _fwd_env(env_raw_params, tr_env).detach()
-            _env_imgs_k  = [_env_flat_to_img(_env_pix_all[k].cpu().numpy(), env_H, env_W) for k in range(N_imgs)]
+            _env_imgs_k  = [_env_flat_to_img(_env_pix_all[k].cpu().numpy(), env_H, env_W) for k in range(_n_log)]
             _env_avg_img = _env_flat_to_img(_env_pix_all.mean(0).cpu().numpy(), env_H, env_W)
             _shin_map = _fwd_shininess(shininess_raw, tr_shin, s_min, s_max).detach()
             _ks_map   = _fwd_ks(ks_raw, tr_ks).detach()
@@ -2450,16 +2619,18 @@ def _optimize_phong_env(
             _shin_m = _shin_map.reshape(-1, 1)[flat_mask]
             _ks_m   = _ks_map.reshape(-1, 1)[flat_mask]
             _recons, _errs = [], []
-            for _k in range(N_imgs):
+            for _k in range(_n_log):
                 _r = _ab_t.new_zeros(H, W, 3)
                 _r.reshape(-1, 3)[flat_mask] = shade_phong_env(
                     view_m, N_m, _ab_m, _env_pix_all[_k], env_dirs_t, env_dw_t,
-                    ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64))
+                    ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64))
                 _r *= mask_t
                 _recons.append(wandb.Image(_r.float().cpu().numpy()))
                 _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
         wandb_run.log({
-            "loss": float(_il), "loss_data": float(_ild),
+            "loss": float(_il), "loss_data": float(_ild), "data_rmse": float(_ild) ** 0.5,
             "loss_sparse": float(_ils), "loss_white": float(_ilw), "loss_tv": float(_iltv),
             "pred_albedo":    wandb.Image(_ab_t.float().cpu().numpy()),
             "pred_shininess": wandb.Image((_shin_map / s_max).squeeze(-1).cpu().numpy()),
@@ -2522,23 +2693,25 @@ def _optimize_phong_env(
                 with torch.no_grad():
                     env_pix_all = _fwd_env(env_raw_params, tr_env).detach()
                     env_imgs_k  = [_env_flat_to_img(env_pix_all[k].cpu().numpy(), env_H, env_W)
-                                   for k in range(N_imgs)]
+                                   for k in range(_n_log)]
                     env_avg_img = _env_flat_to_img(env_pix_all.mean(0).cpu().numpy(), env_H, env_W)
                     _ab_t   = _fwd_albedo(albedo_param, tr_ab).detach()
                     _ab_m   = _ab_t.reshape(-1, 3)[flat_mask]
                     _shin_m = shin_map.reshape(-1, 1)[flat_mask]
                     _ks_m   = ks_map.reshape(-1, 1)[flat_mask]
                     _recons, _errs = [], []
-                    for _k in range(N_imgs):
+                    for _k in range(_n_log):
                         _r = _ab_t.new_zeros(H, W, 3)
                         _r.reshape(-1, 3)[flat_mask] = shade_phong_env(
                             view_m, N_m, _ab_m, env_pix_all[_k], env_dirs_t, env_dw_t,
-                            ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64))
+                            ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64),
+                                     spec_importance=cfg.get("spec_importance", False),
+                                     spec_samples=cfg.get("spec_samples", 64))
                         _r *= mask_t
                         _recons.append(wandb.Image(_r.float().cpu().numpy()))
                         _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
                 wandb_run.log({
-                    "loss": float(loss), "loss_data": float(l_d),
+                    "loss": float(loss), "loss_data": float(l_d), "data_rmse": float(l_d) ** 0.5,
                     "loss_sparse": float(l_s), "loss_white": float(l_w), "loss_tv": float(l_tv),
                     "elapsed_s": elapsed,
                     "pred_albedo":    wandb.Image(

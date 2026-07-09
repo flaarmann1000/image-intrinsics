@@ -9,6 +9,8 @@ over all hit pixels at once.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -194,27 +196,59 @@ def _interp(verts, fn, vn, faces, face_ids, bary, hit, smooth):
 
 # ─────────────────────────────────────────── SH helpers ──────────────────────
 
-def _sh_basis(d):
-    """d: (..., 3) → (..., 9)"""
+def _sh_basis(d, order: int = 2):
+    """d: (..., 3) → (..., 9) for order 2, (..., 16) for order 3.
+
+    Band ordering follows the Ramamoorthi convention used throughout:
+    [DC | y,z,x | xy,yz,3z²−1,xz,x²−y² | band-3 m=−3..3].
+    """
     x, y, z = d[..., 0], d[..., 1], d[..., 2]
-    return torch.stack([
+    terms = [
         torch.ones_like(x) * 0.282095,
         0.488603*y, 0.488603*z, 0.488603*x,
         1.092548*x*y, 1.092548*y*z,
         0.315392*(3*z**2 - 1),
         1.092548*x*z, 0.546274*(x**2 - y**2),
-    ], dim=-1)                                     # (..., 9)
+    ]
+    if order >= 3:
+        terms += [
+            0.590044 * y * (3*x**2 - y**2),
+            2.890611 * x * y * z,
+            0.457046 * y * (5*z**2 - 1),
+            0.373176 * z * (5*z**2 - 3),
+            0.457046 * x * (5*z**2 - 1),
+            1.445306 * z * (x**2 - y**2),
+            0.590044 * x * (x**2 - 3*y**2),
+        ]
+    return torch.stack(terms, dim=-1)              # (..., 9|16)
+
+
+def _sh_order_of(coeffs_t) -> int:
+    """Infer the SH order from the coefficient count (9 → 2, 16 → 3)."""
+    n = coeffs_t.shape[0]
+    if n == 9:
+        return 2
+    if n == 16:
+        return 3
+    raise ValueError(f"Expected 9 (order 2) or 16 (order 3) SH coefficients, got {n}")
 
 
 def _sh_irradiance(coeffs_t, N):
-    """ZH band-limiting weights for diffuse — coeffs_t: (9,3); N: (...,3) → (...,3)"""
-    Y = _sh_basis(N)                               # (..., 9)
-    A = N.new_tensor([
+    """ZH band-limiting weights for diffuse — coeffs_t: (9|16,3); N: (...,3) → (...,3).
+
+    Band 3 has A₃ = 0 (odd Lambertian ZH bands above 1 vanish), so order-3
+    lighting affects the diffuse term only through its lower bands.
+    """
+    order = _sh_order_of(coeffs_t)
+    Y = _sh_basis(N, order=order)                  # (..., 9|16)
+    A_vals = [
         torch.pi,
         2*torch.pi/3, 2*torch.pi/3, 2*torch.pi/3,
         torch.pi/4,   torch.pi/4,   torch.pi/4, torch.pi/4, torch.pi/4,
-    ])
-    # return ((A * Y) @ coeffs_t)       # (..., 3)
+    ]
+    if order >= 3:
+        A_vals += [0.0] * 7
+    A = N.new_tensor(A_vals)
     return ((A * Y) @ coeffs_t).clamp(min=0)       # (..., 3)
 
 
@@ -433,7 +467,8 @@ _LUT_PATH = Path(__file__).parent / "ggx_sh_lut.npz"
 _LUT_N_ROUGH = 512    # roughness resolution (uniform grid over [0, 1])
 _LUT_N_THETA = 8192   # integration resolution
 
-_LUT_CACHE: Optional[torch.Tensor] = None   # shape (N, 3), in-memory cache
+_LUT_PATH_O3 = Path(__file__).parent / "ggx_sh_lut_o3.npz"
+_LUT_CACHE: dict = {}                       # n_bands -> (N, n_bands) tensor
 
 
 # ── LUT computation ───────────────────────────────────────────────────────────
@@ -441,9 +476,10 @@ _LUT_CACHE: Optional[torch.Tensor] = None   # shape (N, 3), in-memory cache
 def _compute_ggx_sh_lut(
     n_roughness: int = _LUT_N_ROUGH,
     n_theta:     int = _LUT_N_THETA,
+    n_bands:     int = 3,
 ) -> np.ndarray:
     """
-    Numerically integrate GGX zonal SH band weights for bands 0, 1, 2.
+    Numerically integrate GGX zonal SH band weights for bands 0..n_bands-1.
 
     Kernel:   w(θ) = D_GGX(n·h = cos(θ/2), α)        ← no cos θ factor
     Bands:    h_l = 2π ∫₀^{π/2} w(θ) P_l(cosθ) sinθ dθ
@@ -461,9 +497,10 @@ def _compute_ggx_sh_lut(
         np.ones_like(cos_t),
         cos_t,
         0.5 * (3.0 * cos_t**2 - 1.0),
-    ]
+        0.5 * (5.0 * cos_t**3 - 3.0 * cos_t),
+    ][:n_bands]
 
-    lut = np.zeros((n_roughness, 3), dtype=np.float32)
+    lut = np.zeros((n_roughness, n_bands), dtype=np.float32)
 
     for i in range(n_roughness):
         r = float(i) / max(n_roughness - 1, 1)
@@ -471,7 +508,7 @@ def _compute_ggx_sh_lut(
         a2 = a ** 2
 
         if a2 < 1e-12:                       # delta limit
-            lut[i] = [4.0, 4.0, 4.0]
+            lut[i] = [4.0] * n_bands
             continue
 
         D = a2 / (np.pi * (cos_th2 * (a2 - 1.0) + 1.0) ** 2)
@@ -489,28 +526,30 @@ def _compute_ggx_sh_lut(
 
 def _get_ggx_sh_lut(
     device:     torch.device,
-    cache_path: Path = _LUT_PATH,
+    cache_path: Optional[Path] = None,
+    n_bands:    int = 3,
 ) -> torch.Tensor:
     """
-    Return the GGX SH LUT on `device`.
+    Return the GGX SH LUT on `device`, with `n_bands` zonal bands (3 for
+    order-2 SH, 4 for order-3).
 
-    First call:  computes the LUT, saves it to `cache_path`, caches in memory.
+    First call:  computes the LUT, saves it to its cache file, caches in memory.
     Later calls: returns the in-memory tensor (moved to `device` if needed).
     """
-    global _LUT_CACHE
-
-    if _LUT_CACHE is None:
-        if cache_path.exists():
-            data = np.load(cache_path)
-            _LUT_CACHE = torch.from_numpy(data["lut"])
+    if n_bands not in _LUT_CACHE:
+        path = cache_path if cache_path is not None else (
+            _LUT_PATH if n_bands == 3 else _LUT_PATH_O3)
+        if path.exists():
+            data = np.load(path)
+            _LUT_CACHE[n_bands] = torch.from_numpy(data["lut"])
         else:
-            print("[ggx_sh] LUT not found — computing … ", end="", flush=True)
-            lut_np = _compute_ggx_sh_lut()
-            np.savez_compressed(cache_path, lut=lut_np)
-            _LUT_CACHE = torch.from_numpy(lut_np)
-            print(f"done  →  saved to {cache_path}")
+            print(f"[ggx_sh] {n_bands}-band LUT not found — computing … ", end="", flush=True)
+            lut_np = _compute_ggx_sh_lut(n_bands=n_bands)
+            np.savez_compressed(path, lut=lut_np)
+            _LUT_CACHE[n_bands] = torch.from_numpy(lut_np)
+            print(f"done  →  saved to {path}")
 
-    return _LUT_CACHE.to(device)
+    return _LUT_CACHE[n_bands].to(device)
 
 
 # ── LUT interpolation ─────────────────────────────────────────────────────────
@@ -538,28 +577,33 @@ def _lut_lookup(lut: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
 # ── GGX SH specular filter ────────────────────────────────────────────────────
 
 def _sh_ggx_filtered_radiance(
-    coeffs_t:  torch.Tensor,   # (9, 3)
+    coeffs_t:  torch.Tensor,   # (9|16, 3)
     dirs:      torch.Tensor,   # (..., 3)  unit reflection directions
     roughness: torch.Tensor,   # (..., 1)  in [0, 1]
-    lut:       torch.Tensor,   # (N, 3)
+    lut:       torch.Tensor,   # (N, 3|4)
 ) -> torch.Tensor:
     """
     GGX-lobe SH filter — analogue of _sh_phong_filtered_radiance.
 
     Convolves the SH-encoded environment with the GGX lobe centred on `dirs`,
-    with per-element width controlled by `roughness`.
+    with per-element width controlled by `roughness`. The SH order is inferred
+    from the coefficient count; order-3 needs a 4-band LUT.
 
     Returns (..., 3), clamped to ≥ 0.
     """
-    Y = _sh_basis(dirs)                          # (..., 9)
-    Bvals = _lut_lookup(lut, roughness.squeeze(-1))  # (..., 3)
+    order = _sh_order_of(coeffs_t)
+    if lut.shape[1] < order + 1:
+        raise ValueError(f"order-{order} SH needs a {order + 1}-band GGX LUT, "
+                         f"got {lut.shape[1]} bands")
+    Y = _sh_basis(dirs, order=order)             # (..., 9|16)
+    Bvals = _lut_lookup(lut, roughness.squeeze(-1))  # (..., n_bands)
 
-    B0 = Bvals[..., 0:1]   # h0/h1
-    B1 = Bvals[..., 1:2]   # 1  (always, kept explicit for clarity)
-    B2 = Bvals[..., 2:3]   # h2/h1
-
-    # Expand per-band scalar to all 9 SH coefficients
-    B = torch.cat([B0, B1, B1, B1, B2, B2, B2, B2, B2], dim=-1)  # (..., 9)
+    parts = [Bvals[..., 0:1],                    # band 0 (1 coeff)
+             Bvals[..., 1:2].expand(*Bvals.shape[:-1], 3),
+             Bvals[..., 2:3].expand(*Bvals.shape[:-1], 5)]
+    if order >= 3:
+        parts.append(Bvals[..., 3:4].expand(*Bvals.shape[:-1], 7))
+    B = torch.cat(parts, dim=-1)                 # (..., 9|16)
 
     return ((B * Y) @ coeffs_t).clamp(min=0.0)   # (..., 3)
 
@@ -610,7 +654,7 @@ def shade_ct_sh(
     metallic = _as_tensor(metallic)
 
     if lut is None:
-        lut = _get_ggx_sh_lut(device)
+        lut = _get_ggx_sh_lut(device, n_bands=_sh_order_of(sh_coeffs) + 1)
 
     # ── Fresnel-Schlick ───────────────────────────────────────────────────────
     # F0: dielectrics reflect ~4%; metals reflect with their albedo tint
@@ -688,6 +732,90 @@ def shade_ct_sh(
 
 # ─────────────────────────────────────────── env-map CT shader ───────────────
 
+def _env_bilinear(env_pixels: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
+    """Differentiable bilinear lookup of a flat (H*W, 3) equirect env map
+    (EnvMap layout: W = 2H, texel centers at half-integers, pole = +Y,
+    u = atan2(z, x)) at arbitrary unit directions (..., 3).
+
+    Gradients flow into env_pixels (gather) AND into dirs (through the
+    bilinear weights), so lobe-shape parameters like roughness receive
+    gradients from the env content."""
+    P = env_pixels.shape[0]
+    H = int(math.sqrt(P / 2))
+    W = 2 * H
+    assert H * W == P, f"env_pixels ({P}) is not an equirect W=2H grid"
+    x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
+    u = (torch.atan2(z, x) / (2 * math.pi) + 0.5) * W - 0.5      # texel coords
+    v = (torch.acos(y.clamp(-1.0, 1.0)) / math.pi) * H - 0.5
+    u0 = torch.floor(u);  wu = (u - u0).unsqueeze(-1)
+    v0 = torch.floor(v);  wv = (v - v0).unsqueeze(-1)
+    iu0 = (u0.long() % W); iu1 = (iu0 + 1) % W                    # wrap in phi
+    iv0 = v0.long().clamp(0, H - 1); iv1 = (iv0 + 1).clamp(0, H - 1)  # clamp at poles
+    p00 = env_pixels[iv0 * W + iu0]
+    p01 = env_pixels[iv0 * W + iu1]
+    p10 = env_pixels[iv1 * W + iu0]
+    p11 = env_pixels[iv1 * W + iu1]
+    return ((p00 * (1 - wu) + p01 * wu) * (1 - wv)
+            + (p10 * (1 - wu) + p11 * wu) * wv)
+
+
+def _spec_ggx_importance(
+    view:        torch.Tensor,   # (M, 3)
+    normals:     torch.Tensor,   # (M, 3)
+    env_pixels:  torch.Tensor,   # (H*W, 3)
+    F0:          torch.Tensor,   # (M, 3)
+    NdotV_raw:   torch.Tensor,   # (M, 1)
+    alpha2:      torch.Tensor,   # (M, 1) or scalar tensor — α² with α = roughness²
+    k_smith:     torch.Tensor,   # (M, 1) — Smith k, α²/2 (matches quadrature path)
+    n_samples:   int = 64,
+) -> torch.Tensor:
+    """GGX half-vector importance sampling of the specular env integral.
+
+    Deterministic stratified samples (identical across pixels and calls, so
+    L-BFGS closures see a noise-free objective): xi1 stratified, xi2 golden-
+    ratio sequence. The D term cancels against the pdf, leaving the classic
+    estimator  spec = mean_s F(VdH) G(NdV, NdL) VdH / (NdH NdV) * L_env(L).
+    Valid at all roughness values (no texel-grid aliasing)."""
+    M      = normals.shape[0]
+    device = normals.device
+    dtype  = normals.dtype
+    NdotV  = NdotV_raw.clamp(min=1e-4)                       # (M, 1)
+    alpha  = alpha2.clamp(min=1e-12).sqrt()                  # (M, 1) — GGX α
+
+    # tangent frame around N (branchless up-vector selection)
+    up   = torch.where(normals[:, 2:3].abs() < 0.999,
+                       torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype).expand_as(normals),
+                       torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype).expand_as(normals))
+    t1 = _norm(torch.cross(up, normals, dim=-1))             # (M, 3)
+    t2 = torch.cross(normals, t1, dim=-1)                    # (M, 3)
+
+    s   = torch.arange(n_samples, device=device, dtype=dtype)
+    xi1 = (s + 0.5) / n_samples                              # (S,) stratified
+    xi2 = torch.frac(s * 0.6180339887498949)                 # (S,) golden ratio
+
+    # GGX D sampling: cosθ_h = sqrt((1-ξ)/(1+(α²-1)ξ))
+    cos_th = ((1.0 - xi1) / (1.0 + (alpha2 - 1.0) * xi1)).clamp(min=0.0).sqrt()  # (M, S)
+    sin_th = (1.0 - cos_th ** 2).clamp(min=0.0).sqrt()
+    phi    = 2 * math.pi * xi2                                # (S,)
+    Hvec = (sin_th * torch.cos(phi)).unsqueeze(-1) * t1.unsqueeze(1) \
+         + (sin_th * torch.sin(phi)).unsqueeze(-1) * t2.unsqueeze(1) \
+         + cos_th.unsqueeze(-1) * normals.unsqueeze(1)        # (M, S, 3)
+
+    VdH = (view.unsqueeze(1) * Hvec).sum(-1)                  # (M, S)
+    L   = 2.0 * VdH.unsqueeze(-1) * Hvec - view.unsqueeze(1)  # (M, S, 3)
+    NdL_raw = (normals.unsqueeze(1) * L).sum(-1)              # (M, S)
+    mf  = ((NdL_raw > 1e-4) & (VdH > 1e-4)).to(dtype)
+    NdL = NdL_raw.clamp(min=1e-4)
+    NdH = (normals.unsqueeze(1) * Hvec).sum(-1).clamp(min=1e-4)
+
+    F = _schlick_F(VdH.clamp(0, 1), F0.unsqueeze(1))          # (M, S, 3)
+    G = _smith_G(NdotV, NdL, k_smith)                         # (M, S)
+
+    radiance = _env_bilinear(env_pixels, L)                   # (M, S, 3)
+    w = (G * VdH / (NdH * NdotV + 1e-7)) * mf                 # (M, S)
+    return (F * w.unsqueeze(-1) * radiance).mean(1)           # (M, 3)
+
+
 def shade_ct_env(
     view:              torch.Tensor,
     normals:           torch.Tensor,
@@ -700,6 +828,8 @@ def shade_ct_env(
     sbatch:            int = 64,
     diffuse_fresnel:   bool = True,
     return_components: bool = False,
+    spec_importance:   bool = False,
+    spec_samples:      int = 64,
 ) -> torch.Tensor:
     """
     Differentiable Cook-Torrance shading with explicit env-map integration.
@@ -719,6 +849,16 @@ def shade_ct_env(
     diffuse_fresnel       : if True, multiply diffuse by (1-F) on top of
                             (1-metallic). Default False (matches Blender).
     return_components     : if True, return (composite, dict)
+    spec_importance       : if True, compute the SPECULAR term by GGX
+                            half-vector importance sampling (spec_samples
+                            deterministic stratified samples, bilinear env
+                            lookup) instead of the texel-grid Riemann sum.
+                            The Riemann sum aliases for lobes narrower than a
+                            texel (roughness ≲ 0.3 on the 32x64 grid, with a
+                            float32 instability peaking near roughness 0.1);
+                            importance sampling stays valid at ALL roughness.
+                            Requires env_pixels on an equirect grid with
+                            W = 2H (the EnvMap layout). Diffuse is unchanged.
 
     Returns
     -------
@@ -765,15 +905,20 @@ def shade_ct_env(
         NdH   = ((NdL_raw + NdotV) / H_len).clamp(0, 1)
         VdH   = ((LdV + 1.0)       / H_len).clamp(0, 1)
 
-        D = _ggx_D(NdH, alpha2)                               # (M, B)
         F = _schlick_F(VdH, F0.unsqueeze(1))                  # (M, B, 3)
-        G = _smith_G(NdotV, NdL, k_smith)                     # (M, B)
 
-        w     = (D * G * dw_b / (4 * NdotV + 1e-7)) * mf     # (M, B)
-        spec     += (F * w[:, :, None] * r_b).sum(1)
+        if not spec_importance:
+            D = _ggx_D(NdH, alpha2)                           # (M, B)
+            G = _smith_G(NdotV, NdL, k_smith)                 # (M, B)
+            w = (D * G * dw_b / (4 * NdotV + 1e-7)) * mf      # (M, B)
+            spec += (F * w[:, :, None] * r_b).sum(1)
         diff_irr += (NdL_raw.clamp(min=0) * dw_b * mf) @ r_b
         F_sum    += (F * mf[:, :, None]).sum(1)
         n_valid  += mf.sum(1)
+
+    if spec_importance:
+        spec = _spec_ggx_importance(view, normals, env_pixels, F0,
+                                    NdotV_raw, alpha2, k_smith, spec_samples)
 
     F_mean    = F_sum / n_valid[:, None].clamp(min=1)         # (M, 3)
     # Diffuse weight: (1-metallic) by default (matches Blender's Principled BSDF);

@@ -424,6 +424,57 @@ def render_scene(
     return render_np
 
 
+def make_dc_lifted_sh_lighting(
+    src_dir: Path,
+    out_dir: Path,
+    resolution: int = 64,
+    eps: float = 1e-4,
+    normalize: bool = True,
+) -> None:
+    """Convert a ref-SH-lighting dir (sh_NNN.npy) into a DC-LIFTED variant.
+
+    Rectified env maps (max(SH,0), as in EnvMap.from_sh) contain >order-2
+    content that the SH decomposition model cannot represent. DC-lifting
+    instead raises the DC coefficient per channel until the map is
+    non-negative, so the map stays EXACTLY order-2 and the saved sh_NNN.npy
+    are its true GT coefficients.
+
+    Writes per light: sh_NNN.npy (lifted coeffs, peak-normalized to map max=1
+    if normalize), sh_env_map_NNN.png (8-bit, for BlenderProc), and
+    sh_env_map_NNN.exr (lossless float — preferred by render_front3d_multipass
+    when present, eliminating the 8-bit env quantization).
+    """
+    import os
+    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    import cv2  # noqa: PLC0415
+
+    src_dir, out_dir = Path(src_dir), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sh_files = sorted(src_dir.glob("sh_*.npy"))
+    if not sh_files:
+        raise FileNotFoundError(f"No sh_*.npy in {src_dir}")
+    lifts = []
+    for f in sh_files:
+        coeffs = np.load(f).astype(np.float32)
+        env, lifted = EnvMap.from_sh_dc_lifted(SHLighting(coeffs), resolution=resolution, eps=eps)
+        img = env.image
+        lifts.append(float(lifted[0].mean() - coeffs[0].mean()))
+        if normalize:
+            s = 1.0 / max(float(img.max()), 1e-8)
+            img, lifted = img * s, lifted * s
+        idx = f.stem.split("_")[-1]
+        np.save(out_dir / f"sh_{idx}.npy", lifted.astype(np.float32))
+        Image.fromarray((np.clip(img, 0, 1) * 255).round().astype(np.uint8)).save(
+            out_dir / f"sh_env_map_{idx}.png")
+        cv2.imwrite(str(out_dir / f"sh_env_map_{idx}.exr"), img[:, :, ::-1].astype(np.float32))
+    with open(out_dir / "config.json", "w") as fh:
+        json.dump({"src_dir": str(src_dir), "dc_lifted": True, "eps": eps,
+                   "resolution": resolution, "normalize": normalize,
+                   "n_lights": len(sh_files)}, fh, indent=2)
+    print(f"DC-lifted {len(sh_files)} lights -> {out_dir}  "
+          f"(mean DC lift before normalization: {np.mean(lifts):.4f})")
+
+
 _DEFAULT_SH_LIGHTS_DIR = Path(__file__).parents[1] / "results" / "ref_sh_lighting"
 
 
@@ -611,7 +662,9 @@ def build_3dfront_dataset(
     src_dir: Path,
     out_dir: Path,
     variant: str = "linear",
-    lighting: str = "sun"
+    lighting: str = "sun",
+    sh_src_dir: Optional[Path] = None,
+    sh_scale: float = 1.0,
 ) -> None:
     """Build a CT decomposition dataset from 3D-Front renderings.
 
@@ -624,6 +677,13 @@ def build_3dfront_dataset(
                   linearized automatically by load_scene at decomp time)
       "exr"     — sun_N.exr   → light_NNN.npy  (float32, HDR;
                   normalized to 99th-percentile ≈ 1.0)
+
+    sh_src_dir: optional dir with sh_NNN.npy GT SH coefficients (e.g.
+      results/ref_sh_lighting for env renders, cycled by index). They are
+      copied into the dataset as sh_NNN.npy — required for the val_images /
+      relighting metric of decompose_scene — scaled by the EFFECTIVE lighting
+      scale of the images: sh_scale (e.g. the BlenderProc env strength 2.0),
+      additionally divided by the exr normalization for the "exr" variant.
 
     The output directory is a valid scene_dir for decompose_scene.
     """
@@ -662,6 +722,15 @@ def build_3dfront_dataset(
         for i, f in enumerate(lighting_files):
             shutil.copy2(f, out_dir / f"light_{i:03d}.png")
 
+    if sh_src_dir is not None:
+        sh_files = sorted(Path(sh_src_dir).glob("sh_*.npy"))
+        if not sh_files:
+            raise FileNotFoundError(f"No sh_*.npy files in {sh_src_dir}")
+        eff_scale = sh_scale / exr_scale if exr_scale else sh_scale
+        for i in range(len(lighting_files)):
+            sh = np.load(sh_files[i % len(sh_files)]).astype(np.float32) * eff_scale
+            np.save(out_dir / f"sh_{i:03d}.npy", sh)
+
     cfg: dict = {
         "src_dir": str(src_dir),
         "variant": variant,
@@ -670,6 +739,10 @@ def build_3dfront_dataset(
     }
     if exr_scale is not None:
         cfg["exr_scale"] = exr_scale
+    if sh_src_dir is not None:
+        cfg["sh_src_dir"] = str(sh_src_dir)
+        cfg["sh_scale"] = sh_scale
+        cfg["sh_eff_scale"] = float(sh_scale / exr_scale if exr_scale else sh_scale)
 
     with open(out_dir / "config.json", "w") as fh:
         json.dump(cfg, fh, indent=2)
@@ -799,6 +872,16 @@ def decompose_scene(
     torch_dtype = torch.float64 if double else torch.float32
 
     scene = load_scene(scene_dir, no_shadow=no_shadow, use_npy=use_npy)
+
+    # ── optional strided downsampling (nearest: GT maps/mask stay crisp) ──────
+    _ds = int(cfg.get("downsample", 1) or 1)
+    if _ds > 1:
+        for k in ("normals_np", "mask_np", "albedo_np", "metallic_np", "roughness_np"):
+            scene[k] = np.ascontiguousarray(scene[k][::_ds, ::_ds])
+        scene["images"] = [np.ascontiguousarray(im[::_ds, ::_ds]) for im in scene["images"]]
+        scene["H"], scene["W"] = scene["normals_np"].shape[:2]
+        print(f"  [downsample] x{_ds} -> {scene['H']}x{scene['W']}")
+
     H, W = scene["H"], scene["W"]
     images     = scene["images"]
     light_keys = scene["light_keys"]
@@ -819,6 +902,26 @@ def decompose_scene(
     gt_sh_coeffs = scene.get("sh_coeffs")  # list of (9,3) arrays or None
     if n_images is not None and gt_sh_coeffs is not None:
         gt_sh_coeffs = gt_sh_coeffs[:n_images]
+
+    # ── validation split: hold out the LAST val_images for the relighting metric ─
+    n_val = int(cfg.get("val_images", 0) or 0)
+    val_imgs = val_sh = None
+    val_keys = []
+    if n_val > 0:
+        if gt_sh_coeffs is None:
+            print("  [val] disabled: no sh_XXX.npy GT lighting found in the scene dir")
+            n_val = 0
+        elif n_val >= len(images):
+            raise ValueError(f"val_images={n_val} >= available images ({len(images)})")
+        else:
+            val_imgs     = images[-n_val:]
+            val_sh       = gt_sh_coeffs[-n_val:]
+            val_keys     = light_keys[-n_val:]
+            images       = images[:-n_val]
+            light_keys   = light_keys[:-n_val]
+            gt_sh_coeffs = gt_sh_coeffs[:-n_val]
+            print(f"  [val] holding out last {n_val} images for relighting "
+                  f"({len(images)} train images)")
 
     grad_log_dir = out_dir / "gradient_flow" if log_gradients else None
 
@@ -917,6 +1020,8 @@ def decompose_scene(
             init_from_gt=init_from_gt,
             log_gradients=log_gradients,
             grad_log_dir=grad_log_dir,
+            val_images=val_imgs,
+            val_sh_coeffs=val_sh,
         )
     elif shader == "ct_env":
         albedo, env_maps_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(
@@ -931,17 +1036,79 @@ def decompose_scene(
             init_from_gt=init_from_gt,
             log_gradients=log_gradients,
             grad_log_dir=grad_log_dir,
+            val_images=val_imgs,
+            val_sh_coeffs=val_sh,
         )
     else:
         raise ValueError(f"shader must be 'ct_sh' or 'ct_env', got {shader!r}")
 
-    # ── albedo RMSE + scale ────────────────────────────────────────────────────
+    # ── albedo RMSE/MAE + scale ────────────────────────────────────────────────
     mask_flat  = mask_np.reshape(-1)
     est_px  = torch.from_numpy(albedo[mask_np])
     gt_px   = torch.from_numpy(gt_albedo[mask_np])
     rmse_t, scale_t = _albedo_rmse(est_px, gt_px)
     rmse    = float(rmse_t)
     scale   = scale_t.numpy()
+    albedo_mae = float((est_px * scale_t - gt_px).abs().mean())
+
+    # ── final relighting error on the held-out val images ─────────────────────
+    # Render the held-out lights with the ESTIMATED intrinsics + their GT
+    # lighting; save target / relit / residual arrays per light under
+    # out_dir/relight/ so the caller can plot them, and record per-light metrics.
+    relight = {}
+    _sh_ord_final = int(cfg.get("sh_order", 2))
+    def _pad_sh_final(s):
+        s = np.asarray(s, np.float32)
+        n = (_sh_ord_final + 1) ** 2
+        if s.shape[0] < n:
+            s = np.concatenate([s, np.zeros((n - s.shape[0], 3), np.float32)])
+        return s
+    if val_imgs is not None:
+        from raw_renderer_gpu import build_sh_basis
+        relight_dir = out_dir / "relight"
+        relight_dir.mkdir(exist_ok=True)
+        with torch.no_grad():
+            _fm  = mask_hw.reshape(-1)
+            _N   = normals_hw.reshape(-1, 3)[_fm]
+            _V   = torch.nn.functional.normalize(
+                cam_pos.unsqueeze(0) - frag_pos_hw.reshape(-1, 3)[_fm], dim=-1)
+            _ab  = torch.from_numpy(albedo).to(device, torch_dtype).reshape(-1, 3)[_fm]
+            _me  = torch.from_numpy(mat_a).to(device, torch_dtype).reshape(-1, 1)[_fm]
+            _ro  = torch.from_numpy(mat_b).to(device, torch_dtype).reshape(-1, 1)[_fm]
+            _fm_np = _fm.cpu().numpy()
+            _lut = _get_ggx_sh_lut(device, n_bands=_sh_ord_final + 1).to(torch_dtype) \
+                if shader == "ct_sh" else None
+            rs, ms = [], []
+            for vi, (v_img, v_sh) in enumerate(zip(val_imgs, val_sh)):
+                _dfres = bool(cfg.get("diffuse_fresnel", True))
+                if shader == "ct_sh":
+                    sh_t = torch.from_numpy(_pad_sh_final(v_sh)).to(device, torch_dtype)
+                    recon = shade_ct_sh(_V, _N, _ab, sh_t, _me, _ro, lut=_lut,
+                                        diffuse_fresnel=_dfres)
+                else:
+                    env_pix = np.maximum(build_sh_basis(env_dirs) @ np.asarray(v_sh, np.float32), 0.0)
+                    recon = shade_ct_env(
+                        _V, _N, _ab,
+                        torch.from_numpy(env_pix).to(device, torch_dtype),
+                        torch.from_numpy(env_dirs).to(device, torch_dtype),
+                        torch.from_numpy(env_dw).to(device, torch_dtype),
+                        _me, _ro, sbatch=cfg.get("sbatch", 64),
+                        spec_importance=cfg.get("spec_importance", False),
+                        spec_samples=cfg.get("spec_samples", 64),
+                        diffuse_fresnel=_dfres)
+                tgt = torch.from_numpy(
+                    np.asarray(v_img, np.float32).reshape(-1, 3)[_fm_np]).to(device, torch_dtype)
+                d = recon - tgt
+                r, m = float(d.pow(2).mean().sqrt()), float(d.abs().mean())
+                rs.append(r); ms.append(m)
+                relit_full = np.zeros((H * W, 3), np.float32)
+                relit_full[_fm_np] = recon.float().cpu().numpy()
+                vk = val_keys[vi] if vi < len(val_keys) else f"val_{vi:03d}"
+                np.save(relight_dir / f"relit_{vk}.npy", relit_full.reshape(H, W, 3))
+        relight = dict(relight_rmse=float(np.mean(rs)), relight_mae=float(np.mean(ms)),
+                       relight_rmse_per_light=[float(x) for x in rs],
+                       relight_mae_per_light=[float(x) for x in ms],
+                       relight_keys=list(val_keys))
 
     inv_scale = 1.0 / np.maximum(scale[None, None, :], 1e-8)
     if shader == "ct_sh":
@@ -959,11 +1126,17 @@ def decompose_scene(
 
     recon_err  = [np.abs(s - img) * mask_np[:, :, None]
                   for s, img in zip(shadings, images)]
-    recon_rmse = float(np.mean([e[mask_np].mean() for e in recon_err]))
+    # recon_mae keeps the historical name's value (mean abs err); recon_rmse is
+    # a true per-image RMSE averaged over the training lights.
+    recon_mae  = float(np.mean([e[mask_np].mean() for e in recon_err]))
+    recon_rmse = float(np.mean([
+        np.sqrt(((s - img) ** 2)[mask_np].mean()) for s, img in zip(shadings, images)]))
 
     metrics = dict(
-        albedo_rmse=rmse, final_loss=float(history[-1]),
-        recon_rmse=recon_rmse,
+        albedo_rmse=rmse, albedo_mae=albedo_mae, final_loss=float(history[-1]),
+        recon_rmse=recon_rmse, recon_mae=recon_mae,
+        **relight,
+        n_train_images=len(images), n_val_images=n_val,
         albedo_scale=scale.tolist(), loss_history=history,
         metallic_est_mean=float(mat_a[mask_np].mean()),
         metallic_gt=float(gt_metallic[mask_np].mean()),
@@ -998,6 +1171,7 @@ def decompose_scene(
     Image.fromarray((albedo_scaled * 255).astype(np.uint8)).save(
         out_dir / "albedo_scaled.png")
     np.save(out_dir / "albedo_scaled.npy", albedo_scaled.astype(np.float32))
+    np.save(out_dir / "albedo_err.npy", albedo_err.astype(np.float32))
 
     _save_gray(mat_a, out_dir / "metallic_est.png")
     np.save(out_dir / "metallic_est.npy", mat_a.astype(np.float32))
@@ -1052,9 +1226,11 @@ def decompose_scene(
         "recon_errors":    [wandb.Image(e.mean(-1)) for e in recon_err],
         light_img_key:     light_imgs_wandb,
         "albedo_rmse":     rmse,
+        "albedo_mae":      albedo_mae,
         "recon_rmse":      recon_rmse,
         "final_loss":      history[-1],
         "elapsed_s":       elapsed,
+        **relight,
     }, step=cfg["n_iter"])
     run.finish()
 
