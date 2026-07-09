@@ -56,7 +56,8 @@ def build_parser():
                    help="Where per-run outputs + the summary CSV are written.")
     p.add_argument("--view_filter", nargs="*", default=None,
                    help="Only view_keys starting with one of these prefixes.")
-    p.add_argument("--dataset_filter", nargs="*", default='ct-ct_sh',
+    p.add_argument("--dataset_filter", nargs="*",
+                #    default='ct-ct_sh',
                    help="Only dataset dirs whose name starts with one of these (e.g. 'blender_' 'ct-ct_sh').")
     p.add_argument("--downsample", type=int, default=4,
                    help="Decompose downsample for datasets NOT already pre-reduced (blender).")
@@ -69,9 +70,9 @@ def build_parser():
     p.add_argument("--diffuse_fresnel", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
                    default=True, help="Optimizer diffuse-Fresnel (default True = always ON).")
     p.add_argument("--n_iter", type=int, default=300)
-    p.add_argument("--lbfgs_max_iter", type=int, default=20)
+    p.add_argument("--lbfgs_max_iter", type=int, default=30)
     p.add_argument("--log_every", type=int, default=10)
-    p.add_argument("--lambda_tv", type=float, default=1e-4)
+    p.add_argument("--lambda_tv", type=float, default=1e-5)
     p.add_argument("--lambda_metallic_binarize", type=float, default=1e-4)
     p.add_argument("--double", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
                    default=True, help="float64 (fp64 is slow on T4/L4; float32 is fine for ct_sh).")
