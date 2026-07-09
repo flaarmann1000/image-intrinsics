@@ -202,7 +202,8 @@ def build_parser():
     p.add_argument("--log_gt_recon_images", action="store_true")
     # ── execution ──
     p.add_argument("--workers", type=int, default=0,
-                   help="Parallel worker processes (0 = one per view, capped at #runs).")
+                   help="Parallel worker processes (0 = min(#runs, CPU count)). The 31^2 LBFGS "
+                        "workload is CPU/launch-bound, so ~one per core saturates a spare GPU.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--wandb_project", default="3dfront-hpsweep-gc")
     p.add_argument("--wandb_entity", default="DLVC-intrinsics")
@@ -249,7 +250,7 @@ def main():
                 wandb_project=args.wandb_project, wandb_mode=args.wandb_mode,
                 force=args.force, no_plots=args.no_plots))
 
-    workers = args.workers or min(len(views), len(tasks))
+    workers = args.workers or min(len(tasks), os.cpu_count() or 4)
     workers = max(1, min(workers, len(tasks)))
     print(f"{len(views)} view(s) x {len(grid)} combo(s) = {len(tasks)} run(s)  "
           f"| SH{args.sh_order}  | workers={workers}  | device={args.device}")

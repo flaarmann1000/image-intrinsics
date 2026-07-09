@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -86,11 +87,14 @@ def build_parser():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true", help="Redo runs even if metrics.json exists.")
     p.add_argument("--no_plots", action="store_true", help="Skip PNG artifact plotting.")
+    p.add_argument("--workers", type=int, default=0,
+                   help="Parallel worker processes (0 = min(#runs, CPU count)). The 31^2 LBFGS "
+                        "workload is CPU/launch-bound, so ~one per core saturates a spare GPU.")
+    p.add_argument("--wandb_mode", default=None, choices=[None, "online", "offline", "disabled"],
+                   help="Force a wandb mode for every run (default: env/online).")
     return p
 
 
-args = build_parser().parse_args()
-DEVICE = args.device
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from raw_optimizer.dfront_ct import decompose_scene   # noqa: E402
 
@@ -146,8 +150,51 @@ def save_relight_plots(run_dir, m, ds_dir, downsample):
         plt.tight_layout(); fig.savefig(pdir / f"relight_{key}.png", dpi=80); plt.close(fig)
 
 
+# ───────────────────────── one run (executed in a worker process) ────────────
+def _metrics_row(m):
+    return dict(
+        albedo_rmse=m["albedo_rmse"], albedo_mae=m.get("albedo_mae"),
+        roughness_mae=m["roughness_err_mean"], metallic_mae=m["metallic_err_mean"],
+        train_recon_rmse=m["recon_rmse"], train_recon_mae=m.get("recon_mae"),
+        val_relight_rmse=m.get("relight_rmse"), val_relight_mae=m.get("relight_mae"),
+        final_loss=m["final_loss"])
+
+
+def run_one(task):
+    """Decompose one (dataset, sh_order, shader) run. Self-contained + picklable
+    so it runs in a spawned process. Returns a summary row (+ status/error)."""
+    if task["wandb_mode"]:
+        os.environ["WANDB_MODE"] = task["wandb_mode"]
+    out_dir = Path(task["out_dir"]); ds_dir = Path(task["dir"])
+    row_base = dict(view=task["view"], dataset=task["dataset"],
+                    shader=task["shader"], sh_order=task["sh_order"])
+
+    # metrics.json is written only on success: present => done; a dir without it
+    # is a partial/preempted run to clear + redo.
+    if (out_dir / "metrics.json").exists() and not task["force"]:
+        m = json.loads((out_dir / "metrics.json").read_text())
+        return {**row_base, **_metrics_row(m), "status": "cached"}
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    try:
+        m = decompose_scene(ds_dir, out_dir, cfg_overrides=task["cfg"], device=task["device"],
+                            wandb_entity=task["wandb_entity"], wandb_project=task["wandb_project"])
+        if not task["no_plots"]:
+            save_intrinsics_plot(out_dir, m, out_dir / "intrinsics.png")
+            save_relight_plots(out_dir, m, ds_dir, task["eff_ds"])
+        (out_dir / "report.json").write_text(json.dumps({
+            **row_base, "decomp_shader": task["shader"], **_metrics_row(m),
+            "n_train": m.get("n_train_images"), "n_val": m.get("n_val_images")}, indent=1))
+        return {**row_base, **_metrics_row(m), "status": "ok"}
+    except Exception as e:                       # keep the batch alive on one bad run
+        import traceback
+        return {**row_base, "status": "error", "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc()[-2000:]}
+
+
 # ───────────────────────── discovery of dataset dirs ─────────────────────────
-def discover_datasets():
+def discover_datasets(args):
     items = []
     for view_dir in sorted(p for p in args.datasets_root.iterdir() if p.is_dir()):
         if args.view_filter and not any(view_dir.name.startswith(f) for f in args.view_filter):
@@ -166,13 +213,7 @@ def discover_datasets():
     return items
 
 
-def main():
-    items = discover_datasets()
-    if not items:
-        raise SystemExit(f"No dataset dirs under {args.datasets_root}")
-    n_runs = len(items) * len(args.sh_orders) * len(args.decomp_shaders)
-    print(f"{len(items)} dataset(s) × {args.sh_orders} × {args.decomp_shaders} = {n_runs} run(s); device={DEVICE}")
-
+def build_tasks(args, items):
     base_cfg = {
         "n_iter": args.n_iter, "lbfgs_max_iter": args.lbfgs_max_iter, "log_every": args.log_every,
         "lambda_tv": args.lambda_tv, "lambda_metallic_binarize": args.lambda_metallic_binarize,
@@ -181,12 +222,10 @@ def main():
         "wandb_max_images": args.wandb_max_images, "diffuse_fresnel": args.diffuse_fresnel,
         "log_gt_recon_images": args.log_gt_recon_images,
     }
-
-    rows, done = [], 0
+    tasks = []
     for it in items:
         for order in args.sh_orders:
             for shader in args.decomp_shaders:
-                done += 1
                 cfg = dict(base_cfg)
                 cfg.update(shader={"ct_sh": "ct_sh", "ct_env": "ct_env", "ct_env_imp": "ct_env"}[shader],
                            sh_order=order, downsample=it["eff_ds"],
@@ -195,50 +234,62 @@ def main():
                     cfg["spec_importance"] = True
                     cfg["spec_samples"] = args.spec_samples
                 tag = f"{it['view']}__{it['name']}__{shader}_SH{order}_N{args.n_train}"
-                out_dir = args.runs_root / tag
-                if (out_dir / "metrics.json").exists() and not args.force:
-                    m = json.loads((out_dir / "metrics.json").read_text())
-                    print(f"[{done}/{n_runs}] {tag}: cached")
-                else:
-                    # metrics.json is written only on successful completion, so an
-                    # out_dir WITHOUT it is a partially-written (preempted) run —
-                    # clear it for a clean redo on spot-restart.
-                    if out_dir.exists():
-                        shutil.rmtree(out_dir, ignore_errors=True)
-                    print(f"[{done}/{n_runs}] {tag}: decomposing …", flush=True)
-                    m = decompose_scene(it["dir"], out_dir, cfg_overrides=cfg, device=DEVICE,
-                                        wandb_entity=args.wandb_entity, wandb_project=args.wandb_project)
-                    if not args.no_plots:
-                        save_intrinsics_plot(out_dir, m, out_dir / "intrinsics.png")
-                        save_relight_plots(out_dir, m, it["dir"], it["eff_ds"])
-                    (out_dir / "report.json").write_text(json.dumps({
-                        "view": it["view"], "dataset": it["name"], "decomp_shader": shader,
-                        "sh_order": order,
-                        "albedo_rmse": m["albedo_rmse"], "albedo_mae": m.get("albedo_mae"),
-                        "roughness_mae": m["roughness_err_mean"], "metallic_mae": m["metallic_err_mean"],
-                        "train_recon_rmse": m["recon_rmse"], "train_recon_mae": m.get("recon_mae"),
-                        "val_relight_rmse": m.get("relight_rmse"), "val_relight_mae": m.get("relight_mae"),
-                        "final_loss": m["final_loss"], "n_train": m.get("n_train_images"),
-                        "n_val": m.get("n_val_images")}, indent=1))
-                rows.append(dict(
-                    view=it["view"], dataset=it["name"], shader=shader, sh_order=order,
-                    albedo_rmse=m["albedo_rmse"], albedo_mae=m.get("albedo_mae"),
-                    roughness_mae=m["roughness_err_mean"], metallic_mae=m["metallic_err_mean"],
-                    train_recon_rmse=m["recon_rmse"], val_relight_rmse=m.get("relight_rmse"),
-                    val_relight_mae=m.get("relight_mae"), final_loss=m["final_loss"]))
-                # atomic write: a preemption mid-write can't corrupt the summary
-                args.runs_root.mkdir(parents=True, exist_ok=True)
-                _tmp = args.runs_root / "decomposition_summary.csv.tmp"
-                pd.DataFrame(rows).to_csv(_tmp, index=False)
-                os.replace(_tmp, args.runs_root / "decomposition_summary.csv")
+                tasks.append(dict(
+                    view=it["view"], dataset=it["name"], dir=str(it["dir"]), eff_ds=it["eff_ds"],
+                    shader=shader, sh_order=order, cfg=cfg,
+                    out_dir=str(args.runs_root / tag), device=args.device,
+                    wandb_entity=args.wandb_entity, wandb_project=args.wandb_project,
+                    wandb_mode=args.wandb_mode, force=args.force, no_plots=args.no_plots))
+    return tasks
+
+
+def main():
+    args = build_parser().parse_args()
+    items = discover_datasets(args)
+    if not items:
+        raise SystemExit(f"No dataset dirs under {args.datasets_root}")
+    tasks = build_tasks(args, items)
+    workers = args.workers or min(len(tasks), os.cpu_count() or 4)
+    workers = max(1, min(workers, len(tasks)))
+    print(f"{len(items)} dataset(s) × {args.sh_orders} × {args.decomp_shaders} = {len(tasks)} run(s)  "
+          f"| workers={workers}  | device={args.device}")
+
+    args.runs_root.mkdir(parents=True, exist_ok=True)
+    try:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+    except Exception:
+        ctx = None
+
+    rows, done = [], 0
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+        futs = {ex.submit(run_one, t): t for t in tasks}
+        for fut in as_completed(futs):
+            done += 1
+            r = fut.result()
+            rows.append(r)
+            # atomic write: a preemption mid-write can't corrupt the summary
+            _tmp = args.runs_root / "decomposition_summary.csv.tmp"
+            pd.DataFrame(rows).to_csv(_tmp, index=False)
+            os.replace(_tmp, args.runs_root / "decomposition_summary.csv")
+            if r.get("status") == "error":
+                print(f"[{done}/{len(tasks)}] {r['view']} {r['dataset']} {r['shader']} SH{r['sh_order']}"
+                      f"  ERROR: {r.get('error')}", flush=True)
+            else:
+                print(f"[{done}/{len(tasks)}] {r['view']} {r['dataset']} {r['shader']} SH{r['sh_order']}"
+                      f"  alb_rmse={r.get('albedo_rmse'):.4f}  recon={r.get('train_recon_rmse'):.4f}"
+                      f"  ({r.get('status')})", flush=True)
 
     df = pd.DataFrame(rows)
-    if len(df):
+    ok = df[df["status"].isin(["ok", "cached"])] if "status" in df else df
+    if len(ok):
         print("\n=== mean over views ===")
-        print(df.groupby(["dataset", "sh_order"])[
+        print(ok.groupby(["dataset", "sh_order"])[
             ["albedo_rmse", "roughness_mae", "metallic_mae", "train_recon_rmse", "val_relight_rmse"]
         ].mean().round(4).to_string())
-        print(f"\nsummary -> {args.runs_root / 'decomposition_summary.csv'}")
+    n_err = int((df["status"] == "error").sum()) if "status" in df else 0
+    print(f"\nsummary -> {args.runs_root / 'decomposition_summary.csv'}"
+          + (f"   ({n_err} run(s) errored)" if n_err else ""))
 
 
 if __name__ == "__main__":
