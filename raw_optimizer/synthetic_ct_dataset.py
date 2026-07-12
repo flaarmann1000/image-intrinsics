@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from functools import partial
@@ -986,7 +987,6 @@ def _save_grad_step(
     data["loss_sparse"] = np.float32(losses[2])
     data["loss_white"]  = np.float32(losses[3])
     data["loss_tv"]     = np.float32(losses[4])
-
     with torch.no_grad():
         for name, p in named_params.items():
             raw_np  = p.data.detach().cpu().numpy()
@@ -1013,12 +1013,22 @@ def _save_grad_step(
     np.savez_compressed(grad_log_dir / f"step_{step:05d}.npz", **data)
 
 
+def _optimizer_name(cfg) -> str:
+    return str(cfg.get("optimizer", "LBFGS")).upper()
+
+
 def _make_optimizer(params, cfg):
-    if cfg["optimizer"] == "LBFGS":
+    name = _optimizer_name(cfg)
+    if name == "LM":
+        return None          # LM is not a torch.optim.Optimizer; see _build_lm
+    if name == "LBFGS":
         return torch.optim.LBFGS(
             params, lr=cfg["lr"],
             max_iter=cfg["lbfgs_max_iter"],
             line_search_fn="strong_wolfe",
+            tolerance_grad=0,
+            tolerance_change=0,
+
         )
     return torch.optim.Adam(params, lr=cfg["lr"])
 
@@ -1034,7 +1044,7 @@ def _make_scheduler(opt, cfg, n_steps):
         lr_schedule_step  : step-size in iters for "step" mode (default 50)
         lr_schedule_gamma : per-step decay factor for "step" mode (default 0.5)
     """
-    if cfg.get("optimizer") == "LBFGS":
+    if _optimizer_name(cfg) in ("LBFGS", "LM"):
         return None
     mode    = cfg.get("lr_schedule", "none")
     lr_0    = cfg["lr"]
@@ -1163,6 +1173,225 @@ def _structured_scalar_log(*, loss, l_d, l_s, l_w, l_tv, loss_ml, loss_mb,
     return d
 
 
+# ─────────────────────────────────────── LM residual helpers ─────────────────
+
+def _sqrt_res(x, eps=1e-12):
+    """Square-root trick: a non-negative loss term c_i is represented by the
+    residual sqrt(c_i), so sum_i r_i^2 == sum_i c_i exactly. eps keeps the
+    derivative of sqrt finite at 0."""
+    return (x + eps).sqrt()
+
+
+def _tv_residuals(x, scale):
+    """Residuals whose squared sum equals `scale * _tv(x)` (isotropic TV)."""
+    dh = x[..., 1:, :] - x[..., :-1, :]
+    dw = x[..., :, 1:] - x[..., :, :-1]
+    rh = _sqrt_res(scale * (dh**2 + 1e-8).sqrt() / dh.numel())
+    rw = _sqrt_res(scale * (dw**2 + 1e-8).sqrt() / dw.numel())
+    return torch.cat([rh.reshape(-1), rw.reshape(-1)])
+
+
+from raw_optimizer.levenberg_marquardt import pcg  # noqa: E402
+
+
+class _CGBackend:
+    """Matrix-free LM step: solve (J^T J + lam D) d = J^T r by preconditioned CG.
+
+    Never forms the P x P matrix (P = 1.3e6 at 512^2), so memory is O(P). Every
+    matvec is  J^T (J v)  evaluated with torch.func jvp/vjp, chunked over images
+    so the autograd graph only ever holds `img_chunk` images. Handles *all*
+    regularizers exactly, including the pixel-coupling ones (TV, sparse, white).
+
+    Preconditioner: block-Jacobi from the exact Gauss-Newton diagonal blocks —
+    a 5x5 block per pixel and a (3*n_sh)^2 block per image — which are cheap to
+    build from the per-pixel jacobians and dramatically cut the CG count.
+    """
+
+    def __init__(self, *, unflatten, data_res_fn, reg_res_fn, blocks_fn,
+                 pix_idx, sh_off, n_sh3, n_imgs, img_chunk, tol, maxiter, dev, dtype):
+        self.unflatten, self.data_res_fn, self.reg_res_fn = unflatten, data_res_fn, reg_res_fn
+        self.blocks_fn = blocks_fn
+        self.pix_idx, self.sh_off, self.n_sh3 = pix_idx, sh_off, n_sh3
+        self.n_imgs, self.img_chunk = n_imgs, max(1, int(img_chunk))
+        self.tol, self.maxiter = float(tol), int(maxiter)
+        self.dev, self.dtype = dev, dtype
+        self.last_cg_iters = 0
+
+    def _chunks(self, idx):
+        for s in range(0, idx.numel(), self.img_chunk):
+            yield idx[s:s + self.img_chunk]
+
+    def build(self, params, idx):
+        self._theta = torch.cat([p.detach().reshape(-1) for p in params])
+        self._idx = idx
+        rhs = torch.zeros_like(self._theta)
+        loss = 0.0
+        for sub in self._chunks(idx):
+            f = lambda th, _s=sub: self.data_res_fn(self.unflatten(th), _s)
+            r, vjp_fn = torch.func.vjp(f, self._theta)
+            rhs += vjp_fn(r)[0]
+            loss += float(r.pow(2).sum())
+            del vjp_fn
+        if self.reg_res_fn is not None:
+            fr = lambda th: self.reg_res_fn(self.unflatten(th))
+            r, vjp_fn = torch.func.vjp(fr, self._theta)
+            rhs += vjp_fn(r)[0]
+            loss += float(r.pow(2).sum())
+            del vjp_fn
+        self.rhs = rhs
+        self._A, self._C = self.blocks_fn(params, idx)     # (M,npix,npix), (K,n_sh3,n_sh3)
+        return loss
+
+    def _JtJv(self, v):
+        out = torch.zeros_like(v)
+        for sub in self._chunks(self._idx):
+            f = lambda th, _s=sub: self.data_res_fn(self.unflatten(th), _s)
+            _, Jv = torch.func.jvp(f, (self._theta,), (v,))
+            _, vjp_fn = torch.func.vjp(f, self._theta)
+            out += vjp_fn(Jv)[0]
+            del vjp_fn, Jv
+        if self.reg_res_fn is not None:
+            fr = lambda th: self.reg_res_fn(self.unflatten(th))
+            _, Jv = torch.func.jvp(fr, (self._theta,), (v,))
+            _, vjp_fn = torch.func.vjp(fr, self._theta)
+            out += vjp_fn(Jv)[0]
+            del vjp_fn, Jv
+        return out
+
+    def solve(self, damping, kind):
+        if kind == "fletcher":
+            d = torch.zeros_like(self.rhs)
+            if self.pix_idx is not None:
+                d[self.pix_idx.reshape(-1)] = torch.diagonal(
+                    self._A, dim1=-2, dim2=-1).reshape(-1)
+            if self._C is not None:
+                d[self.sh_off:self.sh_off + self._C.shape[0] * self.n_sh3] = torch.diagonal(
+                    self._C, dim1=-2, dim2=-1).reshape(-1)
+            d = d.clamp_min(1e-12)
+        else:
+            d = None
+
+        def matvec(v):
+            damp = damping * (d * v if d is not None else v)
+            return self._JtJv(v) + damp
+
+        # block-Jacobi preconditioner, refreshed for this damping value
+        eye_p = torch.eye(self._A.shape[-1], device=self.dev, dtype=self.dtype) \
+            if self.pix_idx is not None else None
+        Ainv = Cinv = None
+        if self.pix_idx is not None:
+            Ad = self._A + damping * (torch.diag_embed(torch.diagonal(self._A, dim1=-2, dim2=-1))
+                                      if kind == "fletcher" else eye_p)
+            Ainv = torch.linalg.inv(Ad + 1e-12 * eye_p)
+        if self._C is not None:
+            eye_s = torch.eye(self.n_sh3, device=self.dev, dtype=self.dtype)
+            Cd = self._C + damping * (torch.diag_embed(torch.diagonal(self._C, dim1=-2, dim2=-1))
+                                      if kind == "fletcher" else eye_s)
+            Cinv = torch.linalg.inv(Cd + 1e-12 * eye_s)
+
+        def precond(v):
+            out = v.clone()
+            if Ainv is not None:
+                vp = v[self.pix_idx]                                  # (M, npix)
+                out[self.pix_idx] = torch.einsum('mij,mj->mi', Ainv, vp)
+            if Cinv is not None:
+                n = Cinv.shape[0] * self.n_sh3
+                vs = v[self.sh_off:self.sh_off + n].view(-1, self.n_sh3)
+                out[self.sh_off:self.sh_off + n] = torch.einsum(
+                    'kij,kj->ki', Cinv, vs).reshape(-1)
+            return out
+
+        x, iters = pcg(matvec, self.rhs, precond, tol=self.tol, maxiter=self.maxiter)
+        self.last_cg_iters = iters
+        if not torch.isfinite(x).all():
+            return None
+        return x
+
+
+class _SchurBackend:
+    """Exact LM step via Schur complement over the per-pixel blocks.
+
+    Each pixel's 5 raw params touch only its own residuals, so the pixel Hessian A
+    is block-diagonal (5x5 per pixel) *provided no regularizer couples pixels*
+    (no TV / sparse / white). Eliminate it and solve the tiny reduced SH system:
+
+        S      = C - B^T (A+lam)^-1 B                  (K*3*n_sh squared, 29 MB at K=100)
+        d_sh   = S^-1 (g_s - B^T (A+lam)^-1 g_p)
+        d_pix  = (A+lam)^-1 (g_p - B d_sh)
+
+    Exact, and fast: the reduced system is only (K*3*n_sh)^2 (2700^2 at K=100).
+    The cost is memory for the cross block B, which is (M*npix) x (K*3*n_sh):
+    ~0.8 GB at 124^2/K=100, ~3.5 GB at 256^2, ~14 GB at 512^2. Above
+    `lm_schur_max_gb` this backend refuses to run and tells you to use 'cg'
+    (which is O(P) and is the auto choice when a pixel-coupling regularizer is on).
+    """
+
+    def __init__(self, *, blocks_full_fn, pix_idx, sh_off, n_sh3, dev, dtype):
+        self.blocks_full_fn = blocks_full_fn
+        self.pix_idx, self.sh_off, self.n_sh3 = pix_idx, sh_off, n_sh3
+        self.dev, self.dtype = dev, dtype
+        self.last_cg_iters = 0
+
+    def build(self, params, idx):
+        self._params, self._idx = params, idx
+        self._P = sum(p.numel() for p in params)
+        A, C, B, g_p, g_s, loss = self.blocks_full_fn(params, idx)
+        self._A, self._C, self._B, self._gp, self._gs = A, C, B, g_p, g_s
+        return loss
+
+    def solve(self, damping, kind):
+        A, C, B, gp, gs = self._A, self._C, self._B, self._gp, self._gs
+        M, npix = A.shape[0], A.shape[-1]
+        K = C.shape[0]
+        eye_p = torch.eye(npix, device=self.dev, dtype=self.dtype)
+        eye_s = torch.eye(self.n_sh3, device=self.dev, dtype=self.dtype)
+        if kind == "fletcher":
+            Ad = A + damping * torch.diag_embed(torch.diagonal(A, dim1=-2, dim2=-1))
+            Cd = C + damping * torch.diag_embed(torch.diagonal(C, dim1=-2, dim2=-1))
+        else:
+            Ad, Cd = A + damping * eye_p, C + damping * eye_s
+        try:
+            Ainv = torch.linalg.inv(Ad + 1e-12 * eye_p)                  # (M, npix, npix)
+        except RuntimeError:
+            return None
+        # T[p] = Ainv[p] @ B[p]  -> (M, npix, K*n_sh3)
+        T = torch.einsum('mij,mja->mia', Ainv, B)
+        S = torch.block_diag(*Cd) - torch.einsum('mia,mib->ab', B, T)    # (K*n_sh3, K*n_sh3)
+        rhs_s = gs.reshape(-1) - torch.einsum('mia,mi->a', T, gp)
+        try:
+            L = torch.linalg.cholesky(S)
+            d_sh = torch.cholesky_solve(rhs_s.unsqueeze(-1), L).squeeze(-1)
+        except RuntimeError:
+            return None
+        d_pix = torch.einsum('mij,mj->mi', Ainv,
+                             gp - torch.einsum('mia,a->mi', B, d_sh))    # (M, npix)
+        delta = torch.zeros(self._P, device=self.dev, dtype=self.dtype)
+        delta[self.pix_idx] = d_pix
+        delta[self.sh_off:self.sh_off + K * self.n_sh3] = d_sh
+        if not torch.isfinite(delta).all():
+            return None
+        return delta
+
+
+def _lm_cfg_kwargs(cfg) -> dict:
+    return dict(
+        solver            = cfg.get("lm_solver", "cholesky"),
+        damping           = cfg.get("lm_damping", "standard"),
+        damping_init      = float(cfg.get("lm_damping_init", 1e-3)),
+        damping_factor    = float(cfg.get("lm_damping_factor", 10.0)),
+        damping_min       = float(cfg.get("lm_damping_min", 1e-12)),
+        damping_max       = float(cfg.get("lm_damping_max", 1e10)),
+        adaptive_damping  = bool(cfg.get("lm_adaptive_damping", True)),
+        learning_rate     = float(cfg.get("lm_learning_rate", 1.0)),
+        attempts_per_step = int(cfg.get("lm_attempts_per_step", 5)),
+        jacobian_max_num_rows = int(cfg.get("lm_jacobian_max_num_rows", 0) or 0),        
+        jacobian_mode     = cfg.get("lm_jacobian_mode", "auto"),
+    )
+# cfg keys consumed directly by the linear backends (not by LevenbergMarquardt):
+#   lm_linear_solver auto|dense|cg|schur   lm_dense_max_params
+#   lm_image_chunk   lm_cg_tol   lm_cg_maxiter   lm_schur_max_gb
+
+
 # ─────────────────────────────────────── Phase 2: SH optimizer ───────────────
 
 def _optimize_ct_sh(
@@ -1184,6 +1413,7 @@ def _optimize_ct_sh(
     grad_log_dir: Optional[Path] = None,
     val_images:   Optional[list] = None,
     val_sh_coeffs: Optional[list] = None,
+    init_maps:    Optional[dict] = None,
 ) -> tuple:
     dev    = normals_hw.device
     ftype  = normals_hw.dtype
@@ -1294,6 +1524,54 @@ def _optimize_ct_sh(
         else:
             roughness_raw = _init_scalar(_gt_rou_scalar, H, W, tr_rou, dev=dev).to(ftype)
 
+    # ── warm-start overrides (natural-space maps from a previous phase) ────────
+    # init_maps["albedo"|"sh"|"metallic"|"roughness"] override the init in-place
+    # (values are natural, i.e. post-transform); used for curriculum chaining.
+    if init_maps is not None:
+        with torch.no_grad():
+            if init_maps.get("albedo") is not None:
+                _am = np.broadcast_to(np.asarray(init_maps["albedo"], np.float32), (H, W, 3)).copy()
+                albedo_param.data.copy_(_init_albedo(torch.from_numpy(_am).to(dev, ftype), tr_ab))
+            if init_maps.get("sh") is not None:
+                sh_coeffs.data.copy_(torch.stack([
+                    torch.from_numpy(_pad_sh(init_maps["sh"][k])).to(dev, ftype)
+                    for k in range(N_imgs)]))
+            if init_maps.get("metallic") is not None:
+                _mm = np.broadcast_to(np.asarray(init_maps["metallic"], np.float32), (H, W, 1)).copy()
+                metallic_raw.data.copy_(_init_map(_mm, tr_met, dev).to(ftype))
+            if init_maps.get("roughness") is not None:
+                _rm = np.broadcast_to(np.asarray(init_maps["roughness"], np.float32), (H, W, 1)).copy()
+                roughness_raw.data.copy_(_init_map(_rm, tr_rou, dev).to(ftype))
+
+    # ── coarse-to-fine lighting: freeze SH bands above `sh_active_order` ───────
+    # Keeps the full order-`sh_order` machinery but only lets the first (a+1)^2
+    # coefficients move (a = sh_active_order), by zeroing the higher bands at init
+    # and masking their gradient. Used for the "SH1 first, then SH2" curriculum.
+    _sh_active = cfg.get("sh_active_order")
+    if _sh_active is not None and "sh" in op:
+        _na = (int(_sh_active) + 1) ** 2
+        if _na < n_sh:
+            with torch.no_grad():
+                sh_coeffs[:, _na:, :] = 0.0
+            _sh_band_mask = torch.zeros(1, n_sh, 1, device=dev, dtype=ftype)
+            _sh_band_mask[:, :_na, :] = 1.0
+            sh_coeffs.register_hook(lambda g, _m=_sh_band_mask: g * _m)
+
+    # ── optional Gaussian noise on the metallic/roughness init (natural space) ─
+    _spec_noise = float(cfg.get("init_spec_noise_std", 0.0) or 0.0)
+    if _spec_noise > 0:
+        if cfg.get("init_seed") is not None:
+            torch.manual_seed(int(cfg["init_seed"]))
+        with torch.no_grad():
+            if "metallic" in op:
+                _mn = (_fwd_metallic(metallic_raw, tr_met)
+                       + torch.randn_like(metallic_raw) * _spec_noise).clamp(1e-4, 1 - 1e-4)
+                metallic_raw.data.copy_(_init_map(_mn.cpu().numpy(), tr_met, dev).to(ftype))
+            if "roughness" in op:
+                _rn = (_fwd_roughness(roughness_raw, tr_rou)
+                       + torch.randn_like(roughness_raw) * _spec_noise).clamp(1e-4, 1 - 1e-4)
+                roughness_raw.data.copy_(_init_map(_rn.cpu().numpy(), tr_rou, dev).to(ftype))
+
     def _get_met(): return _fwd_metallic(metallic_raw, tr_met)
     def _get_rou(): return _fwd_roughness(roughness_raw, tr_rou)
 
@@ -1317,6 +1595,341 @@ def _optimize_ct_sh(
 
     opt   = _make_optimizer(learnable, cfg) if learnable else None
     sched = _make_scheduler(opt, cfg, cfg["n_iter"]) if opt is not None else None
+
+    # ── Levenberg-Marquardt (alternative to LBFGS / Adam) ─────────────────────
+    # LM minimises sum(r^2) directly, so _forward's scalar loss is re-expressed as
+    # residuals: the data term exactly for L2 (r = recon-target), and every
+    # non-negative penalty (L1/huber data, TV, metallic L1/binarize) via the
+    # square-root trick. Scaling matches _forward, so sum(r^2) == its loss.
+    _lm = None
+    _lm_frac = [1.0]                       # chunk fraction, mirrors _forward's `frac`
+    if _optimizer_name(cfg) == "LM" and learnable:
+        from .levenberg_marquardt import LevenbergMarquardt
+        _lm_names = [n for n in ("albedo", "sh", "metallic", "roughness") if n in named_params]
+        _M = int(flat_mask.sum())
+        _denom = float(N_imgs * _M * 3)    # so sum(r^2) over ALL images == loss_data
+
+        def _lm_unpack(pt):
+            d = dict(zip(_lm_names, pt))
+            return (d.get("albedo",    albedo_param.detach()),
+                    d.get("sh",        sh_coeffs.detach()),
+                    d.get("metallic",  metallic_raw.detach()),
+                    d.get("roughness", roughness_raw.detach()))
+
+        def _lm_maps(pt):
+            ab_p, sh_c, met_r, rou_r = _lm_unpack(pt)
+            ab = _fwd_albedo(ab_p, tr_ab)
+            return (ab, ab.reshape(-1, 3)[flat_mask], sh_c,
+                    _fwd_metallic(met_r, tr_met), _fwd_roughness(rou_r, tr_rou))
+
+        def _lm_data_residuals(pt, idx):
+            ab_hw, ab_m, sh_c, met_hw, rou_hw = _lm_maps(pt)
+            met_m = met_hw.reshape(-1, 1)[flat_mask]
+            rou_m = rou_hw.reshape(-1, 1)[flat_mask]
+            rec = torch.stack([
+                shade_ct_sh(view_m, N_m, ab_m, sh_c[k], met_m, rou_m, lut=lut,
+                            diffuse_fresnel=_diffuse_fresnel)
+                for k in idx.tolist()])                       # (n, M, 3)
+            resid = rec - _imgs_m[idx]
+            if cfg["loss"] == "L2":
+                return (resid / math.sqrt(_denom)).reshape(-1)
+            if cfg["loss"] == "L1":
+                return _sqrt_res(resid.abs() / _denom).reshape(-1)
+            _d = cfg.get("huber_delta", 0.05)
+            _a = resid.abs()
+            hub = torch.where(_a <= _d, 0.5 * resid**2, _d * (_a - 0.5 * _d))
+            return _sqrt_res(hub / _denom).reshape(-1)
+
+        def _lm_reg_residuals(pt):
+            ab_hw, _, _, met_hw, rou_hw = _lm_maps(pt)
+            fr = _lm_frac[0]
+            out = []
+            if cfg["lambda_sparse"]:
+                out.append(_tv_residuals(ab_hw.permute(2, 0, 1), fr * cfg["lambda_sparse"]))
+            if cfg["lambda_tv"]:
+                s = fr * cfg["lambda_tv"]
+                out.append(_tv_residuals(ab_hw.permute(2, 0, 1), s))
+                out.append(_tv_residuals(met_hw.permute(2, 0, 1), s))
+                out.append(_tv_residuals(rou_hw.permute(2, 0, 1), s))
+            if cfg["lambda_white"]:                            # already quadratic
+                out.append((math.sqrt(fr * cfg["lambda_white"])
+                            * (ab_hw.mean() - 0.5)).reshape(1))
+            _m = met_hw.reshape(-1, 1)[flat_mask]
+            if cfg.get("lambda_metallic_l1", 0.0):
+                out.append(_sqrt_res(fr * cfg["lambda_metallic_l1"] * _m.abs() / _m.numel()).reshape(-1))
+            if cfg.get("lambda_metallic_binarize", 0.0):
+                out.append(_sqrt_res(fr * cfg["lambda_metallic_binarize"]
+                                     * (_m * (1.0 - _m)).clamp(min=0) / _m.numel()).reshape(-1))
+            if not out:
+                return ab_hw.new_zeros(0)
+            return torch.cat(out)
+
+        # ── block-sparse (structured) normal equations ────────────────────────
+        # The data residual r[k,p,:] depends ONLY on pixel p's own 5 raw params
+        # (albedo rgb, metallic, roughness) and on image k's SH coeffs. So J is
+        # block-sparse and a dense jacrev/jacfwd wastes ~99.9% of its work. Build
+        # J^T J directly from per-pixel blocks:
+        #     H_pp[p]   = sum_k  Jp[k,p]^T Jp[k,p]        (npix x npix)
+        #     H_ss[k]   = sum_p  Js[k,p]^T Js[k,p]        (3*n_sh x 3*n_sh)
+        #     H_ps[p,k] =        Jp[k,p]^T Js[k,p]        (npix x 3*n_sh)
+        # Each per-pixel jacobian costs only 3 VJPs (output dim 3), vmapped over
+        # pixels — independent of the residual count.
+        # Shared layout + per-pixel jacobian (used by the structured-dense, CG and
+        # Schur paths alike).
+        _gidx = torch.nonzero(flat_mask, as_tuple=False).squeeze(-1)   # grid idx of masked px
+        _nsh  = sh_coeffs.shape[1]
+        _nsh3 = _nsh * 3
+        _inv_sd = 1.0 / math.sqrt(_denom)
+        _offs, _o = {}, 0
+        for _nm, _par in zip(_lm_names, learnable):   # NB: don't shadow the _t() helper
+            _offs[_nm] = _o
+            _o += _par.numel()
+        _P = _o
+        _cols, _local = [], []
+        if "albedo" in _offs:
+            _cols.append(_offs["albedo"] + _gidx[:, None] * 3
+                         + torch.arange(3, device=dev, dtype=torch.long))
+            _local += [0, 1, 2]
+        if "metallic" in _offs:
+            _cols.append((_offs["metallic"] + _gidx)[:, None]); _local += [3]
+        if "roughness" in _offs:
+            _cols.append((_offs["roughness"] + _gidx)[:, None]); _local += [4]
+        _pix_idx = torch.cat(_cols, 1) if _cols else None          # (M, npix)
+        _local_t = torch.tensor(_local, device=dev, dtype=torch.long)
+        _npix = len(_local)
+        _has_sh = "sh" in _offs
+        _ar_nsh3 = torch.arange(_nsh3, device=dev, dtype=torch.long)
+        _lm_shapes = [tuple(p.shape) for p in learnable]
+        _lm_numels = [p.numel() for p in learnable]
+
+        def _lm_unflat(theta):
+            out, i = [], 0
+            for shp, n in zip(_lm_shapes, _lm_numels):
+                out.append(theta[i:i + n].view(shp)); i += n
+            return tuple(out)
+
+        def _px_fn(ab_r, met_r, rou_r, sh_k, v, n):
+            ab = _fwd_albedo(ab_r, tr_ab)
+            me = _fwd_metallic(met_r, tr_met)
+            ro = _fwd_roughness(rou_r, tr_rou)
+            return shade_ct_sh(v[None], n[None], ab[None], sh_k, me[None], ro[None],
+                               lut=lut, diffuse_fresnel=_diffuse_fresnel)[0] * _inv_sd
+
+        _jac_px = torch.func.vmap(
+            torch.func.jacrev(_px_fn, argnums=(0, 1, 2, 3)),
+            in_dims=(0, 0, 0, None, 0, 0))
+
+        def _lm_pixsh_maps(pt):
+            d = dict(zip(_lm_names, pt))
+            return (d.get("albedo",    albedo_param.detach()).reshape(-1, 3)[flat_mask],
+                    d.get("sh",        sh_coeffs.detach()),
+                    d.get("metallic",  metallic_raw.detach()).reshape(-1, 1)[flat_mask],
+                    d.get("roughness", roughness_raw.detach()).reshape(-1, 1)[flat_mask])
+
+        def _lm_jac_and_resid(pt, k):
+            """Per-pixel jacobian blocks + residual for one image."""
+            ab_m, sh_c, me_m, ro_m = _lm_pixsh_maps(pt)
+            with torch.no_grad():
+                rec = shade_ct_sh(view_m, N_m, _fwd_albedo(ab_m, tr_ab), sh_c[k],
+                                  _fwd_metallic(me_m, tr_met), _fwd_roughness(ro_m, tr_rou),
+                                  lut=lut, diffuse_fresnel=_diffuse_fresnel)
+                r_k = (rec - _imgs_m[k]) * _inv_sd                       # (M, 3)
+            Ja, Jm, Jr, Js = _jac_px(ab_m, me_m, ro_m, sh_c[k], view_m, N_m)
+            Jpix = torch.cat([Ja, Jm, Jr], dim=-1)[..., _local_t]        # (M, 3, npix)
+            return Jpix, Js.reshape(_gidx.numel(), 3, _nsh3), r_k
+
+        def _lm_blocks(pt, idx):
+            """Gauss-Newton diagonal blocks only: A (M,npix,npix), C (K,n_sh3,n_sh3).
+            Used as the CG block-Jacobi preconditioner (data term only — a
+            preconditioner never needs to be exact)."""
+            A = torch.zeros(_gidx.numel(), _npix, _npix, device=dev, dtype=ftype) if _npix else None
+            C = torch.zeros(len(idx), _nsh3, _nsh3, device=dev, dtype=ftype) if _has_sh else None
+            for j, k in enumerate(idx.tolist()):
+                Jpix, Jsf, _ = _lm_jac_and_resid(pt, k)
+                if _npix:
+                    A += torch.einsum('mci,mcj->mij', Jpix, Jpix)
+                if _has_sh:
+                    C[j] = torch.einsum('mca,mcb->ab', Jsf, Jsf)
+            return A, C
+
+        def _reg_px_fn(ab_r, met_r, rou_r):
+            """Per-pixel regularizer residuals — only the pixel-SEPARABLE ones, which
+            is all Schur permits. Squared-summed they reproduce the scalar terms."""
+            me = _fwd_metallic(met_r, tr_met)
+            fr = _lm_frac[0]
+            out = []
+            if cfg.get("lambda_metallic_l1", 0.0):
+                out.append(_sqrt_res(fr * cfg["lambda_metallic_l1"] * me.abs() / _M))
+            if cfg.get("lambda_metallic_binarize", 0.0):
+                out.append(_sqrt_res(fr * cfg["lambda_metallic_binarize"]
+                                     * (me * (1.0 - me)).clamp(min=0) / _M))
+            if not out:
+                return ab_r.new_zeros(0)
+            return torch.cat(out)
+
+        _jac_reg_px = torch.func.vmap(torch.func.jacrev(_reg_px_fn, argnums=(0, 1, 2)))
+        _has_px_reg = bool(cfg.get("lambda_metallic_l1", 0.0)
+                           or cfg.get("lambda_metallic_binarize", 0.0))
+
+        def _lm_blocks_full(pt, idx):
+            """A, C, B, g_p, g_s, loss  — everything the Schur complement needs.
+            B is (M, npix, K*n_sh3): the memory bound of this backend.
+            Includes the pixel-separable regularizers (they add to A and g_p only)."""
+            K = len(idx)
+            nb = _gidx.numel() * _npix * K * _nsh3 * (8 if ftype == torch.float64 else 4)
+            cap = float(cfg.get("lm_schur_max_gb", 4.0)) * 1e9
+            if nb > cap:
+                raise MemoryError(
+                    f"Schur cross-block B needs {nb/1e9:.1f} GB (> lm_schur_max_gb="
+                    f"{cap/1e9:.1f}). Use lm_linear_solver='cg' (O(P) memory), or "
+                    f"lower the light count / resolution.")
+            A = torch.zeros(_gidx.numel(), _npix, _npix, device=dev, dtype=ftype)
+            C = torch.zeros(K, _nsh3, _nsh3, device=dev, dtype=ftype)
+            B = torch.zeros(_gidx.numel(), _npix, K * _nsh3, device=dev, dtype=ftype)
+            gp = torch.zeros(_gidx.numel(), _npix, device=dev, dtype=ftype)
+            gs = torch.zeros(K, _nsh3, device=dev, dtype=ftype)
+            loss = 0.0
+            for j, k in enumerate(idx.tolist()):
+                Jpix, Jsf, r_k = _lm_jac_and_resid(pt, k)
+                loss += float(r_k.pow(2).sum())
+                A  += torch.einsum('mci,mcj->mij', Jpix, Jpix)
+                gp += torch.einsum('mci,mc->mi',  Jpix, r_k)
+                C[j] = torch.einsum('mca,mcb->ab', Jsf, Jsf)
+                gs[j] = torch.einsum('mca,mc->a',  Jsf, r_k)
+                B[:, :, j * _nsh3:(j + 1) * _nsh3] = torch.einsum('mci,mca->mia', Jpix, Jsf)
+
+            # Pixel-separable regularizers: they touch only each pixel's own params,
+            # so they add to A and g_p (never to B or C). Omitting them would make
+            # the Schur step solve a DIFFERENT system than the loss LM accepts on.
+            if _has_px_reg:
+                ab_m, _, me_m, ro_m = _lm_pixsh_maps(pt)
+                with torch.no_grad():
+                    r_reg = torch.func.vmap(_reg_px_fn)(ab_m, me_m, ro_m)       # (M, nr)
+                    loss += float(r_reg.pow(2).sum())
+                Ra, Rm, Rr = _jac_reg_px(ab_m, me_m, ro_m)
+                Jreg = torch.cat([Ra, Rm, Rr], dim=-1)[..., _local_t]           # (M, nr, npix)
+                A  += torch.einsum('mri,mrj->mij', Jreg, Jreg)
+                gp += torch.einsum('mri,mr->mi',  Jreg, r_reg)
+            return A, C, B, gp, gs, loss
+
+        # ── block-sparse (structured) DENSE normal equations ──────────────────
+        _lm_structured = bool(cfg.get("lm_structured", False))
+        _structured_gn = None
+        if _lm_structured:
+
+            def _structured_gn(pt, idx):
+                d = dict(zip(_lm_names, pt))
+                ab_p  = d.get("albedo",    albedo_param.detach())
+                sh_c  = d.get("sh",        sh_coeffs.detach())
+                met_r = d.get("metallic",  metallic_raw.detach())
+                rou_r = d.get("roughness", roughness_raw.detach())
+                ab_m = ab_p.reshape(-1, 3)[flat_mask]
+                me_m = met_r.reshape(-1, 1)[flat_mask]
+                ro_m = rou_r.reshape(-1, 1)[flat_mask]
+                ab_f = _fwd_albedo(ab_m, tr_ab)
+                me_f = _fwd_metallic(me_m, tr_met)
+                ro_f = _fwd_roughness(ro_m, tr_rou)
+
+                JJ  = torch.zeros(_P, _P, device=dev, dtype=ftype)
+                rhs = torch.zeros(_P, device=dev, dtype=ftype)
+                flat = JJ.view(-1)
+                loss = 0.0
+                Hpp = gp = None
+                for k in idx.tolist():
+                    with torch.no_grad():
+                        rec = shade_ct_sh(view_m, N_m, ab_f, sh_c[k], me_f, ro_f,
+                                          lut=lut, diffuse_fresnel=_diffuse_fresnel)
+                        r_k = (rec - _imgs_m[k]) * _inv_sd                  # (M, 3)
+                        loss += float(r_k.pow(2).sum())
+                    Ja, Jm, Jr, Js = _jac_px(ab_m, me_m, ro_m, sh_c[k], view_m, N_m)
+                    Jpix = torch.cat([Ja, Jm, Jr], dim=-1)[..., _local_t]   # (M, 3, npix)
+                    Jsf  = Js.reshape(_gidx.numel(), 3, _nsh3)              # (M, 3, 3*n_sh)
+                    if _npix:
+                        _hpp = torch.einsum('mci,mcj->mij', Jpix, Jpix)
+                        _gp  = torch.einsum('mci,mc->mi',  Jpix, r_k)
+                        Hpp = _hpp if Hpp is None else Hpp + _hpp
+                        gp  = _gp  if gp  is None else gp  + _gp
+                    if _has_sh:
+                        sh_i = _offs["sh"] + k * _nsh3 + _ar_nsh3           # (3*n_sh,)
+                        _hss = torch.einsum('mca,mcb->ab', Jsf, Jsf)
+                        _gs  = torch.einsum('mca,mc->a',  Jsf, r_k)
+                        flat.index_add_(0, (sh_i[:, None] * _P + sh_i[None, :]).reshape(-1),
+                                        _hss.reshape(-1))
+                        rhs.index_add_(0, sh_i, _gs)
+                        if _npix:
+                            _hps = torch.einsum('mci,mca->mia', Jpix, Jsf)  # (M, npix, 3*n_sh)
+                            rws = _pix_idx[:, :, None].expand(-1, -1, _nsh3)
+                            cls = sh_i.view(1, 1, -1).expand(rws.shape[0], _npix, -1)
+                            flat.index_add_(0, (rws * _P + cls).reshape(-1), _hps.reshape(-1))
+                            flat.index_add_(0, (cls * _P + rws).reshape(-1), _hps.reshape(-1))
+                if _npix:
+                    rws = _pix_idx[:, :, None].expand(-1, -1, _npix)
+                    cls = _pix_idx[:, None, :].expand(-1, _npix, -1)
+                    flat.index_add_(0, (rws * _P + cls).reshape(-1), Hpp.reshape(-1))
+                    rhs.index_add_(0, _pix_idx.reshape(-1), gp.reshape(-1))
+                return JJ, rhs, loss
+
+        _has_reg = any(cfg.get(k, 0.0) for k in
+                       ("lambda_sparse", "lambda_tv", "lambda_white",
+                        "lambda_metallic_l1", "lambda_metallic_binarize"))
+        # Regularizers that couple DIFFERENT pixels: they destroy the block-diagonal
+        # pixel Hessian that the exact Schur complement relies on.
+        _pix_coupled = any(cfg.get(k, 0.0) for k in
+                           ("lambda_tv", "lambda_sparse", "lambda_white"))
+
+        # ── choose the linear solver ──────────────────────────────────────────
+        # P = M*5 + K*3*n_sh. A dense P x P matrix is 25 GB at 124^2 and 6.9 TB at
+        # 512^2, so above ~20k params we must never form it:
+        #   schur : exact, eliminates the block-diagonal per-pixel 5x5 blocks and
+        #           solves the tiny reduced SH system. Needs pixel-separable regs.
+        #   cg    : matrix-free preconditioned CG. O(P) memory, keeps every
+        #           regularizer, inner solve is inexact (truncated Newton).
+        _lin = str(cfg.get("lm_linear_solver", "auto")).lower()
+        if _lin == "auto":
+            if _P <= int(cfg.get("lm_dense_max_params", 20000)):
+                _lin = "dense"
+            else:
+                _lin = "cg" if _pix_coupled else "schur"
+        if _lin == "schur" and _pix_coupled:
+            raise ValueError(
+                "lm_linear_solver='schur' needs pixel-separable regularizers: set "
+                "lambda_tv=lambda_sparse=lambda_white=0 (metallic_l1/binarize are fine), "
+                "or use lm_linear_solver='cg'.")
+        if _lin == "dense" and _P > 40000:
+            print(f"  [LM] WARNING: dense solver with P={_P} -> JtJ is "
+                  f"{_P**2*(8 if ftype==torch.float64 else 4)/1e9:.1f} GB")
+
+        _lm_backend = None
+        if _lin == "cg":
+            _lm_backend = _CGBackend(
+                unflatten=_lm_unflat, data_res_fn=_lm_data_residuals,
+                reg_res_fn=_lm_reg_residuals if _has_reg else None,
+                blocks_fn=_lm_blocks, pix_idx=_pix_idx,
+                sh_off=_offs.get("sh", 0), n_sh3=_nsh3, n_imgs=N_imgs,
+                img_chunk=int(cfg.get("lm_image_chunk", 8)),
+                tol=float(cfg.get("lm_cg_tol", 1e-4)),
+                maxiter=int(cfg.get("lm_cg_maxiter", 50)),
+                dev=dev, dtype=ftype)
+        elif _lin == "schur":
+            _lm_backend = _SchurBackend(
+                blocks_full_fn=_lm_blocks_full, pix_idx=_pix_idx,
+                sh_off=_offs.get("sh", 0), n_sh3=_nsh3, dev=dev, dtype=ftype)
+
+        _lm = LevenbergMarquardt(
+            learnable, _lm_data_residuals, n_samples=N_imgs,
+            reg_residuals_fn=_lm_reg_residuals if _has_reg else None,
+            structured_gn_fn=_structured_gn if _lin == "dense" else None,
+            linear_backend=_lm_backend,
+            **_lm_cfg_kwargs(cfg))
+        _lm_bs = int(cfg.get("lm_batch_size", 0) or 0)
+        _lm_full = not (0 < _lm_bs < N_imgs)
+        _jac_desc = ('block-sparse' if (_lin == 'dense' and _lm_structured)
+                     else ('blocks+autograd' if _lin in ('cg', 'schur')
+                           else cfg.get('lm_jacobian_mode', 'auto')))
+        print(f"  [LM] P={_lm.n_params}  samples={N_imgs}  "
+              f"{'full batch' if _lm_full else f'batch={_lm_bs}'}  "
+              f"linear={_lin}  damping={cfg.get('lm_damping','standard')}  jacobian={_jac_desc}")
+
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev, dtype=ftype)]
     _loss_mb = [torch.zeros((), device=dev, dtype=ftype)]
@@ -1521,10 +2134,21 @@ def _optimize_ct_sh(
     if _use_img_batch and log_gradients:
         print("  [img_batch] disabled: incompatible with log_gradients")
         _use_img_batch = False
+    _lm_info = {}
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
         _step[0] = i
-        if opt is not None:
+        if _lm is not None:
+            # full batch (idx=None) or a random image mini-batch of `lm_batch_size`
+            if _lm_full:
+                _idx, _lm_frac[0] = None, 1.0
+            else:
+                _idx = torch.randperm(N_imgs, device=dev)[:_lm_bs]
+                _lm_frac[0] = _lm_bs / N_imgs
+            _lm_info = _lm.step(_idx)
+            with torch.no_grad():                       # report the full-batch loss
+                loss, l_d, l_s, l_w, l_tv = _forward()
+        elif opt is not None:
             if log_gradients:
                 pre_raw = {n: p.data.clone() for n, p in named_params.items()}
             if _use_img_batch:
@@ -1573,6 +2197,10 @@ def _optimize_ct_sh(
                     recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
                     lr=opt.param_groups[0]["lr"] if opt is not None else 0.0)
                 _payload["elapsed_s"] = elapsed
+                if _lm_info:
+                    _payload["lm/damping"]  = _lm_info["damping"]
+                    _payload["lm/accepted"] = float(_lm_info["accepted"])
+                    _payload["lm/attempts"] = _lm_info["attempts"]
                 wandb_run.log(_payload, step=i)
     total_time = time.perf_counter() - t0
 
@@ -1734,6 +2362,13 @@ def _optimize_ct_env(
     sched = _make_scheduler(opt, cfg, cfg["n_iter"]) if opt is not None else None
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev, dtype=ftype)]
+    if _optimizer_name(cfg) == "LM":
+        # Each env map is 2048x3 free params PER IMAGE, so P explodes (>600k at 100
+        # images) and J^T J is not formable. Use LBFGS/Adam for ct_env, or ct_sh.
+        raise NotImplementedError(
+            "optimizer='LM' is only supported for shader='ct_sh' (ct_env's per-image "
+            "env-map parameters make the P x P normal equations intractable)")
+
     _loss_mb = [torch.zeros((), device=dev, dtype=ftype)]
     _recon_rmse = [0.0]           # per-image recon RMSE/MAE, stashed by _forward
     _recon_mae  = [0.0]

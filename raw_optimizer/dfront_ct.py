@@ -116,7 +116,8 @@ def load_exr(path: Path) -> np.ndarray:
 # ─────────────────────────────────────── data loading ───────────────────────
 
 
-def load_scene(scene_dir: Path, no_shadow: bool = False, use_npy: bool = False) -> dict:
+def load_scene(scene_dir: Path, no_shadow: bool = False, use_npy: bool = False,
+               gt_npy: bool = False) -> dict:
     """Load all maps from a 3D-Front scene directory.
 
     Reads config.json (if present) to determine the image variant:
@@ -137,6 +138,10 @@ def load_scene(scene_dir: Path, no_shadow: bool = False, use_npy: bool = False) 
     no_shadow: if True and light_NNN_no_shadow.png files exist, load those
                instead of the standard light_NNN.png renders.
                (Ignored for the "exr" variant.)
+
+    gt_npy: if True, load the GT intrinsic maps from the lossless float32
+            {normals,albedo,roughness,metallic}.npy copies (when all present)
+            instead of the truncated 8/16-bit PNGs; falls back to PNG otherwise.
     """
     scene_dir = Path(scene_dir)
 
@@ -148,25 +153,48 @@ def load_scene(scene_dir: Path, no_shadow: bool = False, use_npy: bool = False) 
             _ds_cfg = json.load(fh)
         variant = _ds_cfg.get("variant", "linear")
 
-    # Normals: uint8 → float [-1,1], then renormalize
-    norm_raw = np.array(Image.open(scene_dir / "normals.png"), dtype=np.float32)
-    normals = norm_raw / 255.0 * 2.0 - 1.0
-    nlen = np.linalg.norm(normals, axis=-1, keepdims=True).clip(1e-6, None)
-    normals = normals / nlen  # (H, W, 3), unit length
+    # ── GT intrinsic maps ────────────────────────────────────────────────────
+    # gt_npy: load the lossless float32 .npy copies written alongside the PNGs
+    # (normals/albedo/roughness/metallic .npy) instead of the truncated 8/16-bit
+    # PNGs — but only if all four are present, otherwise fall back to PNG.
+    _gt_npy_ok = gt_npy and all(
+        (scene_dir / f"{m}.npy").exists()
+        for m in ("normals", "albedo", "roughness", "metallic")
+    )
+    if _gt_npy_ok:
+        # Normals: float32, background stored as all-zero → mask from norm > 0
+        normals = np.load(scene_dir / "normals.npy").astype(np.float32)
+        mask = (np.linalg.norm(normals, axis=-1) > 0)  # (H, W) bool
+        nlen = np.linalg.norm(normals, axis=-1, keepdims=True).clip(1e-6, None)
+        normals = normals / nlen  # (H, W, 3), unit length
 
-    # Mask: pixels where the raw normal is non-zero (background is all-black)
-    mask = (norm_raw.sum(axis=-1) > 0)  # (H, W) bool
+        albedo = np.load(scene_dir / "albedo.npy").astype(np.float32)[:, :, :3]
 
-    # Albedo: uint8 → float [0,1]
-    albedo = np.array(Image.open(scene_dir / "albedo.png"), dtype=np.float32)
-    albedo = albedo[:, :, :3] / 255.0
+        rough = np.load(scene_dir / "roughness.npy").astype(np.float32)
+        rough = rough if rough.ndim == 3 else rough[:, :, None]  # (H, W, 1)
 
-    # Roughness / metallic: uint16 → float [0,1]
-    rough = np.array(Image.open(scene_dir / "roughness.png"), dtype=np.float32)
-    rough = (rough / 65535.0)[:, :, None]  # (H, W, 1)
+        metal = np.load(scene_dir / "metallic.npy").astype(np.float32)
+        metal = metal if metal.ndim == 3 else metal[:, :, None]  # (H, W, 1)
+    else:
+        # Normals: uint8 → float [-1,1], then renormalize
+        norm_raw = np.array(Image.open(scene_dir / "normals.png"), dtype=np.float32)
+        normals = norm_raw / 255.0 * 2.0 - 1.0
+        nlen = np.linalg.norm(normals, axis=-1, keepdims=True).clip(1e-6, None)
+        normals = normals / nlen  # (H, W, 3), unit length
 
-    metal = np.array(Image.open(scene_dir / "metallic.png"), dtype=np.float32)
-    metal = (metal / 65535.0)[:, :, None]  # (H, W, 1)
+        # Mask: pixels where the raw normal is non-zero (background is all-black)
+        mask = (norm_raw.sum(axis=-1) > 0)  # (H, W) bool
+
+        # Albedo: uint8 → float [0,1]
+        albedo = np.array(Image.open(scene_dir / "albedo.png"), dtype=np.float32)
+        albedo = albedo[:, :, :3] / 255.0
+
+        # Roughness / metallic: uint16 → float [0,1]
+        rough = np.array(Image.open(scene_dir / "roughness.png"), dtype=np.float32)
+        rough = (rough / 65535.0)[:, :, None]  # (H, W, 1)
+
+        metal = np.array(Image.open(scene_dir / "metallic.png"), dtype=np.float32)
+        metal = (metal / 65535.0)[:, :, None]  # (H, W, 1)
 
     # Rendered images
     if variant == "exr":
@@ -759,8 +787,16 @@ _RUN_NAME_SKIP = frozenset({
     "shininess_min", "shininess_max",
     # meta-params handled specially by make_run_name / decompose_scene
     "shader", "no_shadow", "init_from_gt", "freeze_intrinsics",
-    "use_npy", "double", "opt_params", "n_images",
+    "use_npy", "gt_npy", "double", "opt_params", "n_images",
     "log_gt_recon_images",
+    # LM tuning knobs: keep them out of run names (lm_batch_size stays in — it is
+    # the semantically interesting one: full batch vs mini-batch).
+    "lm_solver", "lm_damping_init", "lm_damping_factor", "lm_damping_min",
+    "lm_damping_max", "lm_adaptive_damping", "lm_learning_rate",
+    "lm_attempts_per_step", "lm_jacobian_max_num_rows", "lm_jacobian_mode",
+    "lm_structured", "lm_dense_max_params", "lm_image_chunk", "lm_cg_tol",
+    "lm_cg_maxiter", "lm_schur_max_gb",
+    "curriculum", "init_spec_noise_std", "init_seed",
 })
 
 
@@ -780,6 +816,7 @@ def make_run_name(
     freeze_intrinsics = cfg.get("freeze_intrinsics", False)
     init_from_gt      = cfg.get("init_from_gt",      False)
     use_npy           = cfg.get("use_npy",            False)
+    gt_npy            = cfg.get("gt_npy",             False)
     double            = cfg.get("double",             False)
     n_images          = cfg.get("n_images",           None)
     opt_params_raw    = cfg.get("opt_params",         None)
@@ -810,11 +847,25 @@ def make_run_name(
         + ("_freeze_intrinsics" if freeze_intrinsics   else "")
         + ("_init_from_gt"      if init_from_gt        else "")
         + ("_npy"               if use_npy             else "")
+        + ("_gtnpy"             if gt_npy              else "")
         + ("_f64"               if double              else "")
         + (f"_N{n_images}"      if n_images is not None else "")
         + opt_tag
         + (f"_{override_tags}"  if override_tags       else "")
     )
+
+
+def _subsample_mask(mask_hw: torch.Tensor, frac: float, seed: int = 0) -> torch.Tensor:
+    """A boolean mask keeping a random `frac` of the foreground pixels (for the
+    'fit lighting on a pixel subset first' curriculum phase)."""
+    flat = mask_hw.reshape(-1)
+    idx = torch.nonzero(flat, as_tuple=False).squeeze(-1)
+    n_keep = max(1, int(round(frac * idx.numel())))
+    g = torch.Generator(device="cpu").manual_seed(int(seed))
+    keep = idx[torch.randperm(idx.numel(), generator=g)[:n_keep].to(idx.device)]
+    out = torch.zeros_like(flat)
+    out[keep] = True
+    return out.reshape(mask_hw.shape)
 
 
 def decompose_scene(
@@ -830,6 +881,7 @@ def decompose_scene(
     opt_params: Optional[frozenset] = None,
     log_gradients: bool = False,
     use_npy: bool = False,
+    gt_npy: bool = False,
     double: bool = False,
     n_images: Optional[int] = None,
     device: str = "cuda",
@@ -859,6 +911,7 @@ def decompose_scene(
     init_from_gt      = cfg_overrides.pop("init_from_gt",      init_from_gt)
     freeze_intrinsics = cfg_overrides.pop("freeze_intrinsics", freeze_intrinsics)
     use_npy           = cfg_overrides.pop("use_npy",           use_npy)
+    gt_npy            = cfg_overrides.pop("gt_npy",            gt_npy)
     double            = cfg_overrides.pop("double",            double)
     n_images          = cfg_overrides.pop("n_images",          n_images)
 
@@ -872,7 +925,7 @@ def decompose_scene(
 
     torch_dtype = torch.float64 if double else torch.float32
 
-    scene = load_scene(scene_dir, no_shadow=no_shadow, use_npy=use_npy)
+    scene = load_scene(scene_dir, no_shadow=no_shadow, use_npy=use_npy, gt_npy=gt_npy)
 
     # ── optional strided downsampling (nearest: GT maps/mask stay crisp) ──────
     _ds = int(cfg.get("downsample", 1) or 1)
@@ -940,7 +993,7 @@ def decompose_scene(
     # Build a merged dict that make_run_name reads (meta-params + optimizer overrides)
     _meta = dict(
         shader=shader, no_shadow=no_shadow, init_from_gt=init_from_gt,
-        freeze_intrinsics=freeze_intrinsics, use_npy=use_npy, double=double,
+        freeze_intrinsics=freeze_intrinsics, use_npy=use_npy, gt_npy=gt_npy, double=double,
     )
     if n_images is not None:
         _meta["n_images"] = n_images
@@ -960,6 +1013,8 @@ def decompose_scene(
         wandb_tags.append("noshadow")
     if use_npy:
         wandb_tags.append("npy")
+    if gt_npy:
+        wandb_tags.append("gtnpy")
     if double:
         wandb_tags.append("f64")
     if opt_params is not None:
@@ -1007,6 +1062,37 @@ def decompose_scene(
         _eff_op_sh  = None
         _eff_op_env = None
 
+    # ── curriculum warm-start (ct_sh only) ────────────────────────────────────
+    # cfg["curriculum"] = list of phase dicts, each {n_iter, opt_params?, sh_order?,
+    # pixel_frac?}. Each phase optimizes a sub-problem and hands its natural-space
+    # maps to the next via init_maps; the main optimize below warm-starts from the
+    # last phase. Lets us freeze groups / go SH1->SH2 / fit lighting on a pixel
+    # subset first, all within the existing metrics + artifact pipeline.
+    _curr_init_maps = None
+    _curriculum = cfg.pop("curriculum", None)
+    if shader == "ct_sh" and _curriculum:
+        _seed0 = int(cfg.get("init_seed", 0) or 0)
+        for _pi, _ph in enumerate(_curriculum):
+            _pcfg = dict(cfg)
+            _pcfg["n_iter"]   = int(_ph.get("n_iter", 60))
+            _pcfg["sh_order"] = int(_ph.get("sh_order", cfg.get("sh_order", 2)))
+            _pmask = mask_hw
+            if _ph.get("pixel_frac"):
+                _pmask = _subsample_mask(mask_hw, float(_ph["pixel_frac"]), seed=_seed0 + _pi)
+            _pop = frozenset(_ph["opt_params"]) if _ph.get("opt_params") else _eff_op_sh
+            print(f"  [curriculum {_pi + 1}/{len(_curriculum)}] "
+                  f"opt={sorted(_pop) if _pop else 'all'} sh{_pcfg['sh_order']} "
+                  f"n_iter={_pcfg['n_iter']}"
+                  + (f" pixels={_ph['pixel_frac']:.0%}" if _ph.get("pixel_frac") else ""),
+                  flush=True)
+            _a, _s, _m, _b, *_ = _optimize_ct_sh(
+                images, normals_hw, frag_pos_hw, _pmask, cam_pos,
+                gt_metallic, gt_roughness, _pcfg,
+                wandb_run=None, gt_sh_coeffs=gt_sh_coeffs, gt_albedo=gt_albedo,
+                opt_params=_pop, init_from_gt=init_from_gt,
+                val_images=None, val_sh_coeffs=None, init_maps=_curr_init_maps)
+            _curr_init_maps = {"albedo": _a, "sh": _s, "metallic": _m, "roughness": _b}
+
     if shader == "ct_sh":
         albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
             images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
@@ -1020,6 +1106,7 @@ def decompose_scene(
             grad_log_dir=grad_log_dir,
             val_images=val_imgs,
             val_sh_coeffs=val_sh,
+            init_maps=_curr_init_maps,
         )
     elif shader == "ct_env":
         albedo, env_maps_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(

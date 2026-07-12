@@ -70,6 +70,34 @@ def build_parser():
                    choices=["ct_sh", "ct_env", "ct_env_imp"])
     p.add_argument("--diffuse_fresnel", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
                    default=True, help="Optimizer diffuse-Fresnel (default True = always ON).")
+    p.add_argument("--optimizer", default="LBFGS", choices=["LBFGS", "Adam", "LM"],
+                   help="LM = Levenberg-Marquardt (ct_sh only). Needs far fewer iterations "
+                        "than LBFGS, but each one builds + solves the normal equations.")
+    p.add_argument("--lm_batch_size", type=int, default=0,
+                   help="LM: images per step. 0 = full batch (deterministic, recommended).")
+    p.add_argument("--lm_jacobian_max_num_rows", type=int, default=0,
+                   help="LM: cap Jacobian rows held at once; slices the J^T J accumulation "
+                        "down to O(P^2) memory. 0 = no slicing.")
+    p.add_argument("--lm_damping", default="standard", choices=["standard", "fletcher"])
+    p.add_argument("--lm_solver", default="cholesky", choices=["cholesky", "qr", "lstsq", "solve"])
+    p.add_argument("--lm_jacobian_mode", default="auto", choices=["auto", "forward", "reverse"])
+    p.add_argument("--lm_linear_solver", default="auto",
+                   choices=["auto", "dense", "cg", "schur"],
+                   help="How to solve the LM step. auto: dense below --lm_dense_max_params, "
+                        "else schur if the regularizers are pixel-separable (no tv/sparse/white), "
+                        "else cg. cg is matrix-free (O(P) memory) and scales to 512^2.")
+    p.add_argument("--lm_dense_max_params", type=int, default=20000,
+                   help="auto switches off the dense P x P solver above this P.")
+    p.add_argument("--lm_image_chunk", type=int, default=8,
+                   help="CG: images per jvp/vjp chunk (bounds the autograd graph).")
+    p.add_argument("--lm_cg_tol", type=float, default=1e-4,
+                   help="CG: relative residual tolerance for the inner solve.")
+    p.add_argument("--lm_cg_maxiter", type=int, default=50)
+    p.add_argument("--lm_schur_max_gb", type=float, default=4.0,
+                   help="Schur: refuse if the cross block B would exceed this (then use cg).")
+    p.add_argument("--lm_structured", action="store_true",
+                   help="LM: build the normal equations from block-sparse per-pixel jacobians "
+                        "(ct_sh only). Much faster than a dense Jacobian; same solution.")
     p.add_argument("--n_iter", type=int, default=300)
     p.add_argument("--lbfgs_max_iter", type=int, default=30)
     p.add_argument("--log_every", type=int, default=10)
@@ -221,6 +249,15 @@ def build_tasks(args, items):
         "init_roughness_zero": True, "double": args.double,
         "wandb_max_images": args.wandb_max_images, "diffuse_fresnel": args.diffuse_fresnel,
         "log_gt_recon_images": args.log_gt_recon_images,
+        "optimizer": args.optimizer,
+        "lm_batch_size": args.lm_batch_size, "lm_damping": args.lm_damping,
+        "lm_solver": args.lm_solver, "lm_jacobian_mode": args.lm_jacobian_mode,
+        "lm_jacobian_max_num_rows": args.lm_jacobian_max_num_rows,
+        "lm_structured": args.lm_structured,
+        "lm_linear_solver": args.lm_linear_solver,
+        "lm_dense_max_params": args.lm_dense_max_params,
+        "lm_image_chunk": args.lm_image_chunk, "lm_cg_tol": args.lm_cg_tol,
+        "lm_cg_maxiter": args.lm_cg_maxiter, "lm_schur_max_gb": args.lm_schur_max_gb,
     }
     tasks = []
     for it in items:
