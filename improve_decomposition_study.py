@@ -13,12 +13,21 @@ escape the diffuse/roughness unidentifiability, all against a plain baseline:
   sh1_then_sh2          phase 1 uses order-1 lighting (l=2 band frozen), then full SH2
   pixel_subsample_warmup phase 1 fits SH on a random pixel subset, cheaply
 
-The 7 strategies run with BOTH regularizers on (lambda_tv = lambda_metallic_binarize
-= --reg_lambda). Two extra runs isolate the regularizer effect on the baseline
-(tv-only, binarize-only). That is 9 runs at full 512^2.
+The strategy study runs at --study_downsample (default 2 = 256^2); full resolution
+is reserved for the resolution sweep. Each strategy is run under every mode in
+--reg_modes (default `both none`: lambda_tv=lambda_metallic_binarize=--reg_lambda,
+and both off). Run dirs are `<strategy>_<reg>_ds<D>` — the downsample is IN the
+name, so a re-run at a different --study_downsample never stale-caches an earlier
+run, and different reg modes never overwrite each other. Two extra runs (only when
+'both' is requested) isolate the regularizer on the baseline (tv-only, binarize-only).
 
-Then the plain, UN-regularized baseline is re-run at --downsamples (2 4 8 16) to
-show how resolution alone moves the metrics.
+Then the plain, UN-regularized baseline is run at --downsamples (default 1 2 4 8 16,
+i.e. including full res) to show how resolution alone moves the metrics.
+
+Analysis + plots are built from EVERY `..._ds<D>` run found under <out>/runs
+(previous + new), so incrementally adding a reg mode folds straight into the
+comparison. (Pre-fix orphan dirs without the `_ds<D>` suffix are ignored — their
+curriculum warm-ups had pinned frozen intrinsics at GT.)
 
 Everything uses the lossless float32 GT maps (gt_npy=True) and the .npy observations.
 Optimizer is LBFGS (--n_iter 300, --lbfgs_max_iter 40). Warm-up phases spend the
@@ -40,6 +49,7 @@ Example (VM):
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -59,12 +69,27 @@ from run_decomposition import save_intrinsics_plot, save_relight_plots   # noqa:
 
 
 # ───────────────────────── run specs ─────────────────────────────────────────
+REG_CONFIGS = {
+    "both":     lambda R: dict(lambda_tv=R, lambda_metallic_binarize=R),
+    "none":     lambda R: dict(lambda_tv=0.0, lambda_metallic_binarize=0.0),
+    "tv":       lambda R: dict(lambda_tv=R, lambda_metallic_binarize=0.0),
+    "binarize": lambda R: dict(lambda_tv=0.0, lambda_metallic_binarize=R),
+}
+
+
 def build_runs(args):
-    """Return a list of run dicts: name, downsample, cfg-extra (incl. reg)."""
+    """Return a list of run dicts: name, strategy, group, downsample, reg, cfg-extra.
+
+    The strategy study runs at --study_downsample (default 2). Its run dirs are
+    `<strategy>_<reg>_ds<D>` — the downsample is IN the name so changing --study_downsample
+    can never stale-cache an earlier run at a different resolution. The resolution
+    sweep (un-regularized baseline) keeps the `baseline_ds<D>` names so earlier
+    sweep runs on disk are still reused.
+    """
     R = args.reg_lambda
     WARM, TOTAL = args.warmup, args.n_iter
     FINAL = max(1, TOTAL - WARM)
-    both = dict(lambda_tv=R, lambda_metallic_binarize=R)
+    sd = args.study_downsample
 
     strategies = {
         "baseline": {},
@@ -81,21 +106,21 @@ def build_runs(args):
             n_iter=FINAL, curriculum=[dict(n_iter=WARM, opt_params=["sh"], pixel_frac=args.pixel_frac)]),
     }
 
-    fd = args.fullres_downsample
     runs = []
-    # 7 strategies, full-res, both regularizers
-    for name, extra in strategies.items():
-        runs.append(dict(name=name, group="fullres", downsample=fd,
-                         reg="both", cfg={**both, **extra}))
-    # regularizer isolation on the baseline
-    runs.append(dict(name="baseline_tv_only", group="fullres", downsample=fd,
-                     reg="tv", cfg=dict(lambda_tv=R, lambda_metallic_binarize=0.0)))
-    runs.append(dict(name="baseline_binarize_only", group="fullres", downsample=fd,
-                     reg="binarize", cfg=dict(lambda_tv=0.0, lambda_metallic_binarize=R)))
-    # UN-regularized baseline at each downsample
+    for mode in args.reg_modes:                      # e.g. ["both", "none"]
+        regcfg = REG_CONFIGS[mode](R)
+        for strat, extra in strategies.items():
+            runs.append(dict(name=f"{strat}_{mode}_ds{sd}", strategy=strat, group="fullres",
+                             downsample=sd, reg=mode, cfg={**regcfg, **extra}))
+    # regularizer isolation on the baseline (grouped under 'baseline' for plotting).
+    if "both" in args.reg_modes:
+        for iso in ("tv", "binarize"):
+            runs.append(dict(name=f"baseline_{iso}_ds{sd}", strategy="baseline", group="fullres",
+                             downsample=sd, reg=iso, cfg=REG_CONFIGS[iso](R)))
+    # UN-regularized baseline at each downsample -> resolution curve (full res = ds 1)
     for ds in args.downsamples:
-        runs.append(dict(name=f"baseline_ds{ds}", group="downsample", downsample=ds,
-                         reg="none", cfg=dict(lambda_tv=0.0, lambda_metallic_binarize=0.0)))
+        runs.append(dict(name=f"baseline_ds{ds}", strategy="baseline", group="downsample",
+                         downsample=ds, reg="none", cfg=REG_CONFIGS["none"](R)))
     return runs
 
 
@@ -134,39 +159,91 @@ def _row(m):
                 elapsed_s=m.get("elapsed_s"))
 
 
+def load_all_runs(runs_root: Path, base_res: int = 0) -> pd.DataFrame:
+    """Every valid run on disk (previous + this invocation), so the analysis and
+    plots always include earlier reg modes. Only dirs following the `..._ds<D>`
+    naming are read — this deliberately skips pre-fix orphan dirs (whose curriculum
+    warm-ups pinned frozen intrinsics at GT). Resolution is derived from the base
+    image size / downsample (the stored metrics H was 0)."""
+    rows = []
+    for d in sorted(p for p in runs_root.iterdir() if p.is_dir()):
+        if not re.search(r"_ds\d+$", d.name) or not (d / "metrics.json").exists():
+            continue
+        m = json.loads((d / "metrics.json").read_text())
+        meta = json.loads((d / "report.json").read_text()) if (d / "report.json").exists() else {}
+        name = meta.get("name", d.name)
+        ds = int(meta.get("downsample") or re.search(r"_ds(\d+)$", name).group(1))
+        # strategy / reg: explicit if present, else parsed from `<strat>_<reg>_ds<D>`
+        base = re.sub(r"_ds\d+$", "", name)
+        reg_guess, had_reg = "none", False
+        for rr in ("both", "none", "tv", "binarize"):
+            if base.endswith("_" + rr):
+                reg_guess, base, had_reg = rr, base[: -(len(rr) + 1)], True
+                break
+        strat = meta.get("strategy") or (base or "baseline")
+        # strategy runs carry a reg token in the name (fullres); the resolution
+        # sweep is `baseline_ds<D>` with no reg token (downsample).
+        group = meta.get("group") or ("fullres" if had_reg else "downsample")
+        res = int(meta.get("resolution") or (base_res // ds if base_res else 0))
+        rows.append(dict(name=name, strategy=strat, group=group,
+                         reg=meta.get("reg", reg_guess), downsample=ds,
+                         resolution=res, **_row(m)))
+    return pd.DataFrame(rows)
+
+
+REG_COLOR = {"both": "#4C72B0", "none": "#DD8452", "tv": "#55A868", "binarize": "#8172B3",
+             "unknown": "#999999"}
+
+
 def plot_fullres(df, path):
-    d = df[df["group"] == "fullres"].set_index("name")
+    d = df[df["group"] == "fullres"].copy()
     if not len(d):
         return
-    order = [n for n in d.index]
-    x = np.arange(len(order))
-    fig, axes = plt.subplots(1, len(METRICS), figsize=(3.3 * len(METRICS), 4.2))
+    # x-axis = strategy, grouped bars = reg mode present for that strategy
+    strategies = sorted(d["strategy"].unique(),
+                        key=lambda s: (s != "baseline", s))     # baseline first
+    regs = [r for r in ("none", "both", "tv", "binarize") if r in set(d["reg"])]
+    x = np.arange(len(strategies))
+    w = 0.8 / max(len(regs), 1)
+    fig, axes = plt.subplots(1, len(METRICS), figsize=(3.5 * len(METRICS), 4.6))
     for ax, k in zip(axes, METRICS):
-        vals = d[k].reindex(order).values
-        base = d.loc["baseline", k] if "baseline" in d.index else np.nan
-        colors = ["#55A868" if (np.isfinite(base) and v < base) else "#C44E52" for v in vals]
-        ax.bar(x, vals, color=colors)
-        if np.isfinite(base):
-            ax.axhline(base, color="0.3", ls="--", lw=1, label="baseline")
-        ax.set_xticks(x); ax.set_xticklabels(order, rotation=60, ha="right", fontsize=6)
-        ax.set_title(k, fontsize=9); ax.grid(axis="y", alpha=0.3); ax.legend(fontsize=6)
-    fig.suptitle("full-res strategies (green = beats baseline)", fontsize=11)
+        for i, reg in enumerate(regs):
+            vals = [d[(d.strategy == s) & (d.reg == reg)][k].mean() for s in strategies]
+            ax.bar(x + (i - (len(regs) - 1) / 2) * w, vals, w,
+                   color=REG_COLOR.get(reg, "#999"), label=reg)
+        ax.set_xticks(x); ax.set_xticklabels(strategies, rotation=60, ha="right", fontsize=6)
+        ax.set_title(k, fontsize=9); ax.grid(axis="y", alpha=0.3); ax.legend(fontsize=6, title="reg")
+    fig.suptitle("full-res strategies by regularization (lower = better)", fontsize=11)
     plt.tight_layout(); fig.savefig(path, dpi=90); plt.close(fig)
 
 
 def plot_downsample(df, path):
     d = df[df["group"] == "downsample"].copy()
+    # add the full-res un-regularized baseline as the top-resolution point, if present
+    top = df[(df["group"] == "fullres") & (df["strategy"] == "baseline") & (df["reg"] == "none")]
+    if len(top):
+        d = pd.concat([d, top], ignore_index=True)
     if not len(d):
         return
-    d = d.sort_values("resolution")
-    fig, ax = plt.subplots(1, 3, figsize=(13, 4))
+    d = d[d["resolution"] > 0].drop_duplicates("resolution").sort_values("resolution")
+    if not len(d):
+        return
+    fig, ax = plt.subplots(1, 3, figsize=(13, 4.2))
     for a, k in zip(ax, ["train_recon_rmse", "val_relight_rmse", "albedo_mae"]):
-        a.plot(d["resolution"], d[k], "o-", lw=1.8)
+        a.plot(d["resolution"], d[k], "o-", lw=1.8, ms=6)
+        for xx, yy in zip(d["resolution"], d[k]):
+            a.annotate(f"{yy:.3g}", (xx, yy), fontsize=6, ha="center", va="bottom",
+                       xytext=(0, 4), textcoords="offset points")
+        # mark the best resolution
+        best = d.loc[d[k].idxmin()]
+        a.plot(best["resolution"], best[k], "*", ms=15, color="#C44E52",
+               label=f"best @ {int(best['resolution'])}px")
         a.set_xlabel("resolution (px/side)"); a.set_title(k, fontsize=10)
-        if (d["resolution"] > 0).all() and d["resolution"].nunique() > 1:
+        a.set_xticks(d["resolution"]); a.set_xticklabels([int(v) for v in d["resolution"]])
+        if d["resolution"].nunique() > 1:
             a.set_xscale("log", base=2)
-        a.grid(alpha=0.3, which="both")
-    fig.suptitle("un-regularized baseline vs resolution", fontsize=11)
+        a.grid(alpha=0.3, which="both"); a.legend(fontsize=7)
+    fig.suptitle("un-regularized baseline vs resolution (down-sampling sweep)", fontsize=11)
     plt.tight_layout(); fig.savefig(path, dpi=90); plt.close(fig)
 
 
@@ -189,14 +266,21 @@ def main():
     p.add_argument("--out", type=Path, default=Path("results/improve_study"))
     p.add_argument("--n_train", type=int, default=100)
     p.add_argument("--n_val", type=int, default=28)
-    p.add_argument("--n_iter", type=int, default=300)
+    p.add_argument("--n_iter", type=int, default=500)
     p.add_argument("--lbfgs_max_iter", type=int, default=40)
-    p.add_argument("--warmup", type=int, default=60, help="Curriculum phase-1 steps.")
+    p.add_argument("--warmup", type=int, default=100, help="Curriculum phase-1 steps.")
     p.add_argument("--reg_lambda", type=float, default=1e-5)
-    p.add_argument("--downsamples", type=int, nargs="+", default=[2, 4, 8, 16])
-    p.add_argument("--fullres_downsample", type=int, default=1,
-                   help="Downsample for the 9 'full-res' strategy runs (1 = true 512^2). "
-                        "Raise to run the whole study cheaper, or for a quick smoke test.")
+    p.add_argument("--reg_modes", nargs="+", default=["both", "none"],
+                   choices=["both", "none", "tv", "binarize"],
+                   help="Which regularization settings to run the strategies under. "
+                        "'both' keeps legacy (unsuffixed) run dirs; others are suffixed so "
+                        "they never overwrite earlier runs. Default runs both + none.")
+    p.add_argument("--downsamples", type=int, nargs="+", default=[1, 2, 4, 8, 16],
+                   help="Resolution sweep for the un-regularized baseline (1 = full 512^2). "
+                        "This is the ONLY place full resolution is used.")
+    p.add_argument("--study_downsample", type=int, default=2,
+                   help="Downsample for the strategy study (default 2 = 256^2). Full res is "
+                        "reserved for the resolution sweep only.")
     p.add_argument("--noise_std", type=float, default=0.1)
     p.add_argument("--pixel_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
@@ -206,7 +290,7 @@ def main():
     p.add_argument("--double", action="store_true", help="fp64 (slow at 512^2; default fp32).")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true")
-    p.add_argument("--wandb_mode", default="disabled",
+    p.add_argument("--wandb_mode", default="online",
                    choices=["disabled", "offline", "online"])
     p.add_argument("--wandb_project", default="3dfront-improve-study")
     args = p.parse_args()
@@ -214,20 +298,21 @@ def main():
 
     scene = args.scene or discover_scene(args.datasets_root)
     assert Path(scene).exists(), f"missing scene {scene}"
+    base_res = int(np.load(next(Path(scene).glob("light_*.npy"))).shape[0])
     runs = build_runs(args)
     runs_root = args.out / "runs"
     runs_root.mkdir(parents=True, exist_ok=True)
-    print(f"scene: {scene}\n{len(runs)} run(s): "
-          f"{sum(r['group']=='fullres' for r in runs)} full-res + "
-          f"{sum(r['group']=='downsample' for r in runs)} downsampled  | device={args.device}")
+    print(f"scene: {scene}  (base {base_res}^2)  study at ds{args.study_downsample} "
+          f"({base_res // args.study_downsample}^2)\n{len(runs)} run(s): "
+          f"{sum(r['group']=='fullres' for r in runs)} strategy + "
+          f"{sum(r['group']=='downsample' for r in runs)} resolution-sweep  | device={args.device}")
 
-    rows = []
+    args.out.mkdir(parents=True, exist_ok=True)
     for i, r in enumerate(runs, 1):
         out_dir = runs_root / r["name"]
         cfg = {**base_cfg(args), **r["cfg"], "downsample": r["downsample"]}
         tag = f"[{i}/{len(runs)}] {r['name']} (ds{r['downsample']}, reg={r['reg']})"
         if (out_dir / "metrics.json").exists() and not args.force:
-            m = json.loads((out_dir / "metrics.json").read_text())
             print(f"{tag}: cached")
         else:
             if out_dir.exists():
@@ -242,27 +327,26 @@ def main():
             save_relight_plots(out_dir, m, scene, r["downsample"])
             save_loss_curve(out_dir, m)
             (out_dir / "report.json").write_text(json.dumps(
-                {"name": r["name"], "group": r["group"], "downsample": r["downsample"],
-                 "reg": r["reg"], **_row(m)}, indent=1))
-        H = m.get("H", 0)
-        rows.append(dict(name=r["name"], group=r["group"], reg=r["reg"],
-                         downsample=r["downsample"], resolution=H, **_row(m)))
-        # atomic incremental summary
-        args.out.mkdir(parents=True, exist_ok=True)
+                {"name": r["name"], "strategy": r["strategy"], "group": r["group"],
+                 "downsample": r["downsample"], "reg": r["reg"],
+                 "resolution": base_res // r["downsample"], **_row(m)}, indent=1))
+        # incremental summary from disk (survives interruption on a long VM run)
         _tmp = args.out / "summary.csv.tmp"
-        pd.DataFrame(rows).to_csv(_tmp, index=False)
+        load_all_runs(runs_root, base_res).to_csv(_tmp, index=False)
         os.replace(_tmp, args.out / "summary.csv")
 
-    df = pd.DataFrame(rows)
+    # ── analysis + plots over ALL valid runs on disk (all reg modes) ──────────
+    df = load_all_runs(runs_root, base_res)
+    df.sort_values(["group", "strategy", "reg"]).to_csv(args.out / "summary.csv", index=False)
     plot_fullres(df, args.out / "compare_fullres.png")
     plot_downsample(df, args.out / "compare_downsample.png")
 
     fr = df[df["group"] == "fullres"]
     if len(fr):
-        print("\n=== full-res strategies (sorted by val_relight_rmse) ===")
-        cols = ["name", "reg"] + METRICS
-        print(fr[cols].sort_values("val_relight_rmse").round(5).to_string(index=False))
-    print(f"\nsummary -> {args.out/'summary.csv'}   plots -> {args.out}")
+        print("\n=== full-res strategies (all reg modes on disk, sorted by val_relight_rmse) ===")
+        print(fr[["name", "reg"] + METRICS].sort_values("val_relight_rmse")
+              .round(5).to_string(index=False))
+    print(f"\n{len(df)} run(s) on disk -> summary {args.out/'summary.csv'}   plots -> {args.out}")
 
 
 if __name__ == "__main__":
