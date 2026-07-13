@@ -1322,8 +1322,13 @@ def decompose_scene(
     run.log(_final, step=cfg["n_iter"])
     run.finish()
 
-    with open(out_dir / "metrics.json", "w") as fh:
+    # metrics.json is the completion marker (written last); write it atomically so
+    # an interrupt mid-write can't leave a truncated file that poisons a resume.
+    import os as _os
+    _tmp = out_dir / "metrics.json.tmp"
+    with open(_tmp, "w") as fh:
         json.dump(metrics, fh, indent=2)
+    _os.replace(_tmp, out_dir / "metrics.json")
 
     print(
         f"  {elapsed:.1f}s  albedo RMSE={rmse:.4f}"

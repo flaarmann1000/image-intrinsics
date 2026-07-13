@@ -150,6 +150,22 @@ def save_loss_curve(run_dir, m):
 
 METRICS = ["albedo_mae", "roughness_mae", "metallic_mae", "train_recon_rmse", "val_relight_rmse"]
 
+# the study's own per-run artifacts (written AFTER decompose_scene's metrics.json)
+_ARTIFACTS = ("report.json", "intrinsics.png", "loss_curve.png")
+
+
+def write_artifacts(out_dir, m, scene, r, base_res):
+    """Regenerate the study's per-run artifacts from a (cached or fresh) metrics
+    dict. Cheap — never re-runs the decomposition — so a run interrupted between
+    decompose_scene's marker and here is completed on resume, not redone."""
+    save_intrinsics_plot(out_dir, m, out_dir / "intrinsics.png")
+    save_relight_plots(out_dir, m, scene, r["downsample"])
+    save_loss_curve(out_dir, m)
+    (out_dir / "report.json").write_text(json.dumps(
+        {"name": r["name"], "strategy": r["strategy"], "group": r["group"],
+         "downsample": r["downsample"], "reg": r["reg"],
+         "resolution": base_res // r["downsample"], **_row(m)}, indent=1))
+
 
 def _row(m):
     return dict(albedo_rmse=m["albedo_rmse"], albedo_mae=m.get("albedo_mae"),
@@ -169,8 +185,11 @@ def load_all_runs(runs_root: Path, base_res: int = 0) -> pd.DataFrame:
     for d in sorted(p for p in runs_root.iterdir() if p.is_dir()):
         if not re.search(r"_ds\d+$", d.name) or not (d / "metrics.json").exists():
             continue
-        m = json.loads((d / "metrics.json").read_text())
-        meta = json.loads((d / "report.json").read_text()) if (d / "report.json").exists() else {}
+        try:                                    # skip a corrupt/partly-written run
+            m = json.loads((d / "metrics.json").read_text())
+            meta = json.loads((d / "report.json").read_text()) if (d / "report.json").exists() else {}
+        except (json.JSONDecodeError, OSError):
+            continue
         name = meta.get("name", d.name)
         ds = int(meta.get("downsample") or re.search(r"_ds(\d+)$", name).group(1))
         # strategy / reg: explicit if present, else parsed from `<strat>_<reg>_ds<D>`
@@ -312,10 +331,25 @@ def main():
         out_dir = runs_root / r["name"]
         cfg = {**base_cfg(args), **r["cfg"], "downsample": r["downsample"]}
         tag = f"[{i}/{len(runs)}] {r['name']} (ds{r['downsample']}, reg={r['reg']})"
-        if (out_dir / "metrics.json").exists() and not args.force:
-            print(f"{tag}: cached")
+
+        # resume: metrics.json (written last, atomically, by decompose_scene) is the
+        # 'decomposition done' marker. A valid marker => never re-run the expensive
+        # optimize; just finish any missing study artifacts. Corrupt/absent => redo.
+        m = None
+        if not args.force and (out_dir / "metrics.json").exists():
+            try:
+                m = json.loads((out_dir / "metrics.json").read_text())
+            except (json.JSONDecodeError, OSError):
+                m = None
+        if m is not None:
+            m.setdefault("log_every", args.log_every)
+            if all((out_dir / f).exists() for f in _ARTIFACTS):
+                print(f"{tag}: cached")
+            else:
+                print(f"{tag}: cached (finishing artifacts)", flush=True)
+                write_artifacts(out_dir, m, scene, r, base_res)
         else:
-            if out_dir.exists():
+            if out_dir.exists():                 # partial/preempted (or corrupt) -> clean
                 shutil.rmtree(out_dir, ignore_errors=True)
             print(f"{tag}: running …", flush=True)
             t0 = time.perf_counter()
@@ -323,13 +357,7 @@ def main():
                                 gt_npy=True, wandb_project=args.wandb_project)
             m.setdefault("elapsed_s", time.perf_counter() - t0)
             m["log_every"] = args.log_every
-            save_intrinsics_plot(out_dir, m, out_dir / "intrinsics.png")
-            save_relight_plots(out_dir, m, scene, r["downsample"])
-            save_loss_curve(out_dir, m)
-            (out_dir / "report.json").write_text(json.dumps(
-                {"name": r["name"], "strategy": r["strategy"], "group": r["group"],
-                 "downsample": r["downsample"], "reg": r["reg"],
-                 "resolution": base_res // r["downsample"], **_row(m)}, indent=1))
+            write_artifacts(out_dir, m, scene, r, base_res)
         # incremental summary from disk (survives interruption on a long VM run)
         _tmp = args.out / "summary.csv.tmp"
         load_all_runs(runs_root, base_res).to_csv(_tmp, index=False)
