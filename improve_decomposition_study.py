@@ -121,7 +121,12 @@ def build_runs(args):
     for ds in args.downsamples:
         runs.append(dict(name=f"baseline_ds{ds}", strategy="baseline", group="downsample",
                          downsample=ds, reg="none", cfg=REG_CONFIGS["none"](R)))
-    return runs
+    # dedup by dir name (e.g. strategy-baseline-under-tv == the tv isolation baseline)
+    seen, uniq = set(), []
+    for r in runs:
+        if r["name"] not in seen:
+            seen.add(r["name"]); uniq.append(r)
+    return uniq
 
 
 def base_cfg(args):
@@ -218,10 +223,14 @@ def plot_fullres(df, path):
     d = df[df["group"] == "fullres"].copy()
     if not len(d):
         return
-    # x-axis = strategy, grouped bars = reg mode present for that strategy
+    # x-axis = strategy, grouped bars = reg mode. Only column-ize reg modes that
+    # span >1 strategy (a full sweep); baseline-only isolation modes (e.g. binarize
+    # run only on the baseline) would otherwise be a column of empty slots — they
+    # stay in the CSV / printed table instead.
     strategies = sorted(d["strategy"].unique(),
                         key=lambda s: (s != "baseline", s))     # baseline first
-    regs = [r for r in ("none", "both", "tv", "binarize") if r in set(d["reg"])]
+    span = {r: d[d.reg == r]["strategy"].nunique() for r in set(d["reg"])}
+    regs = [r for r in ("none", "both", "tv", "binarize") if span.get(r, 0) > 1]
     x = np.arange(len(strategies))
     w = 0.8 / max(len(regs), 1)
     fig, axes = plt.subplots(1, len(METRICS), figsize=(3.5 * len(METRICS), 4.6))
