@@ -219,8 +219,10 @@ REG_COLOR = {"both": "#4C72B0", "none": "#DD8452", "tv": "#55A868", "binarize": 
              "unknown": "#999999"}
 
 
-def plot_fullres(df, path):
+def plot_fullres(df, path, study_ds=None):
     d = df[df["group"] == "fullres"].copy()
+    if study_ds is not None:                 # one resolution only — never average
+        d = d[d["downsample"] == study_ds]   # strategy runs across study_downsamples
     if not len(d):
         return
     # x-axis = strategy, grouped bars = reg mode. Only column-ize reg modes that
@@ -241,7 +243,9 @@ def plot_fullres(df, path):
                    color=REG_COLOR.get(reg, "#999"), label=reg)
         ax.set_xticks(x); ax.set_xticklabels(strategies, rotation=60, ha="right", fontsize=6)
         ax.set_title(k, fontsize=9); ax.grid(axis="y", alpha=0.3); ax.legend(fontsize=6, title="reg")
-    fig.suptitle("full-res strategies by regularization (lower = better)", fontsize=11)
+    res = int(d["resolution"].iloc[0]) if len(d) and d["resolution"].iloc[0] else None
+    fig.suptitle(f"strategies by regularization{f' @ {res}px' if res else ''} "
+                 f"(lower = better)", fontsize=11)
     plt.tight_layout(); fig.savefig(path, dpi=90); plt.close(fig)
 
 
@@ -298,7 +302,7 @@ def main():
     p.add_argument("--lbfgs_max_iter", type=int, default=40)
     p.add_argument("--warmup", type=int, default=100, help="Curriculum phase-1 steps.")
     p.add_argument("--reg_lambda", type=float, default=1e-5)
-    p.add_argument("--reg_modes", nargs="+", default=["both", "none"],
+    p.add_argument("--reg_modes", nargs="+", default=["both", "none", "tv"],
                    choices=["both", "none", "tv", "binarize"],
                    help="Which regularization settings to run the strategies under. "
                         "'both' keeps legacy (unsuffixed) run dirs; others are suffixed so "
@@ -306,7 +310,7 @@ def main():
     p.add_argument("--downsamples", type=int, nargs="+", default=[1, 2, 4, 8, 16],
                    help="Resolution sweep for the un-regularized baseline (1 = full 512^2). "
                         "This is the ONLY place full resolution is used.")
-    p.add_argument("--study_downsample", type=int, default=2,
+    p.add_argument("--study_downsample", type=int, default=4,
                    help="Downsample for the strategy study (default 2 = 256^2). Full res is "
                         "reserved for the resolution sweep only.")
     p.add_argument("--noise_std", type=float, default=0.1)
@@ -374,15 +378,21 @@ def main():
 
     # ── analysis + plots over ALL valid runs on disk (all reg modes) ──────────
     df = load_all_runs(runs_root, base_res)
-    df.sort_values(["group", "strategy", "reg"]).to_csv(args.out / "summary.csv", index=False)
-    plot_fullres(df, args.out / "compare_fullres.png")
+    df.sort_values(["group", "downsample", "strategy", "reg"]).to_csv(args.out / "summary.csv", index=False)
+    # strategy graphic is scoped to THIS study resolution (never averages across
+    # study_downsamples) and named per-ds so different resolutions don't overwrite.
+    sd = args.study_downsample
+    plot_fullres(df, args.out / f"compare_strategies_ds{sd}.png", study_ds=sd)
     plot_downsample(df, args.out / "compare_downsample.png")
 
-    fr = df[df["group"] == "fullres"]
+    fr = df[(df["group"] == "fullres") & (df["downsample"] == sd)]
     if len(fr):
-        print("\n=== full-res strategies (all reg modes on disk, sorted by val_relight_rmse) ===")
+        print(f"\n=== strategies @ ds{sd} ({base_res // sd}px), sorted by val_relight_rmse ===")
         print(fr[["name", "reg"] + METRICS].sort_values("val_relight_rmse")
               .round(5).to_string(index=False))
+    other = sorted(set(df[df["group"] == "fullres"]["downsample"]) - {sd})
+    if other:
+        print(f"\n(note: strategy runs also exist at ds {other} — see compare_strategies_ds*.png)")
     print(f"\n{len(df)} run(s) on disk -> summary {args.out/'summary.csv'}   plots -> {args.out}")
 
 
