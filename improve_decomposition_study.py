@@ -53,6 +53,7 @@ import re
 import shutil
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -157,6 +158,45 @@ METRICS = ["albedo_mae", "roughness_mae", "metallic_mae", "train_recon_rmse", "v
 
 # the study's own per-run artifacts (written AFTER decompose_scene's metrics.json)
 _ARTIFACTS = ("report.json", "intrinsics.png", "loss_curve.png")
+
+
+def run_one(task):
+    """Execute (or resume) ONE study run. Top-level + picklable so it can run in a
+    spawned process. Carries the full resume logic:
+      valid metrics.json  -> never re-run the optimize; just finish missing artifacts
+      corrupt / absent    -> wipe the partial dir and redo
+    Returns a small status dict; the parent rebuilds the summary from disk.
+    """
+    os.environ["WANDB_MODE"] = task["wandb_mode"]
+    out_dir = Path(task["out_dir"])
+    scene, r, base_res = Path(task["scene"]), task["run"], task["base_res"]
+
+    m = None
+    if not task["force"] and (out_dir / "metrics.json").exists():
+        try:
+            m = json.loads((out_dir / "metrics.json").read_text())
+        except (json.JSONDecodeError, OSError):
+            m = None
+    try:
+        if m is not None:
+            m.setdefault("log_every", task["log_every"])
+            if all((out_dir / f).exists() for f in _ARTIFACTS):
+                return {"name": r["name"], "status": "cached"}
+            write_artifacts(out_dir, m, scene, r, base_res)
+            return {"name": r["name"], "status": "cached+artifacts"}
+        if out_dir.exists():                     # partial/preempted (or corrupt) -> clean
+            shutil.rmtree(out_dir, ignore_errors=True)
+        t0 = time.perf_counter()
+        m = decompose_scene(scene, out_dir, cfg_overrides=task["cfg"], device=task["device"],
+                            gt_npy=True, wandb_project=task["wandb_project"])
+        m.setdefault("elapsed_s", time.perf_counter() - t0)
+        m["log_every"] = task["log_every"]
+        write_artifacts(out_dir, m, scene, r, base_res)
+        return {"name": r["name"], "status": "ok", "elapsed_s": m["elapsed_s"]}
+    except Exception as e:                       # keep the batch alive on one bad run
+        import traceback
+        return {"name": r["name"], "status": "error", "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc()[-1500:]}
 
 
 def write_artifacts(out_dir, m, scene, r, base_res):
@@ -320,6 +360,11 @@ def main():
                    help="Images per grad-accum chunk (bounds 512^2 memory; safe under LBFGS).")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--double", action="store_true", help="fp64 (slow at 512^2; default fp32).")
+    p.add_argument("--workers", type=int, default=0,
+                   help="Parallel worker processes (0 = min(#runs, CPU count)); each gets its "
+                        "own CUDA context. The runs are independent, so this scales well — but "
+                        "at 256^2/512^2 each worker holds real GPU memory, so lower it if you OOM. "
+                        "1 = sequential (in-process).")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true")
     p.add_argument("--wandb_mode", default="online",
@@ -340,41 +385,55 @@ def main():
           f"{sum(r['group']=='downsample' for r in runs)} resolution-sweep  | device={args.device}")
 
     args.out.mkdir(parents=True, exist_ok=True)
-    for i, r in enumerate(runs, 1):
-        out_dir = runs_root / r["name"]
-        cfg = {**base_cfg(args), **r["cfg"], "downsample": r["downsample"]}
-        tag = f"[{i}/{len(runs)}] {r['name']} (ds{r['downsample']}, reg={r['reg']})"
+    tasks = [dict(run=r, out_dir=str(runs_root / r["name"]), scene=str(scene),
+                  cfg={**base_cfg(args), **r["cfg"], "downsample": r["downsample"]},
+                  base_res=base_res, device=args.device, force=args.force,
+                  log_every=args.log_every, wandb_mode=args.wandb_mode,
+                  wandb_project=args.wandb_project)
+             for r in runs]
+    workers = args.workers or min(len(tasks), os.cpu_count() or 4)
+    workers = max(1, min(workers, len(tasks)))
+    print(f"workers={workers}"
+          + ("  (sequential)" if workers == 1 else
+             f"  — each holds its own CUDA context; lower --workers if the GPU OOMs"))
 
-        # resume: metrics.json (written last, atomically, by decompose_scene) is the
-        # 'decomposition done' marker. A valid marker => never re-run the expensive
-        # optimize; just finish any missing study artifacts. Corrupt/absent => redo.
-        m = None
-        if not args.force and (out_dir / "metrics.json").exists():
-            try:
-                m = json.loads((out_dir / "metrics.json").read_text())
-            except (json.JSONDecodeError, OSError):
-                m = None
-        if m is not None:
-            m.setdefault("log_every", args.log_every)
-            if all((out_dir / f).exists() for f in _ARTIFACTS):
-                print(f"{tag}: cached")
-            else:
-                print(f"{tag}: cached (finishing artifacts)", flush=True)
-                write_artifacts(out_dir, m, scene, r, base_res)
-        else:
-            if out_dir.exists():                 # partial/preempted (or corrupt) -> clean
-                shutil.rmtree(out_dir, ignore_errors=True)
-            print(f"{tag}: running …", flush=True)
-            t0 = time.perf_counter()
-            m = decompose_scene(scene, out_dir, cfg_overrides=cfg, device=args.device,
-                                gt_npy=True, wandb_project=args.wandb_project)
-            m.setdefault("elapsed_s", time.perf_counter() - t0)
-            m["log_every"] = args.log_every
-            write_artifacts(out_dir, m, scene, r, base_res)
-        # incremental summary from disk (survives interruption on a long VM run)
+    try:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+    except Exception:
+        ctx = None
+
+    def _flush_summary():
         _tmp = args.out / "summary.csv.tmp"
         load_all_runs(runs_root, base_res).to_csv(_tmp, index=False)
         os.replace(_tmp, args.out / "summary.csv")
+
+    done, errs = 0, []
+    if workers == 1:                             # keep a simple in-process path
+        for t in tasks:
+            res = run_one(t)
+            done += 1
+            print(f"[{done}/{len(tasks)}] {res['name']}: {res['status']}"
+                  + (f" — {res.get('error')}" if res["status"] == "error" else ""), flush=True)
+            if res["status"] == "error":
+                errs.append(res)
+            _flush_summary()
+    else:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+            futs = {ex.submit(run_one, t): t for t in tasks}
+            for fut in as_completed(futs):
+                res = fut.result()
+                done += 1
+                print(f"[{done}/{len(tasks)}] {res['name']}: {res['status']}"
+                      + (f" — {res.get('error')}" if res["status"] == "error" else ""), flush=True)
+                if res["status"] == "error":
+                    errs.append(res)
+                # incremental summary from disk (survives interruption on a long run)
+                _flush_summary()
+    if errs:
+        print(f"\n{len(errs)} run(s) FAILED:")
+        for e in errs:
+            print(f"  {e['name']}: {e['error']}")
 
     # ── analysis + plots over ALL valid runs on disk (all reg modes) ──────────
     df = load_all_runs(runs_root, base_res)
