@@ -129,7 +129,38 @@ def _patched_make_optimizer(params, cfg):
 
 
 def load_inputs(args):
-    sc = load_scene(Path(args.scene), gt_npy=not args.no_gt_npy)
+    scene = Path(args.scene)
+    # Datasets built by batch_dataset_decomposition.ipynb store the GT maps as lossless
+    # float32 .npy (normals/albedo/roughness/metallic) next to the 8/16-bit PNGs, and the
+    # observations as light_*.npy (config variant "exr"). load_scene(gt_npy=True) prefers
+    # the .npy maps but silently falls back to PNG if ANY of the four is missing — which
+    # would quietly reintroduce the quantization we are trying to avoid. Report which
+    # path is actually taken, and fail loudly if neither is complete.
+    want_npy = not args.no_gt_npy
+    maps = ("normals", "albedo", "roughness", "metallic")
+    have_npy = {m: (scene / f"{m}.npy").exists() for m in maps}
+    have_png = {m: (scene / f"{m}.png").exists() for m in maps}
+    if want_npy and not all(have_npy.values()):
+        missing = [m for m, ok in have_npy.items() if not ok]
+        if all(have_png.values()):
+            print(f"  ! GT .npy incomplete (missing {missing}) -> falling back to PNG maps "
+                  f"(quantized). Pass --no_gt_npy to silence.")
+        else:
+            raise SystemExit(
+                f"scene has neither complete .npy nor .png GT maps "
+                f"(missing npy: {missing}; missing png: "
+                f"{[m for m, ok in have_png.items() if not ok]}) — {scene}")
+    elif not want_npy and not all(have_png.values()):
+        raise SystemExit(f"--no_gt_npy given but PNG GT maps are missing in {scene}")
+
+    sc = load_scene(scene, gt_npy=want_npy)
+    src = "npy (lossless)" if (want_npy and all(have_npy.values())) else "png (quantized)"
+    n_lights = len(sc["images"])
+    print(f"  GT maps : {src}   observations: {n_lights} light_* "
+          f"({'npy' if (scene / 'light_000.npy').exists() else 'png'})")
+    if sc.get("sh_coeffs") is None:
+        raise SystemExit(f"no GT sh_*.npy lighting in {scene} — needed for the val "
+                         f"relight metric in the logging section")
     ds = args.downsample
     st = lambda a: np.ascontiguousarray(a[::ds, ::ds])
     n_tot = args.n_train + args.n_val
@@ -460,14 +491,18 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scene",
-                   default=r"E:\DLVC-backups\260720_results\3dfront-batch\datasets"
-                           r"\1f19c3ef_v2\ct-ct_sh-frOn_env")
+                   default=r"results/3dfront-batch/datasets/1f19c3ef_v2")
+                #    default=r"E:\DLVC-backups\260720_results\3dfront-batch\datasets"
+                #            r"\1f19c3ef_v2\ct-ct_sh-frOn_env")
     p.add_argument("--downsample", type=int, default=1, help="1 = full 512^2")
     p.add_argument("--n_train", type=int, default=100)
     p.add_argument("--n_val", type=int, default=28)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--double", action="store_true", help="fp64 (study uses fp32)")
-    p.add_argument("--no_gt_npy", action="store_true")
+    p.add_argument("--no_gt_npy", action="store_true",
+                   help="Load the quantized PNG GT maps instead of the lossless .npy ones.")
+    p.add_argument("--dataset_name", default="ct-ct_sh-frOn_env",
+                   help="Which dataset leaf to pick when --scene is a datasets root/view dir.")
     p.add_argument("--out", default="profile_results.json")
     # the config being profiled, for extrapolation
     p.add_argument("--study_n_iter", type=int, default=500)
@@ -504,8 +539,21 @@ def main():
         args.max_iters = [5, 10]; args.history_sizes = [100, 10]
         args.img_batches = [8, 32]; args.workers = [1, 2]
 
-    if not Path(args.scene).exists():
-        raise SystemExit(f"scene not found: {args.scene}")
+    scene = Path(args.scene)
+    if not scene.exists():
+        raise SystemExit(f"scene not found: {scene}")
+    # Convenience: accept a datasets ROOT or a view dir and descend to a dataset leaf
+    # (a leaf is what holds light_*.npy). Lets you point at the tree that
+    # batch_dataset_decomposition.ipynb produced without naming the leaf.
+    if not any(scene.glob("light_*.npy")) and not any(scene.glob("light_*.png")):
+        cand = sorted(p for p in scene.rglob(args.dataset_name)
+                      if p.is_dir() and any(p.glob("light_*.npy")))
+        if not cand:
+            raise SystemExit(f"no '{args.dataset_name}' dataset leaf with light_*.npy "
+                             f"under {scene}")
+        scene = cand[0]
+        print(f"(descended to dataset leaf: {scene})")
+    args.scene = str(scene)
 
     print(f"scene   : {args.scene}")
     if args.device == "cuda":
