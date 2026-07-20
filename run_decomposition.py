@@ -24,11 +24,23 @@ one relight panel per val light. A summary CSV is written incrementally. Scalar
 metrics stream to wandb. Resumable: runs with an existing metrics.json are
 skipped unless --force.
 
+With --relight_sweep / --relight_video it additionally relights the estimate under
+a directional light swept across azimuth (see raw_optimizer/relight_sweep.py) and
+writes <run>/relight_sweep/. That is a harder test than the built-in relight metric,
+which re-lights under the val set's GT env SH — the same lighting family the
+optimizer was fit on. The sweep only reads the saved *_est.npy, so it also
+back-fills onto CACHED runs: adding the flag to an already-finished batch produces
+the plots without redoing any optimization.
+
 Example (GCE VM):
   WANDB_API_KEY=... python run_decomposition.py \
       --datasets_root /data/decomp/datasets --runs_root /data/decomp/runs \
       --sh_orders 2 3 --n_train 100 --n_val 28 \
       --wandb_project 3dfront-batch-decomposition-gc --wandb_entity DLVC-intrinsics
+
+Add the relighting sweep + video to a batch that already ran (no re-optimization):
+  python run_decomposition.py --runs_root /data/decomp/runs \
+      --datasets_root /data/decomp/datasets --relight_video
 """
 import argparse
 import json
@@ -122,6 +134,26 @@ def build_parser():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true", help="Redo runs even if metrics.json exists.")
     p.add_argument("--no_plots", action="store_true", help="Skip PNG artifact plotting.")
+    # ── directional relighting sweep (opt-in; see raw_optimizer/relight_sweep.py) ──
+    p.add_argument("--relight_sweep", action="store_true",
+                   help="Also relight the estimate under a directional light swept across "
+                        "azimuth and compare against GT intrinsics through identical "
+                        "geometry. Harder than the built-in relight metric, which re-lights "
+                        "under the val set's GT env SH — the same lighting family that was "
+                        "fit. Writes <run>/relight_sweep/{sweep_panels,sweep_error}.png.")
+    p.add_argument("--relight_video", action="store_true",
+                   help="Also write the sweep as a video (GT | EST | error, plus EST alone). "
+                        "Implies --relight_sweep. mp4 if imageio-ffmpeg is installed, else GIF.")
+    p.add_argument("--sweep_az", type=float, nargs=2, default=[-45.0, 45.0],
+                   metavar=("FROM", "TO"), help="Azimuth range in degrees.")
+    p.add_argument("--sweep_frames", type=int, default=61)
+    p.add_argument("--sweep_elev", type=float, default=30.0,
+                   help="Light elevation above the horizon, degrees.")
+    p.add_argument("--sweep_fps", type=int, default=20)
+    p.add_argument("--sweep_no_ping_pong", action="store_true",
+                   help="Play the sweep once instead of forward-then-back.")
+    p.add_argument("--sweep_save_frames", action="store_true",
+                   help="Also keep the individual PNG frames next to the video.")
     p.add_argument("--workers", type=int, default=4,
                    help="Parallel worker processes (0 = min(#runs, CPU count)). The 31^2 LBFGS "
                         "workload is CPU/launch-bound, so ~one per core saturates a spare GPU.")
@@ -195,6 +227,38 @@ def _metrics_row(m):
         final_loss=m["final_loss"])
 
 
+_SWEEP_ROW_KEYS = ("sweep_rmse_scaled", "sweep_rmse_raw", "sweep_mae_scaled",
+                   "sweep_scale_ratio")
+
+
+def maybe_relight_sweep(task, out_dir, ds_dir):
+    """Run the directional sweep if requested. Returns summary-row fields.
+
+    Deliberately independent of whether the decomposition just ran: it only needs the
+    saved *_est.npy, so it also back-fills the sweep for CACHED runs. That means you can
+    add --relight_sweep to an existing batch and get the plots without redoing any
+    optimization. Never raises — a broken sweep must not fail an otherwise good run."""
+    sw = task.get("sweep")
+    if not sw:
+        return {}
+    prev_p = out_dir / "relight_sweep" / "sweep.json"
+    if prev_p.exists() and not task["force"]:
+        try:
+            prev = json.loads(prev_p.read_text())
+            # only reuse if it already has everything this invocation asks for
+            if not (sw["video"] and "video" not in prev):
+                return {**{k: prev[k] for k in _SWEEP_ROW_KEYS if k in prev},
+                        "sweep_status": "cached"}
+        except Exception:
+            pass                                  # unreadable -> just recompute
+    try:
+        from raw_optimizer.relight_sweep import relight_sweep
+        r = relight_sweep(out_dir, ds_dir, downsample=task["eff_ds"], **sw)
+        return {**{k: r[k] for k in _SWEEP_ROW_KEYS if k in r}, "sweep_status": "ok"}
+    except Exception as e:
+        return {"sweep_status": f"error: {type(e).__name__}: {e}"}
+
+
 def run_one(task):
     """Decompose one (dataset, sh_order, shader) run. Self-contained + picklable
     so it runs in a spawned process. Returns a summary row (+ status/error)."""
@@ -208,7 +272,15 @@ def run_one(task):
     # is a partial/preempted run to clear + redo.
     if (out_dir / "metrics.json").exists() and not task["force"]:
         m = json.loads((out_dir / "metrics.json").read_text())
-        return {**row_base, **_metrics_row(m), "status": "cached"}
+        sweep = maybe_relight_sweep(task, out_dir, ds_dir)
+        # a back-filled sweep must also land in report.json, not just sweep.json + the CSV
+        rp = out_dir / "report.json"
+        if sweep.get("sweep_status") == "ok" and rp.exists():
+            try:
+                rp.write_text(json.dumps({**json.loads(rp.read_text()), **sweep}, indent=1))
+            except Exception:
+                pass
+        return {**row_base, **_metrics_row(m), "status": "cached", **sweep}
     if out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -218,10 +290,12 @@ def run_one(task):
         if not task["no_plots"]:
             save_intrinsics_plot(out_dir, m, out_dir / "intrinsics.png")
             save_relight_plots(out_dir, m, ds_dir, task["eff_ds"])
+        sweep = maybe_relight_sweep(task, out_dir, ds_dir)
         (out_dir / "report.json").write_text(json.dumps({
             **row_base, "decomp_shader": task["shader"], **_metrics_row(m),
-            "n_train": m.get("n_train_images"), "n_val": m.get("n_val_images")}, indent=1))
-        return {**row_base, **_metrics_row(m), "status": "ok"}
+            "n_train": m.get("n_train_images"), "n_val": m.get("n_val_images"),
+            **sweep}, indent=1))
+        return {**row_base, **_metrics_row(m), "status": "ok", **sweep}
     except Exception as e:                       # keep the batch alive on one bad run
         import traceback
         return {**row_base, "status": "error", "error": f"{type(e).__name__}: {e}",
@@ -270,6 +344,15 @@ def build_tasks(args, items):
         "lm_image_chunk": args.lm_image_chunk, "lm_cg_tol": args.lm_cg_tol,
         "lm_cg_maxiter": args.lm_cg_maxiter, "lm_schur_max_gb": args.lm_schur_max_gb,
     }
+    # --relight_video implies the sweep; None disables it entirely (checked in run_one)
+    sweep = None
+    if args.relight_sweep or args.relight_video:
+        sweep = dict(az_from=args.sweep_az[0], az_to=args.sweep_az[1],
+                     n_frames=args.sweep_frames, elev=args.sweep_elev,
+                     diffuse_fresnel=args.diffuse_fresnel, device=args.device,
+                     video=args.relight_video, plots=True, fps=args.sweep_fps,
+                     ping_pong=not args.sweep_no_ping_pong,
+                     save_frames=args.sweep_save_frames)
     tasks = []
     for it in items:
         for order in args.sh_orders:
@@ -287,7 +370,8 @@ def build_tasks(args, items):
                     shader=shader, sh_order=order, cfg=cfg,
                     out_dir=str(args.runs_root / tag), device=args.device,
                     wandb_entity=args.wandb_entity, wandb_project=args.wandb_project,
-                    wandb_mode=args.wandb_mode, force=args.force, no_plots=args.no_plots))
+                    wandb_mode=args.wandb_mode, force=args.force, no_plots=args.no_plots,
+                    sweep=sweep))
     return tasks
 
 
@@ -306,6 +390,11 @@ def main():
     print(f"{len(items)} dataset(s) ({n_g} ground / {len(items)-n_g} no-ground, "
           f"--ground {args.ground}) × {args.sh_orders} × {args.decomp_shaders} "
           f"= {len(tasks)} run(s)  | workers={workers}  | device={args.device}")
+    if tasks[0]["sweep"]:
+        s = tasks[0]["sweep"]
+        print(f"relight sweep: {s['az_from']:+.0f}..{s['az_to']:+.0f} deg azimuth, "
+              f"elev {s['elev']:.0f} deg, {s['n_frames']} frames"
+              + (f", video @ {s['fps']} fps" if s["video"] else ", plots only"))
 
     args.runs_root.mkdir(parents=True, exist_ok=True)
     try:
@@ -329,17 +418,29 @@ def main():
                 print(f"[{done}/{len(tasks)}] {r['view']} {r['dataset']} {r['shader']} SH{r['sh_order']}"
                       f"  ERROR: {r.get('error')}", flush=True)
             else:
+                sw = ""
+                if r.get("sweep_status", "").startswith("error"):
+                    sw = f"  sweep FAILED ({r['sweep_status'][7:]})"
+                elif r.get("sweep_rmse_scaled") is not None:
+                    sw = f"  sweep={r['sweep_rmse_scaled']:.4f}"
                 print(f"[{done}/{len(tasks)}] {r['view']} {r['dataset']} {r['shader']} SH{r['sh_order']}"
                       f"  alb_rmse={r.get('albedo_rmse'):.4f}  recon={r.get('train_recon_rmse'):.4f}"
-                      f"  ({r.get('status')})", flush=True)
+                      f"{sw}  ({r.get('status')})", flush=True)
 
     df = pd.DataFrame(rows)
     ok = df[df["status"].isin(["ok", "cached"])] if "status" in df else df
     if len(ok):
+        cols = ["albedo_rmse", "roughness_mae", "metallic_mae", "train_recon_rmse",
+                "val_relight_rmse"]
+        cols += [c for c in ("sweep_rmse_scaled", "sweep_rmse_raw") if c in ok]
         print("\n=== mean over views ===")
-        print(ok.groupby(["dataset", "sh_order"])[
-            ["albedo_rmse", "roughness_mae", "metallic_mae", "train_recon_rmse", "val_relight_rmse"]
-        ].mean().round(4).to_string())
+        print(ok.groupby(["dataset", "sh_order"])[cols].mean().round(4).to_string())
+    if "sweep_status" in df:
+        n_sw_err = int(df["sweep_status"].astype(str).str.startswith("error").sum())
+        if n_sw_err:
+            print(f"\n! {n_sw_err} relight sweep(s) failed; the decompositions themselves "
+                  f"are unaffected. First: "
+                  f"{df.loc[df['sweep_status'].astype(str).str.startswith('error'), 'sweep_status'].iloc[0]}")
     n_err = int((df["status"] == "error").sum()) if "status" in df else 0
     print(f"\nsummary -> {args.runs_root / 'decomposition_summary.csv'}"
           + (f"   ({n_err} run(s) errored)" if n_err else ""))
