@@ -91,6 +91,18 @@ def build_parser():
                    choices=["ct_sh", "ct_env", "ct_env_imp"])
     p.add_argument("--diffuse_fresnel", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
                    default=True, help="Optimizer diffuse-Fresnel (default True = always ON).")
+    p.add_argument("--gt_npy", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
+                   default=True,
+                   help="Read the GT intrinsic maps from the lossless float32 "
+                        "{normals,albedo,roughness,metallic}.npy instead of the truncated "
+                        "8/16-bit PNGs (default True). The PNGs impose a quantization floor "
+                        "on albedo_rmse and feed quantized roughness/metallic/normals into "
+                        "the forward model, since those are fixed inputs, not estimated.")
+    p.add_argument("--use_npy", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
+                   default=True,
+                   help="Read the observations from light_*.npy when the dataset variant is "
+                        "png-based (default True). No effect on 'exr' datasets, which always "
+                        "load .npy.")
     p.add_argument("--optimizer", default="LBFGS", choices=["LBFGS", "Adam", "LM"],
                    help="LM = Levenberg-Marquardt (ct_sh only). Needs far fewer iterations "
                         "than LBFGS, but each one builds + solves the normal equations.")
@@ -120,7 +132,7 @@ def build_parser():
                    help="LM: build the normal equations from block-sparse per-pixel jacobians "
                         "(ct_sh only). Much faster than a dense Jacobian; same solution.")
     p.add_argument("--n_iter", type=int, default=500)
-    p.add_argument("--lbfgs_max_iter", type=int, default=40)
+    p.add_argument("--lbfgs_max_iter", type=int, default=20)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--lambda_tv", type=float, default=1e-5)
     p.add_argument("--lambda_metallic_binarize", type=float, default=0)
@@ -156,7 +168,7 @@ def build_parser():
                    help="Play the sweep once instead of forward-then-back.")
     p.add_argument("--sweep_save_frames", action="store_true",
                    help="Also keep the individual PNG frames next to the video.")
-    p.add_argument("--workers", type=int, default=4,
+    p.add_argument("--workers", type=int, default=2,
                    help="Parallel worker processes (0 = min(#runs, CPU count)). The 31^2 LBFGS "
                         "workload is CPU/launch-bound, so ~one per core saturates a spare GPU.")
     p.add_argument("--wandb_mode", default=None, choices=[None, "online", "offline", "disabled"],
@@ -352,6 +364,8 @@ def build_tasks(args, items):
         "tr_metallic": "sigmoid", "tr_roughness": "sigmoid", "tr_albedo": "sigmoid",
         "init_roughness_zero": True, "double": args.double,
         "wandb_max_images": args.wandb_max_images, "diffuse_fresnel": args.diffuse_fresnel,
+        # decompose_scene pops these out of cfg_overrides and forwards them to load_scene
+        "gt_npy": args.gt_npy, "use_npy": args.use_npy,
         "log_gt_recon_images": args.log_gt_recon_images,
         "optimizer": args.optimizer,
         "lm_batch_size": args.lm_batch_size, "lm_damping": args.lm_damping,
@@ -412,6 +426,7 @@ def main():
     # Print the resolution each dataset will actually be decomposed at. eff_ds comes from
     # config.json, not --downsample, so a silent mismatch here is what turns a 256^2 run
     # into a 512^2 one and OOMs the GPU.
+    n_png_gt = 0
     for it in items:
         try:
             import numpy as _np
@@ -420,7 +435,17 @@ def main():
             eff = f"{h // it['eff_ds']}^2"
         except Exception:
             eff = "?"
-        print(f"  {it['view']}/{it['name']}: downsample={it['eff_ds']} -> {eff}")
+        # load_scene falls back to the quantized PNGs silently if ANY of the four GT .npy
+        # is missing, so surface which source each dataset will actually use.
+        missing = [m for m in ("normals", "albedo", "roughness", "metallic")
+                   if not (Path(it["dir"]) / f"{m}.npy").exists()]
+        gt_src = "npy" if (args.gt_npy and not missing) else "PNG (quantized)"
+        n_png_gt += gt_src != "npy"
+        print(f"  {it['view']}/{it['name']}: downsample={it['eff_ds']} -> {eff}, GT={gt_src}"
+              + (f"  [missing {','.join(missing)}]" if args.gt_npy and missing else ""))
+    if n_png_gt:
+        print(f"  ! {n_png_gt} dataset(s) will use quantized PNG GT maps — this puts a floor "
+              f"on albedo_rmse and feeds quantized roughness/metallic into the forward model.")
     if tasks[0]["sweep"]:
         s = tasks[0]["sweep"]
         print(f"relight sweep: {s['az_from']:+.0f}..{s['az_to']:+.0f} deg azimuth, "

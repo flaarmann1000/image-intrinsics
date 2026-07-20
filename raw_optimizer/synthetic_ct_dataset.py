@@ -1024,12 +1024,11 @@ def _make_optimizer(params, cfg):
     if name == "LBFGS":
         return torch.optim.LBFGS(
             params, 
-            # lr=cfg["lr"],
-            lr=10,
+            lr=cfg["lr"],            
             max_iter=cfg["lbfgs_max_iter"],
             line_search_fn="strong_wolfe",
-            tolerance_grad=0,
-            tolerance_change=0,
+            tolerance_grad=1e-9,
+            tolerance_change=1e-11,
             history_size=10
 
         )
