@@ -7,6 +7,7 @@ Standalone profiler for the LBFGS ct_sh decomposition, sized to the REAL study c
 
 It answers, in order:
   0  task breakdown   forward vs backward vs LBFGS-internal vs reporting vs setup
+  0b downsample       cost vs resolution (1/2/4 = 512/256/128) and how it scales
   1  closure cost     how many fwd+bwd passes one outer step really costs (line search)
   2  img_batch        does a bigger batch help, and what does it cost in memory?
   3  history_size     LBFGS's two-loop recursion is a launch-bound tax
@@ -28,8 +29,13 @@ Examples
 
   # quick sanity pass first (a few minutes)
   python profile_decomposition.py --downsample 4 --n_train 32 --n_val 8 --quick
+
+  # just the resolution sweep (512 vs 256 vs 128)
+  python profile_decomposition.py --skip breakdown closures plateau img_batch history \\
+      logging workers --downsamples 1 2 4
 """
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -128,7 +134,7 @@ def _patched_make_optimizer(params, cfg):
     return _ORIG_MAKE_OPT(params, cfg)
 
 
-def load_inputs(args):
+def load_inputs(args, quiet=False):
     scene = Path(args.scene)
     # Datasets built by batch_dataset_decomposition.ipynb store the GT maps as lossless
     # float32 .npy (normals/albedo/roughness/metallic) next to the 8/16-bit PNGs, and the
@@ -143,8 +149,9 @@ def load_inputs(args):
     if want_npy and not all(have_npy.values()):
         missing = [m for m, ok in have_npy.items() if not ok]
         if all(have_png.values()):
-            print(f"  ! GT .npy incomplete (missing {missing}) -> falling back to PNG maps "
-                  f"(quantized). Pass --no_gt_npy to silence.")
+            if not quiet:
+                print(f"  ! GT .npy incomplete (missing {missing}) -> falling back to PNG maps "
+                      f"(quantized). Pass --no_gt_npy to silence.")
         else:
             raise SystemExit(
                 f"scene has neither complete .npy nor .png GT maps "
@@ -156,8 +163,9 @@ def load_inputs(args):
     sc = load_scene(scene, gt_npy=want_npy)
     src = "npy (lossless)" if (want_npy and all(have_npy.values())) else "png (quantized)"
     n_lights = len(sc["images"])
-    print(f"  GT maps : {src}   observations: {n_lights} light_* "
-          f"({'npy' if (scene / 'light_000.npy').exists() else 'png'})")
+    if not quiet:
+        print(f"  GT maps : {src}   observations: {n_lights} light_* "
+              f"({'npy' if (scene / 'light_000.npy').exists() else 'png'})")
     if sc.get("sh_coeffs") is None:
         raise SystemExit(f"no GT sh_*.npy lighting in {scene} — needed for the val "
                          f"relight metric in the logging section")
@@ -166,7 +174,8 @@ def load_inputs(args):
     n_tot = args.n_train + args.n_val
     avail = len(sc["images"])
     if avail < n_tot:
-        print(f"  ! scene has only {avail} lights; using n_train={max(avail - args.n_val, 1)}")
+        if not quiet:
+            print(f"  ! scene has only {avail} lights; using n_train={max(avail - args.n_val, 1)}")
         args.n_train = max(avail - args.n_val, 1)
         n_tot = args.n_train + args.n_val
     imgs = [st(im) for im in sc["images"][:n_tot]]
@@ -256,6 +265,95 @@ def sec_breakdown(inp, args, R):
     R["breakdown"] = dict(wall=wall, fwd=p["fwd"], bwd=p["bwd"], lbfgs_internal=internal,
                           extra_forward=p["extra"], misc=misc, closures=p["nclo"],
                           outer=p["nout"])
+
+
+def sec_downsample(args, R):
+    """Cost vs resolution. Must re-load inputs per factor: load_inputs() strides the
+    images/maps and builds the proxy geometry at args.downsample, so the working set is
+    baked in and cannot be resized after the fact."""
+    hdr("0b. DOWNSAMPLE — cost vs resolution")
+    rows = []
+    for d in args.downsamples:
+        a2 = copy.copy(args)                     # shallow: run() only reads device/double
+        a2.downsample = d
+        inp2 = None
+        try:
+            inp2 = load_inputs(a2, quiet=True)
+            res, M, P = inp2["res"], inp2["M"], inp2["P"]
+            r = run(inp2, a2, args.ds_outer, args.ds_max_iter,
+                    img_batch=args.breakdown_img_batch, timed=True)
+            if r["oom"]:
+                print(f"  ds={d:<2} {res:>4}^2  OOM at img_batch="
+                      f"{args.breakdown_img_batch or 'full'}", flush=True)
+                rows.append(dict(downsample=d, res=res, masked_px=M, P=P, oom=True))
+                continue
+            p = r["phases"]
+            rows.append(dict(
+                downsample=d, res=res, masked_px=M, P=P, oom=False,
+                wall=r["wall"], s_per_outer=r["wall"] / args.ds_outer,
+                closures=r["closures"],
+                ms_per_closure=r["wall"] / max(r["closures"], 1) * 1000,
+                fwd_bwd_s=p["fwd"] + p["bwd"],
+                lbfgs_internal_s=p["step"] - p["fwd"] - p["bwd"],
+                peak_gb=r["peak_gb"], final_loss=r["final_loss"]))
+        finally:
+            del inp2                              # free the GPU working set before the
+            if args.device == "cuda":             # next (possibly larger) resolution
+                torch.cuda.empty_cache()
+
+    ok = [x for x in rows if not x["oom"]]
+    if not ok:
+        print("  every resolution OOM'd — lower --breakdown_img_batch")
+        R["downsample"] = rows
+        return
+
+    print(f"  {args.ds_outer} outer x max_iter={args.ds_max_iter}, "
+          f"img_batch={args.breakdown_img_batch or 'full'}, "
+          f"{args.n_train} train images\n")
+    print(f"  {'ds':>3} {'res':>7} {'masked px':>10} {'params':>9} {'closures':>9} "
+          f"{'wall s':>8} {'ms/clo':>8} {'peak GB':>8} {'fwd+bwd%':>9}")
+    for x in ok:
+        print(f"  {x['downsample']:>3} {str(x['res'])+'^2':>7} {x['masked_px']:>10,} "
+              f"{x['P']:>9,} {x['closures']:>9} {x['wall']:>8.2f} "
+              f"{x['ms_per_closure']:>8.1f} {x['peak_gb']:>8.3f} "
+              f"{100*x['fwd_bwd_s']/x['wall']:>9.1f}")
+
+    # Scale relative to the CHEAPEST (largest ds), and compare against the pixel ratio.
+    base = max(ok, key=lambda x: x["downsample"])
+    print(f"\n  relative to ds={base['downsample']} ({base['res']}^2):")
+    print(f"  {'ds':>3} {'px ratio':>9} {'time ratio':>11} {'mem ratio':>10} {'efficiency':>11}")
+    for x in ok:
+        px = x["masked_px"] / base["masked_px"]
+        tr = x["ms_per_closure"] / base["ms_per_closure"]
+        mr = x["peak_gb"] / base["peak_gb"] if base["peak_gb"] else float("nan")
+        print(f"  {x['downsample']:>3} {px:>9.2f}x {tr:>10.2f}x {mr:>9.2f}x "
+              f"{px/tr:>10.2f}x")
+
+    # log-log fit: ms/closure ~ M^alpha. alpha~1 => compute-bound (time tracks pixels),
+    # alpha<<1 => launch/overhead-bound (small resolutions cost far more than their pixels).
+    if len(ok) >= 2:
+        lm = np.log([x["masked_px"] for x in ok])
+        lt = np.log([x["ms_per_closure"] for x in ok])
+        alpha = float(np.polyfit(lm, lt, 1)[0])
+        verdict = ("compute-bound: cost tracks pixel count, so downsampling buys "
+                   "close to its full quadratic saving" if alpha > 0.8 else
+                   "OVERHEAD-bound: cost grows far slower than pixels, so the small "
+                   "resolutions are launch-limited and downsampling saves much less "
+                   "than the {}x pixel reduction suggests".format(
+                       f"{ok[0]['masked_px']/base['masked_px']:.0f}"))
+        print(f"\n  ms/closure ~ masked_px^{alpha:.2f}  ->  {verdict}")
+        R_alpha = alpha
+    else:
+        R_alpha = None
+
+    full = min(ok, key=lambda x: x["downsample"])
+    if full is not base:
+        print(f"  ds={full['downsample']} costs {full['ms_per_closure']/base['ms_per_closure']:.1f}x "
+              f"the time and {full['peak_gb']/max(base['peak_gb'],1e-9):.1f}x the memory "
+              f"of ds={base['downsample']}")
+    print("  NOTE: params P scale with masked px too, so the LBFGS two-loop recursion "
+          "grows with\n        resolution as well — this is not purely a shading cost.")
+    R["downsample"] = dict(rows=rows, alpha=R_alpha, base_ds=base["downsample"])
 
 
 def sec_closures(inp, args, R):
@@ -467,6 +565,22 @@ def sec_summary(args, R):
                    else "FLAT at the end — n_iter can be cut substantially")
         print(f"  convergence: {verdict} "
               f"(last 10% of budget improved {pl['last10pct_ratio']:.3f}x)")
+    ds = R.get("downsample")
+    if ds:
+        ok = [x for x in ds["rows"] if not x["oom"]]
+        if ok and ds.get("alpha") is not None:
+            print(f"  resolution: ms/closure ~ masked_px^{ds['alpha']:.2f} "
+                  + ("(compute-bound — downsampling pays off near-quadratically)"
+                     if ds["alpha"] > 0.8 else
+                     "(overhead-bound — downsampling saves less than the pixel count implies)"))
+        # project the study budget onto each resolution (needs section 1's closure count)
+        if ok and cl:
+            print(f"  projected study run time (n_iter={args.study_n_iter}, "
+                  f"max_iter={args.study_max_iter} = {cl['study_closures']:,.0f} closures):")
+            for x in ok:
+                print(f"    ds={x['downsample']} ({x['res']}^2): "
+                      f"~{cl['study_closures'] * x['ms_per_closure'] / 1000 / 60:6.1f} min/run  "
+                      f"(peak {x['peak_gb']:.2f} GB)")
     ib = R.get("img_batch")
     if ib:
         print(f"  img_batch  -> use {ib['best']}  (peak {ib['best_peak_gb']:.2f} GB)")
@@ -512,6 +626,10 @@ def main():
     p.add_argument("--max_iter", type=int, default=20, help="max_iter for most sections")
     p.add_argument("--breakdown_outer", type=int, default=3)
     p.add_argument("--breakdown_img_batch", type=int, default=0, help="0 = full batch")
+    p.add_argument("--downsamples", type=int, nargs="+", default=[1, 2, 4],
+                   help="downsample factors to compare (1/2/4 = 512/256/128 at native 512)")
+    p.add_argument("--ds_outer", type=int, default=2)
+    p.add_argument("--ds_max_iter", type=int, default=10)
     p.add_argument("--closure_outer", type=int, default=3)
     p.add_argument("--max_iters", type=int, nargs="+", default=[5, 10, 20, 40])
     p.add_argument("--plateau_outer", type=int, default=40)
@@ -525,7 +643,7 @@ def main():
     p.add_argument("--workers", type=int, nargs="+", default=[1, 2])
     # section switches
     p.add_argument("--skip", nargs="*", default=["workers"],
-                   choices=["breakdown", "closures", "plateau", "img_batch",
+                   choices=["breakdown", "downsample", "closures", "plateau", "img_batch",
                             "history", "logging", "workers"],
                    help="sections to skip (workers is skipped by default: it spawns "
                         "full extra processes and can OOM the GPU at 512^2)")
@@ -538,6 +656,7 @@ def main():
         args.plateau_outer, args.log_outer, args.batch_outer = 6, 2, 1
         args.max_iters = [5, 10]; args.history_sizes = [100, 10]
         args.img_batches = [8, 32]; args.workers = [1, 2]
+        args.ds_outer, args.ds_max_iter = 1, 5
 
     scene = Path(args.scene)
     if not scene.exists():
@@ -572,10 +691,14 @@ def main():
               f"    Re-run with e.g. --breakdown_img_batch 25 (or a larger --downsample).")
         sys.exit(1)
     ms = warm["wall"] / max(warm["closures"], 1) * 1000
-    todo = set(["breakdown", "closures", "plateau", "img_batch", "history",
+    todo = set(["breakdown", "downsample", "closures", "plateau", "img_batch", "history",
                 "logging", "workers"]) - set(args.skip)
     est = 0.0
     if "breakdown" in todo: est += args.breakdown_outer * args.max_iter * 1.3
+    if "downsample" in todo:
+        # ms was calibrated at args.downsample; assume cost ~ pixel count for the estimate
+        est += (args.ds_outer * args.ds_max_iter * 1.3
+                * sum((args.downsample / d) ** 2 for d in args.downsamples))
     if "closures" in todo:  est += args.closure_outer * sum(args.max_iters) * 1.3
     if "plateau" in todo:   est += args.plateau_outer * args.max_iter * 1.3
     if "img_batch" in todo: est += args.batch_outer * args.batch_max_iter * 1.3 * (len(args.img_batches) + 1) * 2
@@ -595,6 +718,7 @@ def main():
                        cpus=os.cpu_count()))
     t0 = time.perf_counter()
     if "breakdown" in todo: sec_breakdown(inp, args, R)
+    if "downsample" in todo: sec_downsample(args, R)
     if "closures" in todo:  sec_closures(inp, args, R)
     if "plateau" in todo:   sec_plateau(inp, args, R)
     if "img_batch" in todo: sec_img_batch(inp, args, R)

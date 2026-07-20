@@ -58,8 +58,15 @@ def build_parser():
     p.add_argument("--view_filter", nargs="*", default=None,
                    help="Only view_keys starting with one of these prefixes.")
     p.add_argument("--dataset_filter", nargs="*",
-                #    default='ct-ct_sh',
+                   default='ct-ct_sh',
                    help="Only dataset dirs whose name starts with one of these (e.g. 'blender_' 'ct-ct_sh').")
+    p.add_argument("--ground", default="both", choices=["both", "only", "exclude"],
+                   help="Ground-plane condition to decompose. A dataset is 'ground' if its dir "
+                        "name contains '_ground' (ct-*_env_ground, blender_env_ground_*). "
+                        "both = every match (default), only = ground-plane sets, "
+                        "exclude = no-ground sets. Orthogonal to --dataset_filter, which is a "
+                        "PREFIX match and so cannot separate 'ct-ct_sh-frOn_env' from "
+                        "'ct-ct_sh-frOn_env_ground'.")
     p.add_argument("--downsample", type=int, default=4,
                    help="Decompose downsample for datasets NOT already pre-reduced (blender).")
     p.add_argument("--n_train", type=int, default=100)
@@ -98,8 +105,8 @@ def build_parser():
     p.add_argument("--lm_structured", action="store_true",
                    help="LM: build the normal equations from block-sparse per-pixel jacobians "
                         "(ct_sh only). Much faster than a dense Jacobian; same solution.")
-    p.add_argument("--n_iter", type=int, default=300)
-    p.add_argument("--lbfgs_max_iter", type=int, default=30)
+    p.add_argument("--n_iter", type=int, default=500)
+    p.add_argument("--lbfgs_max_iter", type=int, default=40)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--lambda_tv", type=float, default=1e-5)
     p.add_argument("--lambda_metallic_binarize", type=float, default=1e-4)
@@ -115,7 +122,7 @@ def build_parser():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true", help="Redo runs even if metrics.json exists.")
     p.add_argument("--no_plots", action="store_true", help="Skip PNG artifact plotting.")
-    p.add_argument("--workers", type=int, default=0,
+    p.add_argument("--workers", type=int, default=2,
                    help="Parallel worker processes (0 = min(#runs, CPU count)). The 31^2 LBFGS "
                         "workload is CPU/launch-bound, so ~one per core saturates a spare GPU.")
     p.add_argument("--wandb_mode", default=None, choices=[None, "online", "offline", "disabled"],
@@ -230,6 +237,10 @@ def discover_datasets(args):
         for ds_dir in sorted(p for p in view_dir.iterdir() if p.is_dir()):
             if args.dataset_filter and not any(ds_dir.name.startswith(f) for f in args.dataset_filter):
                 continue
+            is_ground = "_ground" in ds_dir.name
+            if (args.ground == "only" and not is_ground) or \
+               (args.ground == "exclude" and is_ground):
+                continue
             cfg_p = ds_dir / "config.json"
             if not cfg_p.exists() or not any(ds_dir.glob("light_*.npy")):
                 continue
@@ -284,12 +295,17 @@ def main():
     args = build_parser().parse_args()
     items = discover_datasets(args)
     if not items:
-        raise SystemExit(f"No dataset dirs under {args.datasets_root}")
+        raise SystemExit(
+            f"No dataset dirs under {args.datasets_root} matching "
+            f"dataset_filter={args.dataset_filter} view_filter={args.view_filter} "
+            f"ground={args.ground}")
     tasks = build_tasks(args, items)
     workers = args.workers or min(len(tasks), os.cpu_count() or 4)
     workers = max(1, min(workers, len(tasks)))
-    print(f"{len(items)} dataset(s) × {args.sh_orders} × {args.decomp_shaders} = {len(tasks)} run(s)  "
-          f"| workers={workers}  | device={args.device}")
+    n_g = sum("_ground" in it["name"] for it in items)
+    print(f"{len(items)} dataset(s) ({n_g} ground / {len(items)-n_g} no-ground, "
+          f"--ground {args.ground}) × {args.sh_orders} × {args.decomp_shaders} "
+          f"= {len(tasks)} run(s)  | workers={workers}  | device={args.device}")
 
     args.runs_root.mkdir(parents=True, exist_ok=True)
     try:
