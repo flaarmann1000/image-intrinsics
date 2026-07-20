@@ -1023,11 +1023,14 @@ def _make_optimizer(params, cfg):
         return None          # LM is not a torch.optim.Optimizer; see _build_lm
     if name == "LBFGS":
         return torch.optim.LBFGS(
-            params, lr=cfg["lr"],
+            params, 
+            # lr=cfg["lr"],
+            lr=10,
             max_iter=cfg["lbfgs_max_iter"],
             line_search_fn="strong_wolfe",
             tolerance_grad=0,
             tolerance_change=0,
+            history_size=10
 
         )
     return torch.optim.Adam(params, lr=cfg["lr"])
