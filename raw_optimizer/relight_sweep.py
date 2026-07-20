@@ -195,20 +195,21 @@ def relight_sweep(run_dir, ds_dir, downsample=1, az_from=-45.0, az_to=45.0, n_fr
     shs = [dir_sh(a, elev) for a in az]
     rel = Relighter(gt["normals"], gt["mask"], device, dtype, diffuse_fresnel)
 
+    mask = gt["mask"]
+    # Only the GT and scaled frames are kept: they feed the plots and the video. The raw
+    # variant is needed for its error curve alone, so it is streamed one frame at a time
+    # rather than materialised — at 61 frames x 512^2 a third frame list is ~190 MB of
+    # host RAM per worker, which matters when several workers run side by side.
     gt_f = [rel.render(gt, s) for s in shs]
     est_f = [rel.render(est_scaled, s) for s in shs]
-    raw_f = [rel.render(est_raw, s) for s in shs]
 
-    mask = gt["mask"]
-    def _err(a_frames):
-        rm, ma = [], []
-        for g, e in zip(gt_f, a_frames):
-            d = (g - e)[mask]
-            rm.append(float(np.sqrt((d ** 2).mean()))); ma.append(float(np.abs(d).mean()))
-        return np.array(rm), np.array(ma)
+    def _frame_err(g, e):
+        d = (g - e)[mask]
+        return float(np.sqrt((d ** 2).mean())), float(np.abs(d).mean())
 
-    rm_s, ma_s = _err(est_f)
-    rm_r, ma_r = _err(raw_f)
+    rm_s, ma_s = map(np.array, zip(*[_frame_err(g, e) for g, e in zip(gt_f, est_f)]))
+    rm_r, ma_r = map(np.array, zip(*[_frame_err(g, rel.render(est_raw, s))
+                                     for g, s in zip(gt_f, shs)]))
     err_maps = [np.abs(g - e).mean(-1) for g, e in zip(gt_f, est_f)]
     emax = float(np.percentile(np.stack(err_maps), 99.5)) or 1.0
 
@@ -276,4 +277,7 @@ def relight_sweep(run_dir, ds_dir, downsample=1, az_from=-45.0, az_to=45.0, n_fr
         res["error_scale"] = emax
 
     (out_dir / "sweep.json").write_text(__import__("json").dumps(res, indent=1))
+    del rel                                     # drop the geometry + LUT before returning
+    if str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
     return res

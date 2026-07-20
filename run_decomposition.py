@@ -14,10 +14,12 @@ and run this.
 
 Layout expected under --datasets_root:
   <view_key>/<dataset_name>/{light_*.npy, sh_*.npy, albedo|normals|roughness|metallic.png, config.json}
-  dataset_name is 'ct-<shader>-frOn/frOff_<cond>' (pre-reduced; decompose at
-  downsample=1) or 'blender_<cond>' (full-res; decompose at --downsample).
-  The effective downsample is read from config ('prereduced_downsample' present
-  => 1) and falls back to the ct-/blender_ name prefix.
+  dataset_name is 'ct-<shader>-frOn/frOff_<cond>' or 'blender_<cond>'.
+  The effective decompose downsample comes from config.json's
+  'prereduced_downsample': >1 means the images were already shrunk at build time
+  (decompose at 1), ==1 means they are full-res (apply --downsample). Only when
+  the key is absent does it fall back to the ct-/blender_ name prefix. Startup
+  prints the resulting resolution per dataset — check it before a long batch.
 
 Per run writes: metrics.json (decompose_scene), report.json, intrinsics.png, and
 one relight panel per val light. A summary CSV is written incrementally. Scalar
@@ -252,6 +254,14 @@ def maybe_relight_sweep(task, out_dir, ds_dir):
         except Exception:
             pass                                  # unreadable -> just recompute
     try:
+        # The sweep runs in the same process as the decomposition that just finished, so
+        # torch's caching allocator is still holding that run's blocks. Release them
+        # first: otherwise peak = decomposition + sweep, which OOMs a shared GPU once
+        # several workers hit their sweep at the same time.
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         from raw_optimizer.relight_sweep import relight_sweep
         r = relight_sweep(out_dir, ds_dir, downsample=task["eff_ds"], **sw)
         return {**{k: r[k] for k in _SWEEP_ROW_KEYS if k in r}, "sweep_status": "ok"}
@@ -319,9 +329,18 @@ def discover_datasets(args):
             if not cfg_p.exists() or not any(ds_dir.glob("light_*.npy")):
                 continue
             cfg = json.loads(cfg_p.read_text())
-            # already pre-reduced (CT) -> decompose at 1; else (blender) -> --downsample
-            eff_ds = 1 if cfg.get("prereduced_downsample", 0) and cfg["prereduced_downsample"] > 1 \
-                else (1 if ds_dir.name.startswith("ct-") else args.downsample)
+            # Effective decompose downsample. config.json is AUTHORITATIVE when it records
+            # prereduced_downsample: >1 means the images were already shrunk at build time
+            # (decompose at 1, they are small already), ==1 means they were written at full
+            # resolution (so --downsample must still be applied). Only fall back to the
+            # ct-/blender_ name prefix when the key is absent — a 'ct-' name does NOT imply
+            # pre-reduction, and assuming it did silently ignored --downsample and ran
+            # 512^2 decompositions.
+            pre = cfg.get("prereduced_downsample")
+            if pre is not None:
+                eff_ds = 1 if pre > 1 else args.downsample
+            else:
+                eff_ds = 1 if ds_dir.name.startswith("ct-") else args.downsample
             items.append(dict(view=view_dir.name, name=ds_dir.name, dir=ds_dir, eff_ds=eff_ds))
     return items
 
@@ -390,6 +409,18 @@ def main():
     print(f"{len(items)} dataset(s) ({n_g} ground / {len(items)-n_g} no-ground, "
           f"--ground {args.ground}) × {args.sh_orders} × {args.decomp_shaders} "
           f"= {len(tasks)} run(s)  | workers={workers}  | device={args.device}")
+    # Print the resolution each dataset will actually be decomposed at. eff_ds comes from
+    # config.json, not --downsample, so a silent mismatch here is what turns a 256^2 run
+    # into a 512^2 one and OOMs the GPU.
+    for it in items:
+        try:
+            import numpy as _np
+            h = _np.load(next(iter(sorted(Path(it["dir"]).glob("light_*.npy")))),
+                         mmap_mode="r").shape[0]
+            eff = f"{h // it['eff_ds']}^2"
+        except Exception:
+            eff = "?"
+        print(f"  {it['view']}/{it['name']}: downsample={it['eff_ds']} -> {eff}")
     if tasks[0]["sweep"]:
         s = tasks[0]["sweep"]
         print(f"relight sweep: {s['az_from']:+.0f}..{s['az_to']:+.0f} deg azimuth, "
