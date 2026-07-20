@@ -67,12 +67,12 @@ def build_parser():
                         "exclude = no-ground sets. Orthogonal to --dataset_filter, which is a "
                         "PREFIX match and so cannot separate 'ct-ct_sh-frOn_env' from "
                         "'ct-ct_sh-frOn_env_ground'.")
-    p.add_argument("--downsample", type=int, default=4,
+    p.add_argument("--downsample", type=int, default=2,
                    help="Decompose downsample for datasets NOT already pre-reduced (blender).")
     p.add_argument("--n_train", type=int, default=100)
     p.add_argument("--n_val", type=int, default=28,
                    help="Last N lights held out for the relighting metric.")
-    p.add_argument("--sh_orders", type=int, nargs="+", default=[2, 3], choices=[2, 3])
+    p.add_argument("--sh_orders", type=int, nargs="+", default=[2], choices=[2, 3])
     p.add_argument("--decomp_shaders", nargs="+", default=["ct_sh"],
                    choices=["ct_sh", "ct_env", "ct_env_imp"])
     p.add_argument("--diffuse_fresnel", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
@@ -109,7 +109,7 @@ def build_parser():
     p.add_argument("--lbfgs_max_iter", type=int, default=40)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--lambda_tv", type=float, default=1e-5)
-    p.add_argument("--lambda_metallic_binarize", type=float, default=1e-4)
+    p.add_argument("--lambda_metallic_binarize", type=float, default=0)
     p.add_argument("--double", type=lambda s: s.lower() in ("1", "true", "on", "yes"),
                    default=True, help="float64 (fp64 is slow on T4/L4; float32 is fine for ct_sh).")
     p.add_argument("--spec_samples", type=int, default=128)
@@ -122,7 +122,7 @@ def build_parser():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true", help="Redo runs even if metrics.json exists.")
     p.add_argument("--no_plots", action="store_true", help="Skip PNG artifact plotting.")
-    p.add_argument("--workers", type=int, default=2,
+    p.add_argument("--workers", type=int, default=4,
                    help="Parallel worker processes (0 = min(#runs, CPU count)). The 31^2 LBFGS "
                         "workload is CPU/launch-bound, so ~one per core saturates a spare GPU.")
     p.add_argument("--wandb_mode", default=None, choices=[None, "online", "offline", "disabled"],
