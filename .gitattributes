@@ -1,0 +1,3 @@
+# Notebook outputs are stripped from the committed blob (see tools/nbstrip.py).
+# Enable once per clone:  python tools/nbstrip.py --install
+*.ipynb filter=nbstrip

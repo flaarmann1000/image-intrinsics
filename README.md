@@ -23,9 +23,24 @@ idr/
   track/           wandb logging
   pipelines/       decompose  synthetic_generate  synthetic_run  mit  real_scene
 scripts/           command-line entry points
-tests/             golden.py + the recorded baseline
+notebooks/         current notebooks; archive/ holds the dormant ones
+tools/             nbstrip.py (git clean filter for notebook outputs)
+tests/             golden.py + the recorded baseline, test_entrypoints.py
 legacy/            superseded code, kept for reference; nothing live imports it
+
+datasets/          SOURCE data — read, never written (3D-Front, MIT, office)
+assets/            meshes and other static resources
+results/           EVERY generated artifact, grouped by study
+  3dfront-batch/     datasets/ runs/ sweep/     the main workflow
+  synthetic/         dataset/ runs/ backup/     the synthetic study
+  mit/  real_scene/  improve_study/  relight_video/
+  ref_lighting/      dclift/                    reference SH light sets
+  demos/             cpu/ gpu/                  renderer demo output
+  archive/                                      superseded output
 ```
+
+`idr/paths.py` is the single source of truth for all of these — import the constants
+rather than writing repo-relative paths at the call site.
 
 ## Entry points
 
@@ -77,3 +92,25 @@ field with spatially varying maps, rendered through the project's own `shade_ct_
 it has no dataset or external-drive dependency and reproduces identically anywhere. All
 nine cases are bitwise reproducible run-to-run, so the tolerance is `1e-9` rather than a
 noise band — any real numeric drift shows up immediately.
+
+## Notebooks
+
+Live notebooks are in `notebooks/`; `notebooks/archive/` holds ones not touched since
+before July, kept runnable but out of the way. Each starts by walking up from the CWD to
+find the repo root and `chdir`-ing there, so they work whether Jupyter is launched from
+the repo root or from `notebooks/`.
+
+**Outputs are stripped from the committed blob.** Committing them had grown `.git` to
+4.5 GB against 74 MB of notebooks on disk. Enable the filter once per clone:
+
+```bash
+python tools/nbstrip.py --install
+```
+
+`.gitattributes` then routes `*.ipynb` through it: git stores 0.4 MB instead of 74 MB
+(196x), while your working copies keep their outputs. This only stops *future* growth —
+the existing history still holds every past output, and shrinking that needs a history
+rewrite (every commit hash changes), so it is a separate deliberate decision.
+
+If the filter is not installed, notebooks commit with outputs and the repo starts growing
+again — nothing breaks, but the point is lost.
