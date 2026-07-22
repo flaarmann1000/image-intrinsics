@@ -51,7 +51,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("WANDB_MODE", "disabled")
 
 import raw_optimizer.synthetic_ct_dataset as S                      # noqa: E402
-from raw_optimizer.dfront_ct import load_scene, make_proxy_geometry  # noqa: E402
+from idr.data.geometry import make_proxy_geometry     # noqa: E402
+from idr.data.scene_io import load_scene
 from raw_optimizer.synthetic_ct_dataset import _optimize_ct_sh, DEFAULT_CFG  # noqa: E402
 
 OOM = torch.cuda.OutOfMemoryError if hasattr(torch.cuda, "OutOfMemoryError") else RuntimeError
@@ -503,7 +504,8 @@ import sys, os, time, numpy as np, torch
 os.environ['WANDB_MODE']='disabled'
 sys.path.insert(0, r'{Path(__file__).resolve().parent}')
 from pathlib import Path
-from raw_optimizer.dfront_ct import load_scene, make_proxy_geometry
+from idr.data.geometry import make_proxy_geometry
+from idr.data.scene_io import load_scene
 from raw_optimizer.synthetic_ct_dataset import _optimize_ct_sh, DEFAULT_CFG
 ds, K = {args.downsample}, {args.n_train}
 sc = load_scene(Path(r'{args.scene}'), gt_npy={not args.no_gt_npy})

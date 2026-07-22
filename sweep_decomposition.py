@@ -47,7 +47,7 @@ from PIL import Image
 
 # Top-level so spawned workers re-import cleanly (argparse stays under __main__).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from raw_optimizer.dfront_ct import decompose_scene   # noqa: E402
+from idr.pipelines.decompose import decompose_scene# noqa: E402
 
 
 # ───────────────────────── plotting (mirrors run_decomposition.py) ────────────

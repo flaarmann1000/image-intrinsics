@@ -100,7 +100,7 @@ def _sphere_normals(res):
 
 def build_scene(device="cuda"):
     """Deterministic (images, geometry, GT maps, SH lights). Pure function of SEED."""
-    from raw_optimizer.dfront_ct import make_proxy_geometry
+    from idr.data.geometry import make_proxy_geometry
     from idr.render import shade_ct_sh
     from idr.render.brdf import _get_ggx_sh_lut
 
@@ -169,7 +169,7 @@ def write_scene(dest=SCENE):
 
 def load_inputs(device="cuda"):
     """Geometry + images shared by every optimizer-level case."""
-    from raw_optimizer.dfront_ct import make_proxy_geometry
+    from idr.data.geometry import make_proxy_geometry
     sc = build_scene(device)
     Nhw, frag, mhw, cam = make_proxy_geometry(sc["normals"], sc["mask"], 60.0, 2.0,
                                               device, torch.float32)
@@ -180,7 +180,7 @@ def load_inputs(device="cuda"):
 
 def _env_geometry():
     from idr.render import EnvMap, SHLighting
-    from raw_optimizer.dfront_ct import LIGHT_COLOR, LIGHT_INTENSITY
+    from raw_optimizer.synthetic_ct_dataset import LIGHT_COLOR, LIGHT_INTENSITY
     ref = EnvMap.from_sh(SHLighting.directional(
         np.array([0, 0, 1], np.float32), LIGHT_COLOR, intensity=LIGHT_INTENSITY),
         resolution=32)
@@ -245,7 +245,7 @@ def case_pipeline(_inp):
     """Full decompose_scene: loading, downsample, metrics, artifacts."""
     import shutil
     import tempfile
-    from raw_optimizer.dfront_ct import decompose_scene
+    from idr.pipelines.decompose import decompose_scene
     if not (SCENE / "config.json").exists():
         write_scene()
     out = Path(tempfile.mkdtemp(prefix="golden_pipe_"))

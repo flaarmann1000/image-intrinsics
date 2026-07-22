@@ -49,7 +49,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from raw_optimizer.dfront_ct import load_scene, make_proxy_geometry
+from idr.data.geometry import make_proxy_geometry
+
+from idr.data.scene_io import load_scene
 from idr.render import EnvMap, SHLighting, shade_ct_env, shade_ct_sh
 from idr.render.brdf import _get_ggx_sh_lut
 
