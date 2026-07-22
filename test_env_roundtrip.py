@@ -50,8 +50,8 @@ import torch
 from PIL import Image
 
 from raw_optimizer.dfront_ct import load_scene, make_proxy_geometry
-from raw_renderer_gpu import EnvMap, SHLighting, shade_ct_env, shade_ct_sh
-from raw_renderer_gpu.rasterizer import _get_ggx_sh_lut
+from idr.render import EnvMap, SHLighting, shade_ct_env, shade_ct_sh
+from idr.render.brdf import _get_ggx_sh_lut
 
 
 def _flat_masked(arr_hw, flat_mask, device):

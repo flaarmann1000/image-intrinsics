@@ -43,12 +43,14 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from raw_renderer_gpu import (
+from idr.render import (
     rasterize_geometry, shade_ct_sh, shade_ct_env, shade_phong_sh, shade_phong_env,
     SHLight, EnvMapLightGPU,
     Camera, EnvMap, SHLighting, build_sh_basis, generate_mesh, load_obj,
 )
-from raw_renderer_gpu.rasterizer import _norm, _get_ggx_sh_lut, _sh_irradiance, _sh_basis, _lut_lookup
+from idr.render.brdf import _get_ggx_sh_lut, _lut_lookup
+from idr.render.ops import _norm
+from idr.render.sh import _sh_irradiance, _sh_basis
 from raw_optimizer.helper import _albedo_rmse
 
 

@@ -36,7 +36,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from raw_renderer_gpu import EnvMap, SHLighting
+from idr.render import EnvMap, SHLighting
 from raw_optimizer.synthetic_ct_dataset import (
     _optimize_ct_sh, _optimize_ct_env,
     _optimize_phong_sh, _optimize_phong_env,

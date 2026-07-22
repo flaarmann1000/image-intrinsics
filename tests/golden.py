@@ -101,8 +101,8 @@ def _sphere_normals(res):
 def build_scene(device="cuda"):
     """Deterministic (images, geometry, GT maps, SH lights). Pure function of SEED."""
     from raw_optimizer.dfront_ct import make_proxy_geometry
-    from raw_renderer_gpu import shade_ct_sh
-    from raw_renderer_gpu.rasterizer import _get_ggx_sh_lut
+    from idr.render import shade_ct_sh
+    from idr.render.brdf import _get_ggx_sh_lut
 
     rng = np.random.default_rng(SEED)
     normals, mask = _sphere_normals(RES)
@@ -179,7 +179,7 @@ def load_inputs(device="cuda"):
 
 
 def _env_geometry():
-    from raw_renderer_gpu import EnvMap, SHLighting
+    from idr.render import EnvMap, SHLighting
     from raw_optimizer.dfront_ct import LIGHT_COLOR, LIGHT_INTENSITY
     ref = EnvMap.from_sh(SHLighting.directional(
         np.array([0, 0, 1], np.float32), LIGHT_COLOR, intensity=LIGHT_INTENSITY),

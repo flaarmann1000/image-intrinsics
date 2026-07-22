@@ -33,12 +33,12 @@ import torch
 import wandb
 from PIL import Image
 
-from raw_renderer_gpu import (
+from idr.render import (
     shade_ct_sh, shade_ct_env,
     SHLight, EnvMapLightGPU,
     EnvMap, SHLighting,
 )
-from raw_renderer_gpu.rasterizer import _get_ggx_sh_lut
+from idr.render.brdf import _get_ggx_sh_lut
 from raw_optimizer.synthetic_ct_dataset import (
     _optimize_ct_sh,
     _optimize_ct_env,
@@ -1149,7 +1149,7 @@ def decompose_scene(
             s = np.concatenate([s, np.zeros((n - s.shape[0], 3), np.float32)])
         return s
     if val_imgs is not None:
-        from raw_renderer_gpu import build_sh_basis
+        from idr.render import build_sh_basis
         relight_dir = out_dir / "relight"
         relight_dir.mkdir(exist_ok=True)
         with torch.no_grad():

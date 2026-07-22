@@ -32,12 +32,12 @@ import torch
 import wandb
 from PIL import Image
 
-from raw_renderer_gpu import (
+from idr.render import (
     shade_ct_sh, shade_ct_env,
     SHLight, EnvMapLightGPU,
     EnvMap, SHLighting,
 )
-from raw_renderer_gpu.rasterizer import _get_ggx_sh_lut
+from idr.render.brdf import _get_ggx_sh_lut
 from raw_optimizer.synthetic_ct_dataset import (
     _optimize_ct_sh,
     _optimize_ct_env,

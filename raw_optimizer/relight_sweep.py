@@ -36,8 +36,8 @@ import numpy as np
 import torch
 
 from .dfront_ct import load_scene, make_proxy_geometry, LIGHT_COLOR, LIGHT_INTENSITY
-from raw_renderer_gpu import shade_ct_sh, SHLighting
-from raw_renderer_gpu.rasterizer import _get_ggx_sh_lut
+from idr.render import shade_ct_sh, SHLighting
+from idr.render.brdf import _get_ggx_sh_lut
 
 __all__ = ["dir_sh", "Relighter", "relight_sweep"]
 
