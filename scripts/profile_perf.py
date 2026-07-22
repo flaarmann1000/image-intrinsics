@@ -48,6 +48,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from idr.paths import BATCH_DATASETS_DIR   # noqa: E402
 os.environ.setdefault("WANDB_MODE", "disabled")
 
 import idr.optim.steps as S                      # noqa: E402
@@ -620,7 +622,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scene",
-                   default=r"results/3dfront-batch/datasets/1f19c3ef_v2")
+                   default=str(BATCH_DATASETS_DIR / "1f19c3ef_v2"))
                 #    default=r"E:\DLVC-backups\260720_results\3dfront-batch\datasets"
                 #            r"\1f19c3ef_v2\ct-ct_sh-frOn_env")
     p.add_argument("--downsample", type=int, default=1, help="1 = full 512^2")

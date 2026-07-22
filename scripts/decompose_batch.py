@@ -65,9 +65,9 @@ from PIL import Image
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--datasets_root", type=Path, default=Path("results/3dfront-batch/datasets"),
+    p.add_argument("--datasets_root", type=Path, default=BATCH_DATASETS_DIR,
                    help="Root of the notebook's self-contained dataset tree.")
-    p.add_argument("--runs_root", type=Path, default=Path("results/3dfront-batch/runs"),
+    p.add_argument("--runs_root", type=Path, default=BATCH_RUNS_DIR,
                    help="Where per-run outputs + the summary CSV are written.")
     p.add_argument("--view_filter", nargs="*", default=None,
                    help="Only view_keys starting with one of these prefixes.")
@@ -177,6 +177,8 @@ def build_parser():
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from idr.paths import BATCH_DATASETS_DIR, BATCH_RUNS_DIR   # noqa: E402
 from idr.pipelines.decompose import decompose_scene# noqa: E402
 
 

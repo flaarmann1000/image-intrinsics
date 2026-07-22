@@ -42,12 +42,12 @@ from idr.optim.registry import optimize
 from idr.optim.result import EnvGrid
 from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
 from idr.config import DEFAULT_CFG, LIGHT_COLOR, LIGHT_INTENSITY
+from idr.paths import REAL_SCENE_DIR
 from idr.eval.metrics import _albedo_rmse
 
 _WANDB_ENTITY  = "DLVC-intrinsics"
 _WANDB_PROJECT = "real_scene_ct_decomp"
 
-_REPO_ROOT = Path(__file__).parent.parent
 
 # ─────────────────────────────────────── data loading ───────────────────────
 

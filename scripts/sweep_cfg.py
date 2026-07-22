@@ -47,6 +47,8 @@ from PIL import Image
 
 # Top-level so spawned workers re-import cleanly (argparse stays under __main__).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from idr.paths import BATCH_DATASETS_DIR, BATCH_SWEEP_DIR   # noqa: E402
 from idr.pipelines.decompose import decompose_scene# noqa: E402
 
 
@@ -174,8 +176,8 @@ def discover_views(datasets_root: Path, dataset_filter, view_filter, num_views, 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--datasets_root", type=Path, default=Path("results/3dfront-batch/datasets"))
-    p.add_argument("--runs_root", type=Path, default=Path("results/3dfront-batch/sweep"))
+    p.add_argument("--datasets_root", type=Path, default=BATCH_DATASETS_DIR)
+    p.add_argument("--runs_root", type=Path, default=BATCH_SWEEP_DIR)
     p.add_argument("--num_views", type=int, default=10, help="First N views to sweep.")
     p.add_argument("--dataset_filter", nargs="+", default=["ct-ct_sh-frOn"],
                    help="Per view, the first dataset dir starting with one of these is swept "

@@ -32,7 +32,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-_REPO_ROOT = Path(__file__).parent.parent
+# idr/pipelines/mit.py -> parents[2] is the repo root. Computed inline rather than
+# imported from idr.paths because this bootstrap must run BEFORE idr is importable.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -43,12 +45,13 @@ from idr.config import (DEFAULT_CFG, NAMED_TRANSFORMS, SHININESS_RANGE,
                         LIGHT_COLOR, LIGHT_INTENSITY)
 from idr.optim.transforms import _parse_transforms, _transforms_folder
 from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
+from idr.paths import MIT_DATA_DIR, MIT_DIR
 
 
 # ─────────────────────────────────────── constants ───────────────────────────
 
-MIT_ROOT     = _REPO_ROOT / "datasets" / "mit"
-RESULTS_ROOT = _REPO_ROOT / "mit_results"
+MIT_ROOT     = MIT_DATA_DIR
+RESULTS_ROOT = MIT_DIR
 
 DATASET_PATHS: dict[str, Path] = {
     "full":  MIT_ROOT / "multi_ill_dataset",

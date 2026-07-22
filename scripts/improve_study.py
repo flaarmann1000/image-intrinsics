@@ -65,6 +65,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from idr.paths import BATCH_DATASETS_DIR, IMPROVE_STUDY_DIR   # noqa: E402
 from idr.pipelines.decompose import decompose_scene# noqa: E402
 from idr.eval.plots import save_intrinsics_plot, save_relight_plots   # noqa: E402
 
@@ -334,8 +336,8 @@ def main():
     p.add_argument("--scene", type=Path, default=None,
                    help="A ct-ct_sh-frOn_env dataset dir (default: first under --datasets_root).")
     p.add_argument("--datasets_root", type=Path,
-                   default=Path("results/3dfront-batch/datasets"))
-    p.add_argument("--out", type=Path, default=Path("results/improve_study"))
+                   default=BATCH_DATASETS_DIR)
+    p.add_argument("--out", type=Path, default=IMPROVE_STUDY_DIR)
     p.add_argument("--n_train", type=int, default=100)
     p.add_argument("--n_val", type=int, default=28)
     p.add_argument("--n_iter", type=int, default=500)
