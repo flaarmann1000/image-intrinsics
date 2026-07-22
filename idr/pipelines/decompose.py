@@ -330,7 +330,13 @@ def decompose_scene(
     if shader == "ct_sh" and _curriculum:
         _seed0 = int(cfg.get("init_seed", 0) or 0)
         for _pi, _ph in enumerate(_curriculum):
-            _pcfg = dict(cfg)
+            # A phase may override ANY cfg key, not just the four that used to be
+            # special-cased. That is what lets a phase switch optimizer -- e.g.
+            # [{"optimizer": "LBFGS", ...}, {"optimizer": "VARPRO", ...}] to warm-start
+            # variable projection from a gradient-descent run -- without this loop
+            # needing to know which keys exist.
+            _pcfg = {**cfg, **{k: v for k, v in _ph.items()
+                               if k not in ("pixel_frac", "opt_params")}}
             _pcfg["n_iter"]   = int(_ph.get("n_iter", 60))
             _pcfg["sh_order"] = int(_ph.get("sh_order", cfg.get("sh_order", 2)))
             _pmask = mask_hw
@@ -338,6 +344,7 @@ def decompose_scene(
                 _pmask = _subsample_mask(mask_hw, float(_ph["pixel_frac"]), seed=_seed0 + _pi)
             _pop = frozenset(_ph["opt_params"]) if _ph.get("opt_params") else _eff_op_sh
             print(f"  [curriculum {_pi + 1}/{len(_curriculum)}] "
+                  f"{_pcfg.get('optimizer', 'LBFGS')} "
                   f"opt={sorted(_pop) if _pop else 'all'} sh{_pcfg['sh_order']} "
                   f"n_iter={_pcfg['n_iter']}"
                   + (f" pixels={_ph['pixel_frac']:.0%}" if _ph.get("pixel_frac") else ""),

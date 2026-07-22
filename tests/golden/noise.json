@@ -11,5 +11,19 @@
   "light": 0.0,
   "mat_a": 0.0,
   "mat_b": 0.0
+ },
+ "J": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "K": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
  }
 }

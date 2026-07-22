@@ -14,8 +14,12 @@ def _optimizer_name(cfg) -> str:
 
 def _make_optimizer(params, cfg):
     name = _optimizer_name(cfg)
-    if name == "LM":
-        return None          # LM is not a torch.optim.Optimizer; see _build_lm
+    if name in ("LM", "VARPRO"):
+        # Neither is a torch.optim.Optimizer: LM drives itself (idr/optim/lm),
+        # VarPro eliminates the lighting and takes its own reduced step
+        # (idr/optim/varpro). Falling through to the Adam default below would
+        # silently build an optimizer nobody steps.
+        return None
     if name == "LBFGS":
         return torch.optim.LBFGS(
             params, 

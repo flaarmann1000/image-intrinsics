@@ -204,7 +204,7 @@ def woodbury_step(geom, material, sh, active, gram, observations, lam,
     for lo, hi in slices:
         Dj = jac_v(*_args(lo, hi), sh)                           # (b, n, 3, 5)
         r = fwd_v(*_args(lo, hi), sh) - observations[:, lo:hi, :].permute(1, 0, 2)
-        loss += float((r ** 2).sum())
+        loss += float((r ** 2).sum().detach())
         g[lo:hi] = torch.einsum('bnca,bnc->ba', Dj, r)
         Dbd[lo:hi] = torch.einsum('bncx,bncy->bxy', Dj, Dj)
         diagUU[lo:hi] = (_U(lo, hi, Dj) ** 2).sum(-1)

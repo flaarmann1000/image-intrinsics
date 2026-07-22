@@ -34,6 +34,7 @@ from idr.track.wandb_log import (
 from idr.data.synthetic_scene import _scatter, _scatter_np
 from idr.eval.metrics import _albedo_rmse
 from idr.optim.lm.problem import build_lm_solver
+from idr.optim.varpro.problem import build_varpro_solver
 from idr.config import _CT_SH_PARAMS
 from idr.render import shade_ct_sh
 from idr.render.brdf import _get_ggx_sh_lut, _lut_lookup
@@ -272,6 +273,18 @@ def _optimize_ct_sh(
             roughness_raw, flat_mask, N_imgs, N_m, view_m, _imgs_m, lut,
             _diffuse_fresnel, tr_ab, tr_met, tr_rou, _lm_frac, dev, ftype)
 
+    # ── Variable projection (ct_sh only, like LM) ─────────────────────────────
+    # Eliminates the SH lighting in closed form -- the render is linear in it once the
+    # material is fixed -- and takes a lighting-projected Gauss-Newton step over the
+    # per-pixel material. It therefore OWNS sh_coeffs: the elimination overwrites it
+    # each iteration, so `sh` must not also be in opt_params.
+    _vp = None
+    if steps._optimizer_name(cfg) == "VARPRO":
+        _vp = build_varpro_solver(
+            cfg, albedo_param, sh_coeffs, metallic_raw, roughness_raw, flat_mask,
+            _imgs_m, _AY, _Y_R, _NdotV, _front, lut, _sh_ord, _diffuse_fresnel,
+            tr_ab, tr_met, tr_rou, dev, ftype)
+
 
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev, dtype=ftype)]
@@ -481,7 +494,11 @@ def _optimize_ct_sh(
     t0 = time.perf_counter()
     for i in range(cfg["n_iter"]):
         _step[0] = i
-        if _lm is not None:
+        if _vp is not None:
+            _vp_info = _vp.step()
+            with torch.no_grad():                       # report the full-batch loss
+                loss, l_d, l_s, l_w, l_tv = _forward()
+        elif _lm is not None:
             # full batch (idx=None) or a random image mini-batch of `lm_batch_size`
             if _lm_full:
                 _idx, _lm_frac[0] = None, 1.0
