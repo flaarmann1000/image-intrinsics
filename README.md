@@ -75,6 +75,51 @@ Phong; `res.light` is SH coefficients for the `_sh` models and env-map pixels fo
 `_env` ones. `res.is_phong` / `res.is_env` say which, so a call site does not have to
 know which optimizer produced the result.
 
+## Optimizers
+
+`cfg["optimizer"]` selects one of four, all reached through `idr.optim.registry.optimize`:
+
+| | what it does |
+|---|---|
+| `LBFGS` / `Adam` | gradient descent over every unknown jointly |
+| `LM` | Levenberg-Marquardt, `ct_sh` only (`idr/optim/lm/`) |
+| `VARPRO` | variable projection, `ct_sh` only (`idr/optim/varpro/`) |
+
+**Variable projection** exploits the fact that, with the material fixed, the render is
+*linear* in the SH lighting. It solves the lighting in closed form each iteration and
+takes a lighting-projected Gauss-Newton step over the per-pixel material only, so the
+lighting never has to be descended into.
+
+```python
+cfg["optimizer"]     = "VARPRO"
+cfg["varpro_space"]  = "natural"      # or "transformed"
+```
+
+`natural` optimises physical values in a box `[0,1]³ × [0.03,1] × [0,1]`; `transformed`
+optimises the raw parameters so `tr_albedo` / `tr_metallic` / `tr_roughness` are honoured.
+Both are regression-locked as golden cases J and K.
+
+Warm-starting VarPro from a gradient stage is pure config — the curriculum forwards any
+cfg key to a phase:
+
+```python
+cfg["curriculum"] = [
+    {"optimizer": "LBFGS",  "n_iter": 20},
+    {"optimizer": "VARPRO", "n_iter": 20, "varpro_space": "natural"},
+]
+```
+
+Measured on `1f19c3ef_v2/ct-ct_sh-frOn_env` (128² , 75 images, 40 iterations):
+
+| | albedo RMSE | roughness MAE | metallic MAE | recon | relight |
+|---|---|---|---|---|---|
+| LBFGS | 0.1075 | 0.3057 | 0.2326 | 0.0083 | 0.2262 |
+| VarPro | **0.0438** | **0.0742** | **0.0044** | 0.0052 | **0.1139** |
+| LBFGS → VarPro | 0.0437 | 0.1055 | 0.0071 | **0.0028** | 0.1729 |
+
+VarPro costs roughly 2x the wall time per run here and recovers metallic ~50x better —
+LBFGS barely moves it off its initialisation.
+
 ## Behaviour-preservation harness
 
 `tests/golden.py` records reference outputs for nine cases covering every branch that

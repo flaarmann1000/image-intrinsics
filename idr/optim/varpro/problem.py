@@ -106,7 +106,13 @@ class VarProSolver:
             ab = _fwd_albedo(ab, tr_ab)
             me = _fwd_metallic(me, tr_met)
             ro = _fwd_roughness(ro, tr_rou)
-        return torch.cat([ab, ro, me], dim=-1)
+        # DETACH. The model's parameters require grad, but VarPro never backpropagates
+        # through them -- it builds its own Jacobian with torch.func.jacfwd. Without this
+        # the whole active-set iteration and every line-search evaluation get recorded
+        # into an autograd graph that is never used: measured 3.25 GB of graph on a
+        # 128^2 x 75-image scene, enough to OOM a 4 GB card, against 0.51 GB for the
+        # actual VarPro tensors.
+        return torch.cat([ab, ro, me], dim=-1).detach()
 
     def _scatter(self, mat):
         """Write (M,5) back into the model's raw parameter tensors."""
@@ -130,13 +136,14 @@ class VarProSolver:
         and the regularizers `_forward` adds are not part of the eliminated problem.
         """
         nat = to_natural(mat, self.space, self.tr)
-        sh, active, info = solve_lighting_active_set(
-            self.geom, nat[:, :3], nat[:, 4:5], nat[:, 3:4], self.obs,
-            max_iters=self.active_iters, ridge=self.ridge)
-        recon, _ = forward_from_design(self.geom, nat[:, :3], nat[:, 4:5], nat[:, 3:4],
-                                       sh, active=active)
-        # `forward_from_design` and `self.obs` are both (n, M, 3) — no permute.
-        loss = float(((recon - self.obs) ** 2).sum().detach())
+        with torch.no_grad():
+            sh, active, info = solve_lighting_active_set(
+                self.geom, nat[:, :3], nat[:, 4:5], nat[:, 3:4], self.obs,
+                max_iters=self.active_iters, ridge=self.ridge)
+            recon, _ = forward_from_design(self.geom, nat[:, :3], nat[:, 4:5],
+                                           nat[:, 3:4], sh, active=active)
+            # `forward_from_design` and `self.obs` are both (n, M, 3) — no permute.
+            loss = float(((recon - self.obs) ** 2).sum())
         return loss, sh, active, info
 
     # ── one iteration ───────────────────────────────────────────────────────
