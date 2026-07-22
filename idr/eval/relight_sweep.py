@@ -25,7 +25,7 @@ than by a genuinely wrong decomposition.
 
 Used by run_decomposition.py (--relight_sweep / --relight_video) and usable directly:
 
-    from raw_optimizer.relight_sweep import relight_sweep
+    from idr.eval.relight_sweep import relight_sweep
     relight_sweep(run_dir, ds_dir, downsample=2, video=True)
 """
 import math

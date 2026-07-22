@@ -27,7 +27,7 @@ metrics stream to wandb. Resumable: runs with an existing metrics.json are
 skipped unless --force.
 
 With --relight_sweep / --relight_video it additionally relights the estimate under
-a directional light swept across azimuth (see raw_optimizer/relight_sweep.py) and
+a directional light swept across azimuth (see idr/eval/relight_sweep.py) and
 writes <run>/relight_sweep/. That is a harder test than the built-in relight metric,
 which re-lights under the val set's GT env SH — the same lighting family the
 optimizer was fit on. The sweep only reads the saved *_est.npy, so it also
@@ -148,7 +148,7 @@ def build_parser():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true", help="Redo runs even if metrics.json exists.")
     p.add_argument("--no_plots", action="store_true", help="Skip PNG artifact plotting.")
-    # ── directional relighting sweep (opt-in; see raw_optimizer/relight_sweep.py) ──
+    # ── directional relighting sweep (opt-in; see idr/eval/relight_sweep.py) ──
     p.add_argument("--relight_sweep", action="store_true",
                    help="Also relight the estimate under a directional light swept across "
                         "azimuth and compare against GT intrinsics through identical "
@@ -181,54 +181,7 @@ from idr.pipelines.decompose import decompose_scene# noqa: E402
 
 
 # ───────────────────────── plotting ──────────────────────────────────────────
-def save_intrinsics_plot(run_dir, m, save_path):
-    gt = Path(m["scene"])
-    panels = [("albedo GT", gt / "albedo.png", None),
-              ("albedo est", run_dir / "albedo_scaled.png", None),
-              ("albedo err", run_dir / "albedo_err.npy", f"RMSE={m['albedo_rmse']:.3f}"),
-              ("rough GT", gt / "roughness.png", None),
-              ("rough est", run_dir / "roughness_est.png", None),
-              ("rough err", run_dir / "roughness_err.npy", f"MAE={m['roughness_err_mean']:.3f}"),
-              ("metal GT", gt / "metallic.png", None),
-              ("metal est", run_dir / "metallic_est.png", None),
-              ("metal err", run_dir / "metallic_err.npy", f"MAE={m['metallic_err_mean']:.3f}")]
-    fig, ax = plt.subplots(3, 3, figsize=(9.5, 9.5))
-    for a, (t, p, sub) in zip(ax.flat, panels):
-        if Path(p).exists():
-            im = np.load(p) if str(p).endswith(".npy") else np.array(Image.open(p))
-            if str(p).endswith(".npy"):
-                im = im.squeeze()
-                if im.ndim == 3 and im.shape[-1] == 3:
-                    im = im.mean(-1)
-            a.imshow(im, cmap="gray" if im.ndim == 2 else None)
-        a.set_title(t + (f"\n{sub}" if sub else ""), fontsize=8); a.axis("off")
-    fig.suptitle(run_dir.name[:70], fontsize=8); plt.tight_layout()
-    fig.savefig(save_path, dpi=80); plt.close(fig)
-
-
-def save_relight_plots(run_dir, m, ds_dir, downsample):
-    keys = m.get("relight_keys", [])
-    rmses, maes = m.get("relight_rmse_per_light", []), m.get("relight_mae_per_light", [])
-    pdir = run_dir / "relight" / "plots"; pdir.mkdir(parents=True, exist_ok=True)
-    for k, key in enumerate(keys):
-        relit_p = run_dir / "relight" / f"relit_{key}.npy"
-        tgt_p = ds_dir / f"{key}.npy"
-        if not relit_p.exists() or not tgt_p.exists():
-            continue
-        relit = np.load(relit_p)
-        tgt = np.load(tgt_p)[::downsample, ::downsample]
-        resid = np.abs(relit - tgt).mean(-1)
-        fig, ax = plt.subplots(1, 3, figsize=(10, 3.4))
-        ax[0].imshow(np.clip(tgt / 2, 0, 1)); ax[0].set_title(f"target {key}", fontsize=8)
-        ax[1].imshow(np.clip(relit / 2, 0, 1)); ax[1].set_title("relit (est intrinsics + GT light)", fontsize=8)
-        im = ax[2].imshow(resid, cmap="inferno")
-        rm = rmses[k] if k < len(rmses) else float("nan")
-        ma = maes[k] if k < len(maes) else float("nan")
-        ax[2].set_title(f"residual  RMSE={rm:.4f}  MAE={ma:.4f}", fontsize=8)
-        plt.colorbar(im, ax=ax[2], fraction=0.046)
-        for a in ax:
-            a.axis("off")
-        plt.tight_layout(); fig.savefig(pdir / f"relight_{key}.png", dpi=80); plt.close(fig)
+from idr.eval.plots import save_intrinsics_plot, save_relight_plots
 
 
 # ───────────────────────── one run (executed in a worker process) ────────────
@@ -274,7 +227,7 @@ def maybe_relight_sweep(task, out_dir, ds_dir):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        from raw_optimizer.relight_sweep import relight_sweep
+        from idr.eval.relight_sweep import relight_sweep
         r = relight_sweep(out_dir, ds_dir, downsample=task["eff_ds"], **sw)
         return {**{k: r[k] for k in _SWEEP_ROW_KEYS if k in r}, "sweep_status": "ok"}
     except Exception as e:
