@@ -40,6 +40,7 @@ python scripts/decompose_batch.py --datasets_root <dir> --runs_root <dir> --reli
 python scripts/profile_perf.py --scene <dataset-leaf> --quick
 
 python scripts/sweep_cfg.py          # config sweep
+python scripts/synthetic_study.py --phase 1   # synthetic study: render, then --phase 2
 python scripts/improve_study.py      # study driver
 ```
 
@@ -66,7 +67,8 @@ differs — LBFGS, LM with each of the dense/CG/Schur solvers, SH2 and SH3, all 
 models, and the full `decompose_scene` pipeline — then re-checks them after a change.
 
 ```bash
-python tests/golden.py check          # ~2 min
+python tests/golden.py check          # ~2 min, numerical
+python tests/test_entrypoints.py       # modules, public names, CLIs still resolve
 python tests/golden.py record         # re-baseline (only when a change is intended)
 ```
 

@@ -8,13 +8,13 @@ perspective) view direction.
 Usage
 -----
     # Smoke-test: one shader, no regularization, 50 iters
-    python raw_optimizer/mit_dataset.py --dataset small --shader ct_sh --reg none --n-iter 50
+    python -m idr.pipelines.mit --dataset small --shader ct_sh --reg none --n-iter 50
 
     # Full 12-combination batch on small dataset
-    python raw_optimizer/mit_dataset.py --dataset small --shader all --reg all --n-iter 100
+    python -m idr.pipelines.mit --dataset small --shader all --reg all --n-iter 100
 
     # With perspective camera (horizontal FOV 70°)
-    python raw_optimizer/mit_dataset.py --dataset full --shader ct_env --hfov 70 --n-iter 200
+    python -m idr.pipelines.mit --dataset full --shader ct_env --hfov 70 --n-iter 200
 """
 
 from __future__ import annotations

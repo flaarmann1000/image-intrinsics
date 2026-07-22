@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 
 REM ── Configuration ───────────────────────────────────────────────────────────
 set PYTHON=python
-set SCRIPT=raw_optimizer\synthetic_ct_dataset.py
+set SCRIPT=scripts\synthetic_study.py
 set WIDTH=128
 set HEIGHT=128
 set N_ITER=100
