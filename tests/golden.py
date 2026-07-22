@@ -60,7 +60,7 @@ MAX_ITER = 10
 
 
 def _base_cfg(**over):
-    from raw_optimizer.synthetic_ct_dataset import DEFAULT_CFG
+    from idr.config import DEFAULT_CFG
     cfg = {**DEFAULT_CFG,
            "optimizer": "LBFGS", "n_iter": N_ITER, "lbfgs_max_iter": MAX_ITER,
            "log_every": 10 ** 9, "loss": "L2", "double": False,
@@ -180,7 +180,7 @@ def load_inputs(device="cuda"):
 
 def _env_geometry():
     from idr.render import EnvMap, SHLighting
-    from raw_optimizer.synthetic_ct_dataset import LIGHT_COLOR, LIGHT_INTENSITY
+    from idr.config import LIGHT_COLOR, LIGHT_INTENSITY
     ref = EnvMap.from_sh(SHLighting.directional(
         np.array([0, 0, 1], np.float32), LIGHT_COLOR, intensity=LIGHT_INTENSITY),
         resolution=32)
@@ -189,7 +189,7 @@ def _env_geometry():
 
 # ── the case matrix ──────────────────────────────────────────────────────────
 def case_ct_sh(inp, optimizer="LBFGS", sh_order=2, solver=None, n_img=None):
-    from raw_optimizer.synthetic_ct_dataset import _optimize_ct_sh
+    from idr.optim.models.ct_sh import _optimize_ct_sh
     cfg = _base_cfg(optimizer=optimizer, sh_order=sh_order)
     imgs, shs = inp["images"], inp["sh"]
     if optimizer == "LM":
@@ -209,7 +209,7 @@ def case_ct_sh(inp, optimizer="LBFGS", sh_order=2, solver=None, n_img=None):
 
 
 def case_ct_env(inp):
-    from raw_optimizer.synthetic_ct_dataset import _optimize_ct_env
+    from idr.optim.models.ct_env import _optimize_ct_env
     d, dw, eH, eW = _env_geometry()
     a, light, ma, mb, _sh, hist, _t = _optimize_ct_env(
         inp["images"], inp["Nhw"], inp["frag"], inp["mhw"], inp["cam"],
@@ -220,7 +220,7 @@ def case_ct_env(inp):
 
 
 def case_phong_sh(inp):
-    from raw_optimizer.synthetic_ct_dataset import _optimize_phong_sh
+    from idr.optim.models.phong_sh import _optimize_phong_sh
     a, light, ma, mb, _sh, hist, _t = _optimize_phong_sh(
         inp["images"], inp["Nhw"], inp["frag"], inp["mhw"], inp["cam"],
         gt_shininess=32.0, gt_ks=0.5, ka=0.0, kd=1.0, cfg=_base_cfg(),
@@ -230,7 +230,7 @@ def case_phong_sh(inp):
 
 
 def case_phong_env(inp):
-    from raw_optimizer.synthetic_ct_dataset import _optimize_phong_env
+    from idr.optim.models.phong_env import _optimize_phong_env
     d, dw, eH, eW = _env_geometry()
     a, light, ma, mb, _sh, hist, _t = _optimize_phong_env(
         inp["images"], inp["Nhw"], inp["frag"], inp["mhw"], inp["cam"],

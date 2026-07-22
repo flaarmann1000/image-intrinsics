@@ -1,7 +1,7 @@
 """
 MIT multi-illumination dataset: intrinsic decomposition with CT/Phong × SH/Env.
 
-Runs the same 4 optimizers from synthetic_ct_dataset.py on real multi-illumination
+Runs the same 4 optimizers from idr/optim/models/ on real multi-illumination
 images, using Marigold-predicted normals as geometry proxy and a frontal (or
 perspective) view direction.
 
@@ -37,14 +37,14 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from idr.render import EnvMap, SHLighting
-from raw_optimizer.synthetic_ct_dataset import (
-    _optimize_ct_sh, _optimize_ct_env,
-    _optimize_phong_sh, _optimize_phong_env,
-    DEFAULT_CFG, NAMED_TRANSFORMS, SHININESS_RANGE,
-    LIGHT_COLOR, LIGHT_INTENSITY,
-    _parse_transforms, _transforms_folder,
-    _sh_coeffs_to_env_img, _env_flat_to_img,
-)
+from idr.optim.models.ct_env import _optimize_ct_env
+from idr.optim.models.ct_sh import _optimize_ct_sh
+from idr.optim.models.phong_sh import _optimize_phong_sh
+from idr.optim.models.phong_env import _optimize_phong_env
+from idr.config import (DEFAULT_CFG, NAMED_TRANSFORMS, SHININESS_RANGE,
+                        LIGHT_COLOR, LIGHT_INTENSITY)
+from idr.optim.transforms import _parse_transforms, _transforms_folder
+from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
 
 
 # ─────────────────────────────────────── constants ───────────────────────────

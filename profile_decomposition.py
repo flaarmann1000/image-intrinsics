@@ -50,11 +50,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("WANDB_MODE", "disabled")
 
-import raw_optimizer.synthetic_ct_dataset as S                      # noqa: E402
+import idr.optim.steps as S                      # noqa: E402
 from idr.data.geometry import make_proxy_geometry     # noqa: E402
 from idr.data.scene_io import load_scene
-from raw_optimizer.synthetic_ct_dataset import _optimize_ct_sh, DEFAULT_CFG  # noqa: E402
-
+from idr.config import DEFAULT_CFG  # noqa: E402
+from idr.optim.models.ct_sh import _optimize_ct_sh
 OOM = torch.cuda.OutOfMemoryError if hasattr(torch.cuda, "OutOfMemoryError") else RuntimeError
 
 
@@ -247,6 +247,18 @@ def sec_breakdown(inp, args, R):
               f"--breakdown_img_batch <n> (see section 2 for what fits).")
         return
     p, wall = r["phases"], r["wall"]
+    # The phase timings only exist if S._opt_step was actually swapped for the timed
+    # wrapper. That patch works by rebinding a module attribute, so it is silently
+    # defeated if a caller does `from idr.optim.steps import _opt_step` (binding the
+    # original at import time) instead of calling steps._opt_step(). When that happened
+    # the profiler happily reported 0 ms forward over 46 closures, so fail loudly here.
+    if p["nclo"] and p["fwd"] <= 0.0:
+        raise SystemExit(
+            f"phase timing is dead: {p['nclo']} closures ran but forward measured "
+            f"{p['fwd']:.3f}s.\n"
+            f"    idr.optim.steps._opt_step was patched but the model did not go through "
+            f"it.\n    Check that idr/optim/models/*.py call `steps._opt_step(...)` rather "
+            f"than importing\n    the name directly.")
     internal = p["step"] - p["fwd"] - p["bwd"]
     misc = wall - p["step"] - p["extra"]
     rows = [("forward  (in closure)", p["fwd"], p["nclo"]),
@@ -506,7 +518,8 @@ sys.path.insert(0, r'{Path(__file__).resolve().parent}')
 from pathlib import Path
 from idr.data.geometry import make_proxy_geometry
 from idr.data.scene_io import load_scene
-from raw_optimizer.synthetic_ct_dataset import _optimize_ct_sh, DEFAULT_CFG
+from idr.config import DEFAULT_CFG
+from idr.optim.models.ct_sh import _optimize_ct_sh
 ds, K = {args.downsample}, {args.n_train}
 sc = load_scene(Path(r'{args.scene}'), gt_npy={not args.no_gt_npy})
 s = lambda a: np.ascontiguousarray(a[::ds, ::ds])
@@ -597,7 +610,7 @@ def sec_summary(args, R):
         best = max(wk, key=lambda x: x["runs_per_min"])
         print(f"  workers    -> {best['workers']} "
               f"({best['runs_per_min']/wk[0]['runs_per_min']:.2f}x vs 1 worker)")
-    print("\n  Also check `_make_optimizer` in raw_optimizer/synthetic_ct_dataset.py:")
+    print("\n  Also check `_make_optimizer` in idr/optim/steps.py:")
     print("    tolerance_grad=0 / tolerance_change=0 DISABLE LBFGS early stopping, so every")
     print("    outer step burns the full max_iter inner iterations even after convergence.")
 

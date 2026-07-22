@@ -10,3 +10,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 RESULTS_DIR = REPO_ROOT / "results"
 DEFAULT_SH_LIGHTS_DIR = RESULTS_DIR / "ref_sh_lighting"
+
+# Synthetic-study tree (generate_dataset writes here, run_study reads it back).
+SYNTHETIC_ROOT = REPO_ROOT / "synthetic_ct"
+DATASET_ROOT = SYNTHETIC_ROOT / "dataset"
+RESULTS_ROOT = SYNTHETIC_ROOT / "results"

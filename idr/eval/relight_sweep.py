@@ -39,7 +39,7 @@ from idr.data.geometry import make_proxy_geometry
 
 from idr.data.scene_io import load_scene
 
-from raw_optimizer.synthetic_ct_dataset import LIGHT_COLOR, LIGHT_INTENSITY
+from idr.config import LIGHT_COLOR, LIGHT_INTENSITY
 from idr.render import shade_ct_sh, SHLighting
 from idr.render.brdf import _get_ggx_sh_lut
 

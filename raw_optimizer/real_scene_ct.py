@@ -38,15 +38,10 @@ from idr.render import (
     EnvMap, SHLighting,
 )
 from idr.render.brdf import _get_ggx_sh_lut
-from raw_optimizer.synthetic_ct_dataset import (
-    _optimize_ct_sh,
-    _optimize_ct_env,
-    _sh_coeffs_to_env_img,
-    _env_flat_to_img,
-    DEFAULT_CFG,
-    LIGHT_COLOR,
-    LIGHT_INTENSITY,
-)
+from idr.optim.models.ct_sh import _optimize_ct_sh
+from idr.optim.models.ct_env import _optimize_ct_env
+from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
+from idr.config import DEFAULT_CFG, LIGHT_COLOR, LIGHT_INTENSITY
 from raw_optimizer.helper import _albedo_rmse
 
 _WANDB_ENTITY  = "DLVC-intrinsics"

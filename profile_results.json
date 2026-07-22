@@ -1,0 +1,77 @@
+{
+ "meta": {
+  "scene": "tests\\golden\\scene",
+  "res": 32,
+  "masked_px": 524,
+  "n_train": 8,
+  "n_val": 2,
+  "P": 2836,
+  "device": "cuda",
+  "fp64": false,
+  "ms_per_closure": 446.4824500028044,
+  "gpu": "NVIDIA GeForce GTX 1650 Ti",
+  "cpus": 12,
+  "total_profile_s": 1.6279909000149928
+ },
+ "breakdown": {
+  "wall": 1.052720399980899,
+  "fwd": 0.30538190028164536,
+  "bwd": 0.4503320998046547,
+  "lbfgs_internal": 0.24117869994370267,
+  "extra_forward": 0.012774600007105619,
+  "misc": 0.043053099943790585,
+  "closures": 46,
+  "outer": 2
+ },
+ "downsample": {
+  "rows": [
+   {
+    "downsample": 1,
+    "res": 32,
+    "masked_px": 524,
+    "P": 2836,
+    "oom": false,
+    "wall": 0.14544890000252053,
+    "s_per_outer": 0.14544890000252053,
+    "closures": 6,
+    "ms_per_closure": 24.241483333753422,
+    "fwd_bwd_s": 0.0872927000746131,
+    "lbfgs_internal_s": 0.011375999951269478,
+    "peak_gb": 0.018304512,
+    "final_loss": 0.002374689094722271
+   },
+   {
+    "downsample": 2,
+    "res": 16,
+    "masked_px": 131,
+    "P": 871,
+    "oom": false,
+    "wall": 0.20656989997951314,
+    "s_per_outer": 0.20656989997951314,
+    "closures": 6,
+    "ms_per_closure": 34.42831666325219,
+    "fwd_bwd_s": 0.11660299997311085,
+    "lbfgs_internal_s": 0.015205400064587593,
+    "peak_gb": 0.017413632,
+    "final_loss": 0.0027175070717930794
+   },
+   {
+    "downsample": 4,
+    "res": 8,
+    "masked_px": 33,
+    "P": 381,
+    "oom": false,
+    "wall": 0.18395939999027178,
+    "s_per_outer": 0.18395939999027178,
+    "closures": 6,
+    "ms_per_closure": 30.65989999837863,
+    "fwd_bwd_s": 0.10848329996224493,
+    "lbfgs_internal_s": 0.0147763000568375,
+    "peak_gb": 0.01719552,
+    "final_loss": 0.0022686750162392855
+   }
+  ],
+  "alpha": -0.08510629655976248,
+  "base_ds": 4
+ }
+}
