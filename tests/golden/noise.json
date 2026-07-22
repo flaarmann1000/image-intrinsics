@@ -4,5 +4,12 @@
   "metallic_est": 0.0,
   "metrics": 0.0,
   "roughness_est": 0.0
+ },
+ "I": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
  }
 }

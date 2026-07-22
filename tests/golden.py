@@ -197,6 +197,10 @@ def case_ct_sh(inp, optimizer="LBFGS", sh_order=2, solver=None, n_img=None):
         # residual/Jacobian/solve path; more only costs time.
         cfg.update(n_iter=3, lm_batch_size=0, lm_jacobian_mode="forward",
                    lm_linear_solver=solver or "dense")
+        if solver == "schur":
+            # schur eliminates the block-diagonal per-pixel Hessian exactly, which
+            # requires pixel-separable regularizers -- TV couples neighbours.
+            cfg["lambda_tv"] = 0.0
         n_img = n_img or 4
     if n_img:
         imgs, shs = imgs[:n_img], shs[:n_img]
@@ -275,6 +279,8 @@ CASES = {
           lambda i: case_ct_sh(i, optimizer="LM", solver="dense")),
     "C": ("ct_sh LM  cg      (lm matrix-free path, used at 512^2)",
           lambda i: case_ct_sh(i, optimizer="LM", solver="cg")),
+    "I": ("ct_sh LM  schur   (exact per-pixel elimination)",
+          lambda i: case_ct_sh(i, optimizer="LM", solver="schur")),
     "D": ("ct_sh LBFGS SH3   (order-3 basis + LUT band 3)", lambda i: case_ct_sh(i, sh_order=3)),
     "E": ("ct_env LBFGS      (env branch)", case_ct_env),
     "F": ("phong_sh LBFGS    (phong branch)", case_phong_sh),
