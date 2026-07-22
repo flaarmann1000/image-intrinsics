@@ -3131,9 +3131,7 @@ def _optimize_phong_env(
             recon_m   = shade_phong_env(view_m, N_m, albedo_m,
                                         env_pix_k, env_dirs_t, env_dw_t,
                                         ka, kd, ks_m, shininess_m,
-                                        sbatch=cfg.get("sbatch", 64),
-                                     spec_importance=cfg.get("spec_importance", False),
-                                     spec_samples=cfg.get("spec_samples", 64))
+                                        sbatch=cfg.get("sbatch", 64))
             recon = albedo.new_zeros(H, W, 3)
             recon.reshape(-1, 3)[flat_mask] = recon_m
             loss_data = loss_data + _loss_fn(recon, imgs_t[k], mask_t, cfg["loss"])
@@ -3158,8 +3156,7 @@ def _optimize_phong_env(
                                            env_pix_k, env_dirs_t, env_dw_t,
                                            ka, kd, ks_m, shininess_m,
                                            sbatch=cfg.get("sbatch", 64),
-                                     spec_importance=cfg.get("spec_importance", False),
-                                     spec_samples=cfg.get("spec_samples", 64), return_components=True)
+                                           return_components=True)
                 result.append(comps)
         return result
 
@@ -3208,9 +3205,7 @@ def _optimize_phong_env(
                 _r = _ab_t.new_zeros(H, W, 3)
                 _r.reshape(-1, 3)[flat_mask] = shade_phong_env(
                     view_m, N_m, _ab_m, _env_pix_all[_k], env_dirs_t, env_dw_t,
-                    ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64),
-                                     spec_importance=cfg.get("spec_importance", False),
-                                     spec_samples=cfg.get("spec_samples", 64))
+                    ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64))
                 _r *= mask_t
                 _recons.append(wandb.Image(_r.float().cpu().numpy()))
                 _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
@@ -3289,9 +3284,7 @@ def _optimize_phong_env(
                         _r = _ab_t.new_zeros(H, W, 3)
                         _r.reshape(-1, 3)[flat_mask] = shade_phong_env(
                             view_m, N_m, _ab_m, env_pix_all[_k], env_dirs_t, env_dw_t,
-                            ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64),
-                                     spec_importance=cfg.get("spec_importance", False),
-                                     spec_samples=cfg.get("spec_samples", 64))
+                            ka, kd, _ks_m, _shin_m, sbatch=cfg.get("sbatch", 64))
                         _r *= mask_t
                         _recons.append(wandb.Image(_r.float().cpu().numpy()))
                         _errs.append(wandb.Image((_r - imgs_t[_k]).abs().mul(mask_t).float().cpu().numpy()))
