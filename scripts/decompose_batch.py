@@ -103,9 +103,35 @@ def build_parser():
                    help="Read the observations from light_*.npy when the dataset variant is "
                         "png-based (default True). No effect on 'exr' datasets, which always "
                         "load .npy.")
-    p.add_argument("--optimizer", default="LBFGS", choices=["LBFGS", "Adam", "LM"],
+    p.add_argument("--optimizer", default="LBFGS",
+                   choices=["LBFGS", "Adam", "LM", "VARPRO"],
                    help="LM = Levenberg-Marquardt (ct_sh only). Needs far fewer iterations "
-                        "than LBFGS, but each one builds + solves the normal equations.")
+                        "than LBFGS, but each one builds + solves the normal equations. "
+                        "VARPRO = variable projection (ct_sh only): eliminates the SH "
+                        "lighting in closed form each iteration and takes a "
+                        "lighting-projected Gauss-Newton step over the material.")
+    # ── VarPro (see idr/optim/varpro/) ────────────────────────────────────────
+    p.add_argument("--varpro_space", default="natural",
+                   choices=["natural", "transformed"],
+                   help="natural: optimise physical values in a box, ignoring tr_*. "
+                        "transformed: optimise the raw params, honouring tr_albedo/"
+                        "tr_metallic/tr_roughness.")
+    p.add_argument("--varpro_chunk", type=int, default=4096,
+                   help="Pixels per chunk in the Woodbury step. The coupling term U is "
+                        "(chunk, 5, n_img*3*n_sh); lower this if it does not fit.")
+    p.add_argument("--varpro_lam_init", type=float, default=1e-3,
+                   help="Initial Marquardt damping. The reduced Hessian is near-singular "
+                        "by construction (cond ~1e15), so damping is not optional.")
+    p.add_argument("--varpro_active_iters", type=int, default=8,
+                   help="Active-set iterations in the lighting solve. The set can cycle "
+                        "rather than converge; the returned state is self-consistent "
+                        "either way.")
+    p.add_argument("--curriculum", default=None,
+                   help="JSON list of phase dicts, each overriding any cfg key, run in "
+                        "order with the previous phase warm-starting the next. This is "
+                        "how GD->VarPro is expressed, e.g. "
+                        '\'[{"optimizer":"LBFGS","n_iter":200},'
+                        '{"optimizer":"VARPRO","n_iter":30}]\'')
     p.add_argument("--lm_batch_size", type=int, default=0,
                    help="LM: images per step. 0 = full batch (deterministic, recommended).")
     p.add_argument("--lm_jacobian_max_num_rows", type=int, default=0,
@@ -312,6 +338,30 @@ def discover_datasets(args):
     return items
 
 
+def _parse_curriculum(spec):
+    """Parse --curriculum JSON into a list of phase dicts, failing early and clearly.
+
+    Validated here rather than deep inside decompose_scene: a malformed phase would
+    otherwise surface as a confusing failure after the dataset has already loaded, or
+    worse, be silently ignored and produce a run that looks fine but never ran the
+    phase you asked for.
+    """
+    try:
+        phases = json.loads(spec)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--curriculum is not valid JSON: {e}\n  got: {spec}")
+    if not isinstance(phases, list) or not phases:
+        raise SystemExit(f"--curriculum must be a non-empty JSON list of phase dicts, "
+                         f"got {type(phases).__name__}")
+    for i, ph in enumerate(phases):
+        if not isinstance(ph, dict):
+            raise SystemExit(f"--curriculum phase {i} must be an object, got {ph!r}")
+        opt = str(ph.get("optimizer", "LBFGS")).upper()
+        if opt not in ("LBFGS", "ADAM", "LM", "VARPRO"):
+            raise SystemExit(f"--curriculum phase {i}: unknown optimizer {opt!r}")
+    return phases
+
+
 def build_tasks(args, items):
     base_cfg = {
         "n_iter": args.n_iter, "lbfgs_max_iter": args.lbfgs_max_iter, "log_every": args.log_every,
@@ -323,6 +373,10 @@ def build_tasks(args, items):
         "gt_npy": args.gt_npy, "use_npy": args.use_npy,
         "log_gt_recon_images": args.log_gt_recon_images,
         "optimizer": args.optimizer,
+        "varpro_space": args.varpro_space, "varpro_chunk": args.varpro_chunk,
+        "varpro_lam_init": args.varpro_lam_init,
+        "varpro_active_iters": args.varpro_active_iters,
+        **({"curriculum": _parse_curriculum(args.curriculum)} if args.curriculum else {}),
         "lm_batch_size": args.lm_batch_size, "lm_damping": args.lm_damping,
         "lm_solver": args.lm_solver, "lm_jacobian_mode": args.lm_jacobian_mode,
         "lm_jacobian_max_num_rows": args.lm_jacobian_max_num_rows,

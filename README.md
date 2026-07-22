@@ -100,14 +100,19 @@ optimises the raw parameters so `tr_albedo` / `tr_metallic` / `tr_roughness` are
 Both are regression-locked as golden cases J and K.
 
 Warm-starting VarPro from a gradient stage is pure config — the curriculum forwards any
-cfg key to a phase:
+cfg key to a phase, and `scripts/decompose_batch.py` takes it as JSON:
 
-```python
-cfg["curriculum"] = [
-    {"optimizer": "LBFGS",  "n_iter": 20},
-    {"optimizer": "VARPRO", "n_iter": 20, "varpro_space": "natural"},
-]
+```bash
+python scripts/decompose_batch.py --optimizer VARPRO --varpro_space natural --double 0 ...
+
+python scripts/decompose_batch.py --double 0 --curriculum   '[{"optimizer":"LBFGS","n_iter":200},{"optimizer":"VARPRO","n_iter":30}]' ...
 ```
+
+**Use `--double 0` with VarPro.** fp64 is ~7x slower here for no gain (measured: albedo
+RMSE 0.0392 fp64 vs 0.0354 fp32 at the same budget) because VarPro's cost is dominated by
+dense linear algebra. The caveat is that the reference implementation warns fp32 is
+unverified in the low-roughness band; roughness recovered cleanly in these runs, but that
+band is where to look first if a result seems off.
 
 Measured on `1f19c3ef_v2/ct-ct_sh-frOn_env` (128² , 75 images, 40 iterations):
 
