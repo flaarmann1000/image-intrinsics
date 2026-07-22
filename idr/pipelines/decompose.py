@@ -22,8 +22,9 @@ from idr.render.brdf import _get_ggx_sh_lut
 from idr.data.scene_io import load_scene
 from idr.data.geometry import make_proxy_geometry, _subsample_mask
 from idr.data.build import render_scene, render_3dfront_dataset
-from idr.optim.models.ct_sh import _optimize_ct_sh
-from idr.optim.models.ct_env import _optimize_ct_env
+from idr.optim.models.ct_sh import _optimize_ct_sh   # curriculum warm-start only
+from idr.optim.registry import optimize
+from idr.optim.result import EnvGrid
 from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
 from idr.data.synthetic_scene import _make_lights_random_sh
 from idr.config import DEFAULT_CFG, NAMED_TRANSFORMS, LIGHT_COLOR, LIGHT_INTENSITY
@@ -349,39 +350,26 @@ def decompose_scene(
                 val_images=None, val_sh_coeffs=None, init_maps=_curr_init_maps)
             _curr_init_maps = {"albedo": _a, "sh": _s, "metallic": _m, "roughness": _b}
 
-    if shader == "ct_sh":
-        albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
-            images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-            gt_metallic, gt_roughness, cfg,
-            wandb_run=run,
-            gt_sh_coeffs=gt_sh_coeffs,
-            gt_albedo=gt_albedo,
-            opt_params=_eff_op_sh,
-            init_from_gt=init_from_gt,
-            log_gradients=log_gradients,
-            grad_log_dir=grad_log_dir,
-            val_images=val_imgs,
-            val_sh_coeffs=val_sh,
-            init_maps=_curr_init_maps,
-        )
-    elif shader == "ct_env":
-        albedo, env_maps_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(
-            images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-            gt_metallic, gt_roughness,
-            env_dirs, env_dw, cfg,
-            wandb_run=run,
-            env_H=env_H, env_W=env_W,
-            gt_sh_coeffs=gt_sh_coeffs,
-            gt_albedo=gt_albedo,
-            opt_params=_eff_op_env,
-            init_from_gt=init_from_gt,
-            log_gradients=log_gradients,
-            grad_log_dir=grad_log_dir,
-            val_images=val_imgs,
-            val_sh_coeffs=val_sh,
-        )
-    else:
+    if shader not in ("ct_sh", "ct_env"):
         raise ValueError(f"shader must be 'ct_sh' or 'ct_env', got {shader!r}")
+    _res = optimize(
+        shader, images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
+        gt_metallic, gt_roughness, cfg,
+        env=EnvGrid(env_dirs, env_dw, env_H, env_W) if shader == "ct_env" else None,
+        wandb_run=run,
+        gt_sh_coeffs=gt_sh_coeffs,
+        gt_albedo=gt_albedo,
+        opt_params=_eff_op_env if shader == "ct_env" else _eff_op_sh,
+        init_from_gt=init_from_gt,
+        log_gradients=log_gradients,
+        grad_log_dir=grad_log_dir,
+        val_images=val_imgs,
+        val_sh_coeffs=val_sh,
+        **({} if shader == "ct_env" else {"init_maps": _curr_init_maps}),
+    )
+    albedo, mat_a, mat_b = _res.albedo, _res.mat_a, _res.mat_b
+    shadings, history, elapsed = _res.shadings, _res.history, _res.elapsed
+    sh_out, env_maps_out = _res.sh, _res.env_maps
 
     # ── albedo RMSE/MAE + scale ────────────────────────────────────────────────
     mask_flat  = mask_np.reshape(-1)

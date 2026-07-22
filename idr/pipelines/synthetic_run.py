@@ -27,10 +27,8 @@ from idr.data.geometry import make_proxy_geometry
 from idr.data.synthetic_scene import _get_light_entries, _scene_suffix, _scatter, _scatter_np
 from idr.data.synthetic_io import _read_dataset_meta
 from idr.optim.transforms import _parse_transforms, _transforms_folder, _fwd_albedo
-from idr.optim.models.ct_sh import _optimize_ct_sh
-from idr.optim.models.ct_env import _optimize_ct_env
-from idr.optim.models.phong_sh import _optimize_phong_sh
-from idr.optim.models.phong_env import _optimize_phong_env
+from idr.optim.registry import optimize
+from idr.optim.result import EnvGrid
 from idr.eval.metrics import _albedo_lighting_scale, _rescale_albedo_lighting
 from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
 from raw_optimizer.helper import _albedo_rmse
@@ -211,44 +209,24 @@ def run_study(
         sh_out:   np.ndarray = np.empty(0)
         env_maps: np.ndarray = np.empty(0)
 
-        if shader == "ct_sh":
-            albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
-                images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_met_map, gt_rough_map, cfg,  # type: ignore[possibly-undefined]
-                wandb_run=run, gt_sh_coeffs=gt_sh_list,
-                gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
-                init_from_gt=init_from_gt, log_gradients=log_gradients,
-                grad_log_dir=grad_log_dir,
-            )
-        elif shader == "ct_env":
-            albedo, env_maps, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(
-                images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_met_map, gt_rough_map, env_dirs, env_dw, cfg,  # type: ignore[possibly-undefined]
-                wandb_run=run, env_H=env_H, env_W=env_W,
-                gt_sh_coeffs=gt_sh_list, gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
-                init_from_gt=init_from_gt, log_gradients=log_gradients,
-                grad_log_dir=grad_log_dir,
-            )
-        elif shader == "phong_sh":
-            albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_phong_sh(
-                images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_shin_map, gt_ks_map,  # type: ignore[possibly-undefined]  # spatial GT (broadcast-compatible)
-                mat_cfg["ka"], mat_cfg["kd"], cfg,
-                wandb_run=run, gt_sh_coeffs=gt_sh_list,
-                gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
-                init_from_gt=init_from_gt, log_gradients=log_gradients,
-                grad_log_dir=grad_log_dir,
-            )
-        else:  # phong_env
-            albedo, env_maps, mat_a, mat_b, shadings, history, elapsed = _optimize_phong_env(
-                images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                gt_shin_map, gt_ks_map,  # type: ignore[possibly-undefined]  # spatial GT
-                mat_cfg["ka"], mat_cfg["kd"],
-                env_dirs, env_dw, cfg, wandb_run=run, env_H=env_H, env_W=env_W,
-                gt_sh_coeffs=gt_sh_list, gt_albedo=gt_color, opt_params=opt_params, transforms=tr,
-                init_from_gt=init_from_gt, log_gradients=log_gradients,
-                grad_log_dir=grad_log_dir,
-            )
+        _is_ph = shader.startswith("phong")
+        _res = optimize(
+            shader, images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
+            (gt_shin_map if _is_ph else gt_met_map),
+            (gt_ks_map   if _is_ph else gt_rough_map),
+            cfg,
+            ka=(mat_cfg["ka"] if _is_ph else None),
+            kd=(mat_cfg["kd"] if _is_ph else None),
+            env=(EnvGrid(env_dirs, env_dw, env_H, env_W)
+                 if shader.endswith("_env") else None),
+            wandb_run=run, gt_sh_coeffs=gt_sh_list, gt_albedo=gt_color,
+            opt_params=opt_params, transforms=tr, init_from_gt=init_from_gt,
+            log_gradients=log_gradients, grad_log_dir=grad_log_dir,
+        )
+        albedo, mat_a, mat_b = _res.albedo, _res.mat_a, _res.mat_b
+        shadings, history, elapsed = _res.shadings, _res.history, _res.elapsed
+        sh_out   = _res.sh       if _res.sh       is not None else np.empty(0)
+        env_maps = _res.env_maps if _res.env_maps is not None else np.empty(0)
 
         # mat_a = metallic or shininess (H,W,1), mat_b = roughness or ks (H,W,1)
         gt_a = gt_shin   if is_phong else gt_metallic   # type: ignore[possibly-undefined]

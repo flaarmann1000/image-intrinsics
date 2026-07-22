@@ -38,8 +38,8 @@ from idr.render import (
     EnvMap, SHLighting,
 )
 from idr.render.brdf import _get_ggx_sh_lut
-from idr.optim.models.ct_sh import _optimize_ct_sh
-from idr.optim.models.ct_env import _optimize_ct_env
+from idr.optim.registry import optimize
+from idr.optim.result import EnvGrid
 from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
 from idr.config import DEFAULT_CFG, LIGHT_COLOR, LIGHT_INTENSITY
 from raw_optimizer.helper import _albedo_rmse
@@ -359,27 +359,20 @@ def decompose_scene(
 
     # ── optimize ──────────────────────────────────────────────────────────────
     t0 = time.time()
-    if shader == "ct_sh":
-        albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
-            images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-            gt_metallic, gt_roughness, cfg,
-            wandb_run=run,
-            gt_albedo=gt_albedo,
-            log_gradients=log_gradients,
-            grad_log_dir=grad_log_dir,
-        )
-    elif shader == "ct_env":
-        albedo, env_maps_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(
-            images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-            gt_metallic, gt_roughness,
-            env_dirs, env_dw, cfg,
-            wandb_run=run,
-            gt_albedo=gt_albedo,
-            log_gradients=log_gradients,
-            grad_log_dir=grad_log_dir,
-        )
-    else:
+    if shader not in ("ct_sh", "ct_env"):
         raise ValueError(f"shader must be 'ct_sh' or 'ct_env', got {shader!r}")
+    _res = optimize(
+        shader, images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
+        gt_metallic, gt_roughness, cfg,
+        env=(EnvGrid(env_dirs, env_dw, env_H, env_W) if shader == "ct_env" else None),
+        wandb_run=run,
+        gt_albedo=gt_albedo,
+        log_gradients=log_gradients,
+        grad_log_dir=grad_log_dir,
+    )
+    albedo, mat_a, mat_b = _res.albedo, _res.mat_a, _res.mat_b
+    shadings, history, elapsed = _res.shadings, _res.history, _res.elapsed
+    sh_out, env_maps_out = _res.sh, _res.env_maps
 
     # ── albedo RMSE + scale ────────────────────────────────────────────────────
     mask_flat  = mask_np.reshape(-1)

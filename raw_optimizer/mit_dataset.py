@@ -37,10 +37,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from idr.render import EnvMap, SHLighting
-from idr.optim.models.ct_env import _optimize_ct_env
-from idr.optim.models.ct_sh import _optimize_ct_sh
-from idr.optim.models.phong_sh import _optimize_phong_sh
-from idr.optim.models.phong_env import _optimize_phong_env
+from idr.optim.registry import optimize
+from idr.optim.result import EnvGrid
 from idr.config import (DEFAULT_CFG, NAMED_TRANSFORMS, SHININESS_RANGE,
                         LIGHT_COLOR, LIGHT_INTENSITY)
 from idr.optim.transforms import _parse_transforms, _transforms_folder
@@ -263,38 +261,19 @@ def run_mit_decomposition(
             sh_out   = np.zeros(0)
             env_maps = np.zeros(0)
 
-            if shader_name == "ct_sh":
-                albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_sh(
-                    images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                    gt_metallic=0.0, gt_roughness=0.5,
-                    cfg=cfg, wandb_run=wandb_run,
-                    gt_sh_coeffs=None, gt_albedo=None, opt_params=None, transforms=tr,
-                )
-            elif shader_name == "ct_env":
-                albedo, env_maps, mat_a, mat_b, shadings, history, elapsed = _optimize_ct_env(
-                    images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                    gt_metallic=0.0, gt_roughness=0.5,
-                    env_dirs=env_dirs_np, env_dw=env_dw_np,
-                    cfg=cfg, wandb_run=wandb_run,
-                    env_H=env_H, env_W=env_W,
-                    gt_sh_coeffs=None, gt_albedo=None, opt_params=None, transforms=tr,
-                )
-            elif shader_name == "phong_sh":
-                albedo, sh_out, mat_a, mat_b, shadings, history, elapsed = _optimize_phong_sh(
-                    images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                    gt_shininess=32.0, gt_ks=0.5, ka=0.0, kd=1.0,
-                    cfg=cfg, wandb_run=wandb_run,
-                    gt_sh_coeffs=None, gt_albedo=None, opt_params=None, transforms=tr,
-                )
-            else:  # phong_env
-                albedo, env_maps, mat_a, mat_b, shadings, history, elapsed = _optimize_phong_env(
-                    images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
-                    gt_shininess=32.0, gt_ks=0.5, ka=0.0, kd=1.0,
-                    env_dirs=env_dirs_np, env_dw=env_dw_np,
-                    cfg=cfg, wandb_run=wandb_run,
-                    env_H=env_H, env_W=env_W,
-                    gt_sh_coeffs=None, gt_albedo=None, opt_params=None, transforms=tr,
-                )
+            _is_ph = shader_name.startswith("phong")
+            _res = optimize(
+                shader_name, images, normals_hw, frag_pos_hw, mask_hw, cam_pos,
+                (32.0 if _is_ph else 0.0), (0.5 if _is_ph else 0.5), cfg,
+                ka=(0.0 if _is_ph else None), kd=(1.0 if _is_ph else None),
+                env=(EnvGrid(env_dirs_np, env_dw_np, env_H, env_W)
+                     if shader_name.endswith("_env") else None),
+                wandb_run=wandb_run, gt_sh_coeffs=None, gt_albedo=None,
+                opt_params=None, transforms=tr,
+            )
+            albedo, mat_a, mat_b = _res.albedo, _res.mat_a, _res.mat_b
+            shadings, history, elapsed = _res.shadings, _res.history, _res.elapsed
+            sh_out, env_maps = _res.sh, _res.env_maps
 
             # ── metrics ───────────────────────────────────────────────────────
             mask_np    = mask_hw.cpu().numpy()
