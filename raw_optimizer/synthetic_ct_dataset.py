@@ -49,7 +49,6 @@ from raw_renderer_gpu import (
     Camera, EnvMap, SHLighting, build_sh_basis, generate_mesh, load_obj,
 )
 from raw_renderer_gpu.rasterizer import _norm, _get_ggx_sh_lut, _sh_irradiance, _sh_basis, _lut_lookup
-from raw_optimizer.optimizer import _tv
 from raw_optimizer.helper import _albedo_rmse
 
 
@@ -1071,6 +1070,18 @@ def _make_scheduler(opt, cfg, n_steps):
         gamma     = (floor / lr_0) ** (1.0 / max(n_steps, 1)) if lr_0 > 0 else 1.0
         return torch.optim.lr_scheduler.ExponentialLR(opt, gamma=gamma)
     return None
+
+
+def _tv(x: torch.Tensor) -> torch.Tensor:
+    """Isotropic total variation. x: [..., H, W] (last two dims are spatial).
+
+    Was imported from raw_optimizer/optimizer.py, whose only other export
+    (`optimize`) is a superseded pre-CT entry point; it now lives in legacy/misc/.
+    Companion of `_tv_residuals` below, which is the same penalty expressed as LM
+    residuals rather than a scalar."""
+    dh = x[..., 1:, :] - x[..., :-1, :]
+    dw = x[..., :, 1:] - x[..., :, :-1]
+    return (dh**2 + 1e-8).sqrt().mean() + (dw**2 + 1e-8).sqrt().mean()
 
 
 def _loss_fn(recon, target, mask_t, mode, huber_delta=0.05):
