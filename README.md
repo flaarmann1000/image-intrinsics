@@ -122,8 +122,9 @@ LBFGS barely moves it off its initialisation.
 
 ## Behaviour-preservation harness
 
-`tests/golden.py` records reference outputs for nine cases covering every branch that
-differs — LBFGS, LM with each of the dense/CG/Schur solvers, SH2 and SH3, all four
+`tests/golden.py` records reference outputs for eleven cases covering every branch that
+differs — LBFGS, LM with each of the dense/CG/Schur solvers, VarPro in both parameter
+spaces, SH2 and SH3, all four
 models, and the full `decompose_scene` pipeline — then re-checks them after a change.
 
 ```bash
@@ -135,7 +136,7 @@ python tests/golden.py record         # re-baseline (only when a change is inten
 Its inputs are **synthesized**, not loaded from a dataset directory: a sphere normal
 field with spatially varying maps, rendered through the project's own `shade_ct_sh`. So
 it has no dataset or external-drive dependency and reproduces identically anywhere. All
-nine cases are bitwise reproducible run-to-run, so the tolerance is `1e-9` rather than a
+eleven cases are bitwise reproducible run-to-run, so the tolerance is `1e-9` rather than a
 noise band — any real numeric drift shows up immediately.
 
 ## Notebooks
