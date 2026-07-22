@@ -45,3 +45,17 @@ def _rescale_albedo_lighting(
     for lp in lighting_params:
         lp.data /= scale  # (..., 3) / (3,) — broadcasts over all leading dims
     return scale
+
+
+def _albedo_rmse(est, gt):
+    est = est.detach().clone()
+    gt = gt.detach()
+    num = (gt * est).sum(0)
+    den = (est * est).sum(0).clamp_min(1e-8)
+    scale = num / den
+    est *= scale
+    return torch.sqrt(((gt - est)**2).mean()), scale
+
+
+# Public alias: notebooks and every optimizer import this, so it is API in practice.
+albedo_rmse = _albedo_rmse

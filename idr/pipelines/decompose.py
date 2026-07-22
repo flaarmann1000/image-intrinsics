@@ -28,7 +28,7 @@ from idr.optim.result import EnvGrid
 from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
 from idr.data.synthetic_scene import _make_lights_random_sh
 from idr.config import DEFAULT_CFG, NAMED_TRANSFORMS, LIGHT_COLOR, LIGHT_INTENSITY
-from raw_optimizer.helper import _albedo_rmse
+from idr.eval.metrics import _albedo_rmse
 
 _WANDB_ENTITY  = "DLVC-intrinsics"
 _WANDB_PROJECT = "3dfront_ct_decomp"

@@ -32,7 +32,7 @@ from idr.track.wandb_log import (
     _sh_coeffs_to_env_img, _env_flat_to_img, _save_grad_step, _structured_scalar_log,
 )
 from idr.data.synthetic_scene import _scatter, _scatter_np
-from raw_optimizer.helper import _albedo_rmse
+from idr.eval.metrics import _albedo_rmse
 from idr.optim.lm.problem import build_lm_solver
 from idr.config import _CT_SH_PARAMS
 from idr.render import shade_ct_sh

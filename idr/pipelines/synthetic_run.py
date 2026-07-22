@@ -31,7 +31,7 @@ from idr.optim.registry import optimize
 from idr.optim.result import EnvGrid
 from idr.eval.metrics import _albedo_lighting_scale, _rescale_albedo_lighting
 from idr.track.wandb_log import _sh_coeffs_to_env_img, _env_flat_to_img
-from raw_optimizer.helper import _albedo_rmse
+from idr.eval.metrics import _albedo_rmse
 
 _ALL_SHADERS = ["ct_sh", "ct_env", "phong_sh", "phong_env"]
 

@@ -3,10 +3,21 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "raw-renderer"
-version = "0.1.0"
+name = "idr"
+version = "0.2.0"
+description = "Intrinsic decomposition and relighting"
 requires-python = ">=3.9"
-dependencies = ["numpy", "Pillow"]
+dependencies = ["numpy", "Pillow", "torch"]
+
+[project.optional-dependencies]
+# Batch driving, experiment tracking and the relighting videos.
+study = ["pandas", "matplotlib", "wandb", "imageio", "imageio-ffmpeg"]
 
 [tool.setuptools.packages.find]
-include = ["raw_renderer*", "raw_renderer_gpu*"]
+# `legacy` is deliberately excluded: it is kept for reference, not for importing.
+include = ["idr*"]
+
+[tool.setuptools.package-data]
+# The GGX-SH lookup tables are loaded from disk next to idr/render/brdf.py. Without
+# them the first call silently recomputes a 512 x 8192 integration instead.
+"idr.render" = ["*.npz"]
