@@ -189,14 +189,15 @@ def _env_geometry():
 
 # ── the case matrix ──────────────────────────────────────────────────────────
 def case_ct_sh(inp, optimizer="LBFGS", sh_order=2, solver=None, n_img=None,
-               varpro_space=None):
+               varpro_space=None, n_inner_rho=0):
     from idr.optim.models.ct_sh import _optimize_ct_sh
     cfg = _base_cfg(optimizer=optimizer, sh_order=sh_order)
     if varpro_space is not None:
         # VarPro eliminates the lighting each iteration, so a handful of outer steps
-        # already exercises the whole path (design -> active set -> Woodbury -> line
-        # search); more only costs time.
-        cfg.update(n_iter=4, varpro_space=varpro_space, varpro_chunk=2048)
+        # already exercises the whole path (design -> active set -> Woodbury -> per-pixel
+        # line search -> Nielsen damping); more only costs time.
+        cfg.update(n_iter=4, varpro_space=varpro_space, varpro_chunk=2048,
+                   varpro_n_inner_rho=n_inner_rho)
     imgs, shs = inp["images"], inp["sh"]
     if optimizer == "LM":
         # 3 outer steps on a few images is enough to move every parameter through the
@@ -295,6 +296,9 @@ CASES = {
           lambda i: case_ct_sh(i, optimizer="VARPRO", varpro_space="natural")),
     "K": ("ct_sh VARPRO transformed  (same, Jacobian chained through _fwd_*)",
           lambda i: case_ct_sh(i, optimizer="VARPRO", varpro_space="transformed")),
+    "L": ("ct_sh VARPRO + profiled rho (inner albedo Gauss-Newton)",
+          lambda i: case_ct_sh(i, optimizer="VARPRO", varpro_space="natural",
+                               n_inner_rho=10)),
     "H": ("decompose_scene   (pipeline: IO+metrics+artifacts)", case_pipeline),
 }
 

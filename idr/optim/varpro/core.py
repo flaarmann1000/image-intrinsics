@@ -136,7 +136,7 @@ def _chol_inv_lower(gram, n_sh, ridge=1e-10):
 
 def woodbury_step(geom, material, sh, active, gram, observations, lam,
                   space="natural", transforms=None, chunk=4096, max_bytes=None,
-                  store_jac=True):
+                  store_jac=True, lam_rel_init=1e-3):
     """One damped reduced Gauss-Newton step.
 
     material     (M,5) in `space`: [albedo(3), roughness, metallic]
@@ -211,8 +211,20 @@ def woodbury_step(geom, material, sh, active, gram, observations, lam,
         if store_jac:
             jac_store.append(Dj)
 
-    # Marquardt scaling on the diagonal of the REDUCED Hessian, matching the reference.
-    Lam = lam * (Dbd.diagonal(dim1=1, dim2=2) - diagUU).clamp_min(1e-12)
+    # Marquardt scaling on the diagonal of the REDUCED Hessian. `lam` may be a scalar or
+    # one value PER PIXEL: pixels differ enormously in conditioning (a shadowed or
+    # near-grazing pixel constrains its material far more weakly than a well-lit one), so
+    # a single global trust region is set by the worst pixel and throttles all the rest.
+    diagH = (Dbd.diagonal(dim1=1, dim2=2) - diagUU).clamp_min(1e-12)
+    if lam is None:
+        # Seed per-pixel damping from the curvature, as the reference does
+        # (lam0 = 1e-3 * max diag H). It has to happen here: the caller cannot know the
+        # Hessian before the step that computes it. The seeded value comes back in
+        # info["lam"] so the caller can carry it forward.
+        lam = lam_rel_init * diagH.max(dim=1).values
+    _lam = lam if not torch.is_tensor(lam) else (
+        lam[:, None] if lam.dim() == 1 else lam)
+    Lam = _lam * diagH
     K = Dbd + torch.diag_embed(Lam)
     Kf, info_k = torch.linalg.cholesky_ex(K)
     if int((info_k != 0).sum()):
@@ -239,5 +251,9 @@ def woodbury_step(geom, material, sh, active, gram, observations, lam,
         Y = torch.cholesky_solve(_U(lo, hi, Dj), Kf[lo:hi])
         delta[lo:hi] += torch.einsum('bam,m->ba', Y, w)
 
+    # Lam and g are returned because the caller's trust-region gain ratio needs the
+    # predicted reduction  0.5 * step^T (Lam*step - g), which cannot be reconstructed
+    # from delta alone. diagH seeds a per-pixel lam0.
     return delta, {"loss": loss, "m": m, "chunks": len(slices),
-                   "grad_norm": float(g.norm())}
+                   "grad_norm": float(g.norm()), "Lam": Lam, "g": g, "diagH": diagH,
+                   "lam": lam}

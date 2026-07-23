@@ -158,17 +158,34 @@ python scripts/decompose_batch.py --datasets_root <dir> --runs_root <dir> \
                     "lambda_tv":0,"lambda_sparse":0,"lambda_white":0}]'
 ```
 
-**Three VarPro refinements are not implemented here**, so this reproduces the recipe's
-shape and hyperparameters but not its polish step exactly:
+All three of the reference's VarPro refinements are implemented:
 
-- **profiled albedo** (`--n-inner-rho 10`): an inner loop re-solving albedo in closed form
-  each iteration, exploiting the render being linear in it
-- **per-pixel damping**: `lam0 = 1e-3 * diagH.max(dim=1)` per pixel, versus one scalar here
-- **per-pixel accept/reject** with a Nielsen gain-ratio update
-  (`lam * clamp_min(1 - (2*rho-1)^3, 1/3)`), versus a global "did the total loss drop"
+- **per-pixel damping** seeded as `lam0 = 1e-3 * max diag(H)`, and **per-pixel
+  accept/reject** with a Nielsen gain-ratio update — both always on. Measured against a
+  single scalar lam with global acceptance: 2.5x lower final loss and 27% better
+  roughness at equal iterations, for ~25% more wall time. Pixels genuinely diverge —
+  observed `lam` spanning nine orders of magnitude within one image, and 50-75% of pixels
+  accepting per iteration rather than all or nothing.
+- **profiled albedo** (`--varpro_n_inner_rho 10`), opt-in and **off by default**, because
+  it is a *polish* tool rather than a general improvement (see below).
 
-They were deferred as "Stage B" because VarPro already beat LBFGS clearly without them.
-Expect this configuration to track the reference qualitatively, not numerically.
+`--varpro_n_inner_rho` drives albedo to its conditional optimum for the CURRENT roughness
+and metallic. Measured on the golden scene:
+
+| | albedo RMSE | roughness MAE | metallic MAE | recon |
+|---|---|---|---|---|
+| cold VarPro, no profiling | **0.1268** | **0.1569** | **0.2227** | **0.00142** |
+| cold VarPro, profiling | 0.2129 | 0.2021 | 0.3018 | 0.00370 |
+| GD → VarPro, no profiling | **0.1294** | 0.0953 | 0.0876 | 0.00047 |
+| GD → VarPro, profiling | 0.1317 | **0.0945** | **0.0546** | **0.00038** |
+
+From a cold start it is clearly harmful: it over-commits albedo to fit a still-wrong
+roughness/metallic. After a gradient warm start — the only way the reference uses it — it
+helps, cutting metallic error 37% and reconstruction 19%. Set it in the VarPro phase of a
+curriculum, not on a standalone run. It costs ~3x the wall time.
+
+(The inner solve converges in about 2 steps, not 10, so `n_inner_rho=10` is mostly
+wasted work; it is kept as the default *value* only to match the reference.)
 
 One further difference: the reference sums its per-image loss over images where this repo
 means over them, a factor of `n_images`. Adam is per-parameter scale-invariant, so

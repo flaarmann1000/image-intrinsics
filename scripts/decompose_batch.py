@@ -122,6 +122,11 @@ def build_parser():
     p.add_argument("--varpro_lam_init", type=float, default=1e-3,
                    help="Initial Marquardt damping. The reduced Hessian is near-singular "
                         "by construction (cond ~1e15), so damping is not optional.")
+    p.add_argument("--varpro_n_inner_rho", type=int, default=0,
+                   help="Inner albedo Gauss-Newton steps per iteration (the reference "
+                        "uses 10). This is a POLISH tool: it drives albedo to its optimum "
+                        "for the CURRENT roughness/metallic, which helps after a GD warm "
+                        "start but hurts from a cold start. natural space only. 0 = off.")
     p.add_argument("--varpro_active_iters", type=int, default=8,
                    help="Active-set iterations in the lighting solve. The set can cycle "
                         "rather than converge; the returned state is self-consistent "
@@ -376,6 +381,7 @@ def build_tasks(args, items):
         "varpro_space": args.varpro_space, "varpro_chunk": args.varpro_chunk,
         "varpro_lam_init": args.varpro_lam_init,
         "varpro_active_iters": args.varpro_active_iters,
+        "varpro_n_inner_rho": args.varpro_n_inner_rho,
         **({"curriculum": _parse_curriculum(args.curriculum)} if args.curriculum else {}),
         "lm_batch_size": args.lm_batch_size, "lm_damping": args.lm_damping,
         "lm_solver": args.lm_solver, "lm_jacobian_mode": args.lm_jacobian_mode,

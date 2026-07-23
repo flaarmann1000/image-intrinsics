@@ -29,6 +29,7 @@ from idr.optim.transforms import (_fwd_albedo, _fwd_metallic, _fwd_roughness,
 from .core import to_natural, woodbury_step
 from .design import VarProGeometry, forward_from_design
 from .lighting import solve_lighting_active_set
+from .profile_rho import refine_rho
 
 __all__ = ["build_varpro_solver", "VarProSolver"]
 
@@ -78,14 +79,26 @@ class VarProSolver:
         if self.space not in ("natural", "transformed"):
             raise ValueError(f"varpro_space must be 'natural' or 'transformed', "
                              f"got {self.space!r}")
-        if cfg.get("varpro_profile_rho", False) and self.space == "transformed":
+        if int(cfg.get("varpro_n_inner_rho", 0)) > 0 and self.space == "transformed":
             # refine_rho works because the render is LINEAR in albedo; under a sigmoid
             # it is not. Fail loudly rather than silently skip the refinement.
-            raise ValueError("varpro_profile_rho requires varpro_space='natural' — the "
-                             "albedo profiling step relies on linearity in albedo, which "
-                             "a sigmoid transform destroys.")
-        self.lam = float(cfg.get("varpro_lam_init", 1e-3))
+            raise ValueError(
+                "varpro_n_inner_rho > 0 requires varpro_space='natural'. The albedo "
+                "profiling exploits the render's structure in albedo directly; a sigmoid "
+                "reparameterisation destroys it. Use natural space, or set "
+                "varpro_n_inner_rho=0 to run VarPro without profiling.")
+        # lam is PER PIXEL and seeded from the curvature on the first step, matching the
+        # reference's lam0 = 1e-3 * max diag(H). It cannot be built here because the
+        # Hessian is not known until the first Woodbury step, hence the None sentinel.
+        self.lam = None
+        self.lam_init_rel = float(cfg.get("varpro_lam_init", 1e-3))
         self.lam_ceiling = float(cfg.get("varpro_lam_ceiling", 1e10))
+        self.n_inner_rho = int(cfg.get("varpro_n_inner_rho", 0))
+        self._state = None
+        M = int(flat_mask.sum())
+        # Nielsen's failure multiplier, per pixel: doubles on each consecutive rejection
+        # so a pixel that keeps failing backs off geometrically.
+        self.v = torch.full((M,), 2.0, dtype=dtype, device=dev)
         self.active_iters = int(cfg.get("varpro_active_iters", 8))
         self.ridge = float(cfg.get("varpro_lighting_ridge", 1e-10))
         self.chunk = int(cfg.get("varpro_chunk", 4096))
@@ -130,63 +143,118 @@ class VarProSolver:
 
     # ── objective ───────────────────────────────────────────────────────────
     def _eval(self, mat):
-        """Eliminate the lighting for this material and return (loss, sh, active, info).
+        """-> (material, F_p, sh, active, info).
 
-        The loss is the data term only — VarPro's objective is the projected residual,
-        and the regularizers `_forward` adds are not part of the eliminated problem.
+        Eliminates the lighting, optionally profiles albedo, and returns the objective
+        PER PIXEL so the caller can accept or reject each pixel independently.
+        `F_p = 0.5 * sum(r^2)` over images and channels, matching the convention in which
+        `g = J^T r` is the gradient.
+
+        The returned material is not necessarily the one passed in: with
+        `varpro_profile_rho` the albedo is refined here, and that refined value is the
+        state the outer step continues from.
+
+        Only the data term — VarPro's objective is the projected residual, and the
+        regularizers `_forward` adds are not part of the eliminated problem.
         """
-        nat = to_natural(mat, self.space, self.tr)
         with torch.no_grad():
+            nat = to_natural(mat, self.space, self.tr)
             sh, active, info = solve_lighting_active_set(
                 self.geom, nat[:, :3], nat[:, 4:5], nat[:, 3:4], self.obs,
                 max_iters=self.active_iters, ridge=self.ridge)
+
+            if self.n_inner_rho > 0:
+                # Profile albedo toward its conditional optimum, then RE-solve the
+                # lighting for it: the two are coupled, and stopping after the albedo
+                # refinement would leave a lighting fitted to the pre-refinement albedo.
+                rho = refine_rho(self.geom, nat, sh, active, self.obs,
+                                 n_steps=self.n_inner_rho, chunk=self.chunk)
+                nat = torch.cat([rho, nat[:, 3:5]], dim=1)
+                mat = nat if self.space == "natural" else torch.cat(
+                    [_inv_albedo(rho, self.tr[0]), mat[:, 3:5]], dim=1)
+                sh, active, info = solve_lighting_active_set(
+                    self.geom, nat[:, :3], nat[:, 4:5], nat[:, 3:4], self.obs,
+                    max_iters=self.active_iters, ridge=self.ridge)
+
             recon, _ = forward_from_design(self.geom, nat[:, :3], nat[:, 4:5],
                                            nat[:, 3:4], sh, active=active)
             # `forward_from_design` and `self.obs` are both (n, M, 3) — no permute.
-            loss = float(((recon - self.obs) ** 2).sum())
-        return loss, sh, active, info
+            r = recon - self.obs
+            F_p = 0.5 * (r * r).sum(dim=(0, 2))          # (M,) per-pixel objective
+        return mat, F_p, sh, active, info
 
     # ── one iteration ───────────────────────────────────────────────────────
     def step(self):
-        mat = self._gather()
-        loss0, sh, active, linfo = self._eval(mat)
+        # The evaluated state carries over between iterations: the state settled at the
+        # end of one step is exactly the top-of-loop state of the next, so caching it
+        # saves a full lighting solve per iteration.
+        if self._state is None:
+            self._state = self._eval(self._gather())
+        mat, F_p, sh, active, linfo = self._state
 
-        delta, _sinfo = woodbury_step(
+        delta, sinfo = woodbury_step(
             self.geom, mat, sh, active, linfo["gram"], self.obs, self.lam,
             space=self.space, transforms=self.tr, chunk=self.chunk,
-            max_bytes=self.max_bytes)
+            max_bytes=self.max_bytes, lam_rel_init=self.lam_init_rel)
+        Lam, g = sinfo["Lam"], sinfo["g"]
+        self.lam = sinfo["lam"]        # seeded from curvature on the first step
 
-        # Backtrack. The reduced Hessian is near-singular, so a full step can overshoot
-        # badly; accept the first fraction that actually lowers the objective.
-        best = None
+        # PER-PIXEL line search. Pixels differ in how far the quadratic model stays
+        # trustworthy, so each keeps the first fraction that yields a positive gain
+        # ratio rather than the whole image sharing one fraction. Note each trial still
+        # moves ALL pixels (the lighting solve is global), so a pixel's F_try is measured
+        # with its neighbours also displaced -- an approximation the reference makes too.
+        best_mat = mat.clone()
+        best_F = F_p.clone()
+        best_ratio = torch.full_like(F_p, -1.0)
+        accepted = torch.zeros(F_p.shape[0], dtype=torch.bool, device=F_p.device)
+        n_tried = 0
         for f in self.fractions:
-            trial = mat + f * delta
+            n_tried += 1
+            stepv = f * delta
+            trial = mat + stepv
             if self.space == "natural":
                 trial = torch.max(torch.min(trial, self.upper), self.lower)
-            l_try, sh_try, act_try, _ = self._eval(trial)
-            if l_try < loss0:
-                best = (trial, l_try, sh_try, f)
+            _, F_try, _, _, _ = self._eval(trial)
+            # Predicted reduction of the damped quadratic model, per pixel.
+            predicted = 0.5 * (stepv * (Lam * stepv - g)).sum(dim=1)
+            ratio = torch.where(predicted > 0, (F_p - F_try) / predicted,
+                                torch.full_like(predicted, -1.0))
+            newly = (ratio > 0) & (~accepted)
+            best_mat = torch.where(newly[:, None], trial, best_mat)
+            best_F = torch.where(newly, F_try, best_F)
+            best_ratio = torch.where(newly, ratio, best_ratio)
+            accepted |= newly
+            if bool(accepted.all()):
                 break
-        if best is None:
-            # Nothing helped: shrink the trust region and leave the state untouched.
-            self.lam = min(self.lam * 10.0, self.lam_ceiling)
-            return {"accepted": False, "loss": loss0, "lam": self.lam, "frac": 0.0,
-                    "active_converged": linfo["converged"]}
 
-        trial, l_new, sh_new, frac = best
-        self._scatter(trial)
+        # Nielsen damping update: the shrink factor is continuous in the gain ratio
+        # (a near-perfect model shrinks lam by ~1/3, a marginal one barely at all),
+        # while a rejected pixel grows by v and doubles v -- so repeated failure backs
+        # off geometrically instead of at a fixed rate.
+        lam_ok = self.lam * torch.clamp_min(
+            1.0 - (2.0 * best_ratio.clamp(max=1.0) - 1.0) ** 3, 1.0 / 3.0)
+        self.lam = torch.where(accepted, lam_ok, self.lam * self.v).clamp(
+            max=self.lam_ceiling)
+        self.v = torch.where(accepted, torch.full_like(self.v, 2.0), self.v * 2.0)
+
+        n_acc = int(accepted.sum())
+        if n_acc == 0:
+            return {"accepted": 0, "frac_pixels": 0.0, "loss": float(F_p.sum()),
+                    "fractions_tried": n_tried, "active_converged": linfo["converged"]}
+
+        new_mat = torch.where(accepted[:, None], best_mat, mat)
+        # Re-evaluate once at the settled (mixed-fraction) material: this both writes a
+        # lighting that matches the material actually kept, and becomes the next step's
+        # cached state -- so it is not an extra solve.
+        self._state = self._eval(new_mat)
+        self._scatter(self._state[0])
         with torch.no_grad():
-            self.sh_coeffs.copy_(sh_new)
-        # Adapt the trust region to the step length that was actually usable. Accepting
-        # only a heavily shortened step means the quadratic model is over-reaching, so
-        # damping should RISE even though the iteration succeeded -- otherwise lam decays
-        # on every success and the line search pays for it again next iteration.
-        if frac >= self.fractions[0]:
-            self.lam = max(self.lam / 3.0, 1e-12)
-        elif frac <= self.fractions[-1]:
-            self.lam = min(self.lam * 2.0, self.lam_ceiling)
-        return {"accepted": True, "loss": l_new, "loss_prev": loss0, "lam": self.lam,
-                "frac": frac, "active_converged": linfo["converged"]}
+            self.sh_coeffs.copy_(self._state[2])
+        return {"accepted": n_acc, "frac_pixels": n_acc / F_p.shape[0],
+                "loss": float(self._state[1].sum()), "loss_prev": float(F_p.sum()),
+                "fractions_tried": n_tried, "active_converged": linfo["converged"],
+                "lam_median": float(self.lam.median())}
 
 
 def build_varpro_solver(cfg, albedo_param, sh_coeffs, metallic_raw, roughness_raw,
