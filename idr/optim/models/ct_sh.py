@@ -62,6 +62,8 @@ def _optimize_ct_sh(
     val_images:   Optional[list] = None,
     val_sh_coeffs: Optional[list] = None,
     init_maps:    Optional[dict] = None,
+    wandb_step_offset: int = 0,
+    wandb_phase:  Optional[int] = None,
 ) -> tuple:
     dev    = normals_hw.device
     ftype  = normals_hw.dtype
@@ -476,14 +478,22 @@ def _optimize_ct_sh(
             _rou_m = _get_rou().detach().reshape(-1, 1)[flat_mask]
             _init_scale = (_albedo_lighting_scale(albedo_param, tr_ab, flat_mask, _gt_ab_m)
                            if _gt_ab_m is not None else None)
-        wandb_run.log(_structured_scalar_log(
-            loss=_il, l_d=_ild, l_s=_ils, l_w=_ilw, l_tv=_iltv,
-            loss_ml=_loss_ml[0], loss_mb=_loss_mb[0], scale3=_init_scale,
-            gt_metrics=_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
-            relight=_relight_metrics(_ab_m, _met_m, _rou_m),
-            recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
-            lr=opt.param_groups[0]["lr"] if opt is not None else 0.0,
-        ), step=-1)
+        # The step=-1 "before optimization" baseline only makes sense once. In a
+        # curriculum every phase shares one wandb run on a single step timeline
+        # (wandb_step_offset), so later phases skip this -- their starting state is just
+        # the previous phase's final logged step.
+        if wandb_step_offset == 0:
+            _init_payload = _structured_scalar_log(
+                loss=_il, l_d=_ild, l_s=_ils, l_w=_ilw, l_tv=_iltv,
+                loss_ml=_loss_ml[0], loss_mb=_loss_mb[0], scale3=_init_scale,
+                gt_metrics=_gt_rmse_metrics(_ab_m, _met_m, _rou_m),
+                relight=_relight_metrics(_ab_m, _met_m, _rou_m),
+                recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
+                lr=opt.param_groups[0]["lr"] if opt is not None else 0.0,
+            )
+            if wandb_phase is not None:
+                _init_payload["phase"] = wandb_phase
+            wandb_run.log(_init_payload, step=-1)
     _rescale_every = cfg.get("rescale_every", 0)
     _img_batch = int(cfg.get("img_batch", 0) or 0)
     _use_img_batch = 0 < _img_batch < N_imgs
@@ -557,11 +567,18 @@ def _optimize_ct_sh(
                     recon_rmse=_recon_rmse[0], recon_mae=_recon_mae[0],
                     lr=opt.param_groups[0]["lr"] if opt is not None else 0.0)
                 _payload["elapsed_s"] = elapsed
+                if wandb_phase is not None:
+                    # Numeric so it charts as a step function: the boundary between
+                    # curriculum phases (e.g. LBFGS -> VarPro) is then visible on any
+                    # metric, and metrics can be grouped/filtered by phase in the UI.
+                    _payload["phase"] = wandb_phase
                 if _lm_info:
                     _payload["lm/damping"]  = _lm_info["damping"]
                     _payload["lm/accepted"] = float(_lm_info["accepted"])
                     _payload["lm/attempts"] = _lm_info["attempts"]
-                wandb_run.log(_payload, step=i)
+                # In a curriculum the phases lay end to end on one step timeline; the
+                # offset is 0 for a standalone run, so this is a no-op there.
+                wandb_run.log(_payload, step=i + wandb_step_offset)
     total_time = time.perf_counter() - t0
 
     with torch.no_grad():

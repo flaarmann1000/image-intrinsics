@@ -326,6 +326,7 @@ def decompose_scene(
     # last phase. Lets us freeze groups / go SH1->SH2 / fit lighting on a pixel
     # subset first, all within the existing metrics + artifact pipeline.
     _curr_init_maps = None
+    _wstep = 0                       # running wandb step offset across curriculum phases
     _curriculum = cfg.pop("curriculum", None)
     if shader == "ct_sh" and _curriculum:
         _seed0 = int(cfg.get("init_seed", 0) or 0)
@@ -349,13 +350,19 @@ def decompose_scene(
                   f"n_iter={_pcfg['n_iter']}"
                   + (f" pixels={_ph['pixel_frac']:.0%}" if _ph.get("pixel_frac") else ""),
                   flush=True)
+            # Curriculum phases now log to the SAME wandb run as the final stage, laid
+            # end to end on one step timeline via _wstep, tagged with the phase index so
+            # the GD->VarPro boundary is visible on every metric. (They used to pass
+            # wandb_run=None and were invisible.)
             _a, _s, _m, _b, *_ = _optimize_ct_sh(
                 images, normals_hw, frag_pos_hw, _pmask, cam_pos,
                 gt_metallic, gt_roughness, _pcfg,
-                wandb_run=None, gt_sh_coeffs=gt_sh_coeffs, gt_albedo=gt_albedo,
+                wandb_run=run, gt_sh_coeffs=gt_sh_coeffs, gt_albedo=gt_albedo,
                 opt_params=_pop, init_from_gt=init_from_gt,
-                val_images=None, val_sh_coeffs=None, init_maps=_curr_init_maps)
+                val_images=None, val_sh_coeffs=None, init_maps=_curr_init_maps,
+                wandb_step_offset=_wstep, wandb_phase=_pi)
             _curr_init_maps = {"albedo": _a, "sh": _s, "metallic": _m, "roughness": _b}
+            _wstep += _pcfg["n_iter"]
 
     if shader not in ("ct_sh", "ct_env"):
         raise ValueError(f"shader must be 'ct_sh' or 'ct_env', got {shader!r}")
@@ -372,7 +379,14 @@ def decompose_scene(
         grad_log_dir=grad_log_dir,
         val_images=val_imgs,
         val_sh_coeffs=val_sh,
-        **({} if shader == "ct_env" else {"init_maps": _curr_init_maps}),
+        # Continue the curriculum's step timeline into the final stage and give it the
+        # next phase index. ct_sh only: the offset kwargs are ct_sh's, and the
+        # curriculum (hence a non-zero offset) is ct_sh-only anyway.
+        **({} if shader == "ct_env" else {
+            "init_maps": _curr_init_maps,
+            "wandb_step_offset": _wstep,
+            "wandb_phase": len(_curriculum) if _curriculum else None,
+        }),
     )
     albedo, mat_a, mat_b = _res.albedo, _res.mat_a, _res.mat_b
     shadings, history, elapsed = _res.shadings, _res.history, _res.elapsed
@@ -570,7 +584,10 @@ def decompose_scene(
     if _log_gt_recon:
         _final["gt_images"]      = [wandb.Image(img) for img in images]
         _final["recon_err_maps"] = [wandb.Image(e.mean(-1)) for e in recon_err]
-    run.log(_final, step=cfg["n_iter"])
+    # Land the final summary at the END of the (possibly multi-phase) timeline, not at
+    # the main run's own n_iter -- a curriculum shifts every phase forward by _wstep, so
+    # cfg["n_iter"] alone would drop this back on top of the last curriculum phase.
+    run.log(_final, step=_wstep + cfg["n_iter"])
     run.finish()
 
     # metrics.json is the completion marker (written last); write it atomically so
