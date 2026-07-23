@@ -156,7 +156,12 @@ def _optimize_ct_sh(
         if init_from_gt:
             metallic_raw = _init_map(_gt_met_np.reshape(H, W, 1), tr_met, dev).to(ftype).requires_grad_(True)
         else:
-            _mv = 0.0 if cfg.get("init_spec_zero", False) else 0.5
+            # init_metallic overrides the flag-derived default outright, so a paper
+            # recipe that starts at e.g. 0.05 (mostly dielectric) is expressible
+            # without inventing another boolean.
+            _mv = cfg.get("init_metallic")
+            if _mv is None:
+                _mv = 0.0 if cfg.get("init_spec_zero", False) else 0.5
             metallic_raw = _init_scalar(_mv, H, W, tr_met, dev=dev).to(ftype).requires_grad_(True)
         learnable.append(metallic_raw)
         named_params["metallic"] = metallic_raw
@@ -167,14 +172,22 @@ def _optimize_ct_sh(
                             if _gt_met_np.ndim > 0
                             else _init_scalar(_gt_met_scalar, H, W, tr_met, dev=dev).to(ftype))
         else:
-            _mv = 0.0 if cfg.get("init_spec_zero", False) else 0.5
+            # init_metallic overrides the flag-derived default outright, so a paper
+            # recipe that starts at e.g. 0.05 (mostly dielectric) is expressible
+            # without inventing another boolean.
+            _mv = cfg.get("init_metallic")
+            if _mv is None:
+                _mv = 0.0 if cfg.get("init_spec_zero", False) else 0.5
             metallic_raw = _init_scalar(_mv, H, W, tr_met, dev=dev).to(ftype)
 
     if "roughness" in op:
         if init_from_gt:
             roughness_raw = _init_map(_gt_rou_np.reshape(H, W, 1), tr_rou, dev).to(ftype).requires_grad_(True)
         else:
-            _rv = 1.0 if cfg.get("init_spec_zero", False) else (0.1 if cfg.get("init_roughness_zero", False) else 0.5)
+            _rv = cfg.get("init_roughness")
+            if _rv is None:
+                _rv = (1.0 if cfg.get("init_spec_zero", False)
+                       else (0.1 if cfg.get("init_roughness_zero", False) else 0.5))
             roughness_raw = _init_scalar(_rv, H, W, tr_rou, dev=dev).to(ftype).requires_grad_(True)
         learnable.append(roughness_raw)
         named_params["roughness"] = roughness_raw
@@ -185,7 +198,10 @@ def _optimize_ct_sh(
                              if _gt_rou_np.ndim > 0
                              else _init_scalar(_gt_rou_scalar, H, W, tr_rou, dev=dev).to(ftype))
         else:
-            _rv = 1.0 if cfg.get("init_spec_zero", False) else (0.1 if cfg.get("init_roughness_zero", False) else 0.5)
+            _rv = cfg.get("init_roughness")
+            if _rv is None:
+                _rv = (1.0 if cfg.get("init_spec_zero", False)
+                       else (0.1 if cfg.get("init_roughness_zero", False) else 0.5))
             roughness_raw = _init_scalar(_rv, H, W, tr_rou, dev=dev).to(ftype)
 
     # ── warm-start overrides (natural-space maps from a previous phase) ────────

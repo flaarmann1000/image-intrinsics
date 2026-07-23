@@ -125,6 +125,55 @@ Measured on `1f19c3ef_v2/ct-ct_sh-frOn_env` (128² , 75 images, 40 iterations):
 VarPro costs roughly 2x the wall time per run here and recovers metallic ~50x better —
 LBFGS barely moves it off its initialisation.
 
+### Reproducing the reference project's recipe
+
+The parallel prototype (`Documents/intrinsic_decomposition`) settles on one "baseline
+recipe", identical across `run_baseline_sweep.sh` and `run_baseline_sweep_extra.sh`: a
+long Adam run, then a short VarPro polish from its checkpoint. Its settings, and how they
+map here:
+
+| reference | value | here |
+|---|---|---|
+| GD optimizer / lr | Adam, `0.05` | `optimizer=Adam`, `lr=0.05` |
+| GD iterations | 60k (indoor) / 20k (3D-Front) | `n_iter` |
+| images | 16 | `n_train` |
+| dtype | float32 | `--double 0` |
+| material parameterization | sigmoid reparam | `tr_*=sigmoid` |
+| albedo init | mean image | (default) |
+| roughness init | 0.5 | `init_roughness=0.5` |
+| metallic init | 0.05 | `init_metallic=0.05` |
+| SH init | DC 1.5, rest 0 | (default) |
+| regularizers | none | all `lambda_*=0` |
+| VarPro iterations | 20 | `n_iter` of the final stage |
+| VarPro space | box `[0,0,0,0.03,0]..[1,1,1,1,1]` | `varpro_space=natural` |
+| line search | `1.0, 0.5, 0.25, 0.125` | (default) |
+| damping ceiling | `1e10` | `varpro_lam_ceiling` (default) |
+
+```bash
+python scripts/decompose_batch.py --datasets_root <dir> --runs_root <dir> \
+    --double 0 --n_train 16 --optimizer VARPRO --varpro_space natural --n_iter 20 \
+    --curriculum '[{"optimizer":"Adam","lr":0.05,"n_iter":20000,
+                    "tr_albedo":"sigmoid","tr_metallic":"sigmoid","tr_roughness":"sigmoid",
+                    "init_metallic":0.05,"init_roughness":0.5,
+                    "lambda_tv":0,"lambda_sparse":0,"lambda_white":0}]'
+```
+
+**Three VarPro refinements are not implemented here**, so this reproduces the recipe's
+shape and hyperparameters but not its polish step exactly:
+
+- **profiled albedo** (`--n-inner-rho 10`): an inner loop re-solving albedo in closed form
+  each iteration, exploiting the render being linear in it
+- **per-pixel damping**: `lam0 = 1e-3 * diagH.max(dim=1)` per pixel, versus one scalar here
+- **per-pixel accept/reject** with a Nielsen gain-ratio update
+  (`lam * clamp_min(1 - (2*rho-1)^3, 1/3)`), versus a global "did the total loss drop"
+
+They were deferred as "Stage B" because VarPro already beat LBFGS clearly without them.
+Expect this configuration to track the reference qualitatively, not numerically.
+
+One further difference: the reference sums its per-image loss over images where this repo
+means over them, a factor of `n_images`. Adam is per-parameter scale-invariant, so
+`lr=0.05` still transfers.
+
 ## Behaviour-preservation harness
 
 `tests/golden.py` records reference outputs for eleven cases covering every branch that
