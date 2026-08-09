@@ -31,7 +31,7 @@ from typing import Optional
 
 import torch
 
-from idr.render.brdf import _lut_lookup
+from idr.render.brdf import _lut_lookup, ggx_sh_bands
 
 __all__ = ["VarProGeometry", "build_design_split", "contract", "forward_from_design"]
 
@@ -44,7 +44,7 @@ class VarProGeometry:
     Y_R   (M, n_sh)  Y_lm(R)         specular SH basis along the reflection vector
     NdotV (M, 1)     clamped N.V
     front (M, 1)     front-facing mask, 1.0 / 0.0
-    lut   (L, bands) GGX-SH lookup table
+    lut   (L, bands) GGX-SH lookup table (only consulted when hl_mode="lut")
     """
     AY: torch.Tensor
     Y_R: torch.Tensor
@@ -53,6 +53,9 @@ class VarProGeometry:
     lut: torch.Tensor
     sh_order: int = 2
     diffuse_fresnel: bool = True
+    # Specular zonal-band source; MUST match the shader's cfg["hl_mode"] so the design
+    # matrix reproduces shade_ct_sh exactly (the equivalence VarPro's correctness rests on).
+    hl_mode: str = "analytic"
 
     @property
     def n_sh(self) -> int:
@@ -96,7 +99,8 @@ def build_design_split(geom: VarProGeometry,
     diff_w = geom.front * k_d * albedo / torch.pi                     # (M, 3)
     spec_w = geom.front * F * G1 / 4.0                                # (M, 3)
 
-    BY = _band_expand(_lut_lookup(geom.lut, roughness.squeeze(-1)),
+    BY = _band_expand(ggx_sh_bands(roughness.squeeze(-1), geom.hl_mode, geom.lut,
+                                   n_bands=geom.sh_order + 1),
                       geom.sh_order) * geom.Y_R                       # (M, n_sh)
 
     D = diff_w[:, :, None] * geom.AY[:, None, :]                      # (M, 3, n_sh)

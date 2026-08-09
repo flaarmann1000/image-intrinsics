@@ -10,7 +10,7 @@ from typing import Optional, Union
 from .ops import _norm
 from .types import PBRMat, PointLightGPU, EnvMapLightGPU
 from .brdf import (_ggx_D, _schlick_F, _smith_G, _f0_mat, _get_ggx_sh_lut,
-                   _lut_lookup)
+                   _lut_lookup, ggx_sh_bands)
 from .sh import _sh_basis, _sh_order_of, _sh_irradiance
 
 def _ct_point(frag_pos, N, cam_pos, mat: PBRMat, light: PointLightGPU):
@@ -98,23 +98,29 @@ def _sh_ggx_filtered_radiance(
     coeffs_t:  torch.Tensor,   # (9|16, 3)
     dirs:      torch.Tensor,   # (..., 3)  unit reflection directions
     roughness: torch.Tensor,   # (..., 1)  in [0, 1]
-    lut:       torch.Tensor,   # (N, 3|4)
+    lut:       Optional[torch.Tensor] = None,   # (N, 3|4); only used when hl_mode="lut"
+    hl_mode:   str = "analytic",
 ) -> torch.Tensor:
     """
     GGX-lobe SH filter — analogue of _sh_phong_filtered_radiance.
 
     Convolves the SH-encoded environment with the GGX lobe centred on `dirs`,
     with per-element width controlled by `roughness`. The SH order is inferred
-    from the coefficient count; order-3 needs a 4-band LUT.
+    from the coefficient count; order-3 needs a 4th zonal band.
+
+    The zonal band weights h_l come from `hl_mode`: "analytic" (closed form, correct at
+    every roughness — the default) or "lut" (the shipped uniform table, bit-identical to
+    the previous behaviour, which is under-resolved below roughness ~0.08). See
+    `idr.render.brdf.ggx_sh_bands`.
 
     Returns (..., 3), clamped to ≥ 0.
     """
     order = _sh_order_of(coeffs_t)
-    if lut.shape[1] < order + 1:
+    if hl_mode == "lut" and lut is not None and lut.shape[1] < order + 1:
         raise ValueError(f"order-{order} SH needs a {order + 1}-band GGX LUT, "
                          f"got {lut.shape[1]} bands")
     Y = _sh_basis(dirs, order=order)             # (..., 9|16)
-    Bvals = _lut_lookup(lut, roughness.squeeze(-1))  # (..., n_bands)
+    Bvals = ggx_sh_bands(roughness.squeeze(-1), hl_mode, lut, n_bands=order + 1)  # (..., n_bands)
 
     parts = [Bvals[..., 0:1],                    # band 0 (1 coeff)
              Bvals[..., 1:2].expand(*Bvals.shape[:-1], 3),
@@ -136,6 +142,7 @@ def shade_ct_sh(
     lut:              Optional[torch.Tensor] = None,
     diffuse_fresnel:  bool = True,
     return_components: bool = False,
+    hl_mode:          str = "analytic",
 ) -> torch.Tensor:
     """
     Differentiable Cook-Torrance shading with SH-environment specular.
@@ -148,9 +155,14 @@ def shade_ct_sh(
     sh_coeffs : (9, 3)    SH lighting coefficients
     metallic  : scalar or (..., 1)  metallic factor in [0, 1]
     roughness : scalar or (..., 1)  perceptual roughness in [0, 1]
-    lut       : optional pre-loaded GGX SH LUT; fetched/computed if None
+    lut       : optional pre-loaded GGX SH LUT; only consulted when hl_mode="lut"
+                (fetched/computed if None), ignored under the analytic default
     diffuse_fresnel : if True, multiply the diffuse by (1-F) on top of
                 (1-metallic). Default False to match Blender's Principled BSDF.
+    hl_mode   : specular zonal-band source, "analytic" (closed form, correct at every
+                roughness — default) or "lut" (the shipped table, bit-identical to the
+                previous behaviour but under-resolved below roughness ~0.08). See
+                `idr.render.brdf.ggx_sh_bands`.
 
     Returns
     -------
@@ -169,7 +181,7 @@ def shade_ct_sh(
     roughness = _as_tensor(roughness)
     metallic = _as_tensor(metallic)
 
-    if lut is None:
+    if lut is None and hl_mode == "lut":
         lut = _get_ggx_sh_lut(device, n_bands=_sh_order_of(sh_coeffs) + 1)
 
     # ── Fresnel-Schlick ───────────────────────────────────────────────────────
@@ -197,7 +209,7 @@ def shade_ct_sh(
 
     # ── Specular (GGX SH) ─────────────────────────────────────────────────────
     R = _norm(2.0 * NdotV_raw * normals - view)
-    L_spec = _sh_ggx_filtered_radiance(sh_coeffs, R, roughness, lut)
+    L_spec = _sh_ggx_filtered_radiance(sh_coeffs, R, roughness, lut, hl_mode=hl_mode)
     spec = F * G1 * L_spec / 4.0
     # spec = G1 * L_spec / 4.0
 

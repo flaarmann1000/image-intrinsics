@@ -242,7 +242,24 @@ def woodbury_step(geom, material, sh, active, gram, observations, lam,
         Msmall += torch.einsum('bam,bak->mk', U, Y)
         rhs += torch.einsum('bam,ba->m', U, z[lo:hi])
     Msmall = torch.eye(m, dtype=dt, device=dev) - Msmall
-    w = torch.linalg.solve(Msmall, rhs.unsqueeze(-1)).squeeze(-1)
+    # Degenerate / under-constrained scenes can make this reduced Woodbury system singular
+    # (the material Gauss-Newton block is rank-deficient for the current damping). Fall back to
+    # a ridged solve, then least-squares; the outer per-pixel accept/reject rejects any bad step.
+    try:
+        w = torch.linalg.solve(Msmall, rhs.unsqueeze(-1)).squeeze(-1)
+    except RuntimeError:
+        # Escalate a diagonal ridge (each try is a fast solve; a heavy enough ridge is
+        # diagonally dominant hence PD). Avoids GPU lstsq/SVD, which is very slow on a large
+        # rank-deficient m x m system (degenerate scenes: shadows, big flat ground planes).
+        eye = torch.eye(m, dtype=dt, device=dev)
+        base = Msmall.diagonal().abs().mean().clamp_min(1e-12)
+        w = rhs.new_zeros(m)
+        for _e in (1e-6, 1e-4, 1e-2, 1e0, 1e2):
+            try:
+                w = torch.linalg.solve(Msmall + (_e * base) * eye, rhs.unsqueeze(-1)).squeeze(-1)
+                break
+            except RuntimeError:
+                continue
 
     # ── pass 3: apply the correction ────────────────────────────────────────
     delta = z.clone()

@@ -89,6 +89,21 @@ DEFAULT_CFG = dict(
     init_roughness_zero  = False,
     lambda_metallic_l1        = 0.0,
     lambda_metallic_binarize  = 0.0,
+    # Soft box constraint for natural-space (identity-transform) material optimisation:
+    # penalises albedo/metallic/roughness values outside [0, 1] with a squared hinge, so
+    # they stay physical without the gradient-saturation of a sigmoid reparameterisation.
+    # No-op (0.0) by default and under sigmoid transforms (values already in range).
+    lambda_box                = 0.0,
+    # Lighting prior. Pulls the per-image SH toward a reference (pass `light_prior=<(K,n_sh,3)>`
+    # to optimize()) with ||sh - ref||^2; if no reference is given, falls back to an SH
+    # SMOOTHNESS prior that shrinks the non-DC (directional) coefficients toward 0. Targets the
+    # albedo<->lighting ambiguity from the lighting side. No-op at 0.0.
+    lambda_light_prior        = 0.0,
+    # Monochrome-light prior (nvdiffrec/nvdiffrecmc-style): penalise the per-image SH's colour
+    # imbalance ||sh - mean_RGB(sh)||^2, pushing lighting toward achromatic so *colour* is
+    # explained by albedo instead of baked into the light. Breaks the colour axis of the
+    # albedo<->lighting ambiguity. No-op at 0.0.
+    lambda_light_mono         = 0.0,
     lr_end            = 0.0,
     lr_schedule       = "none",
     lr_schedule_step  = 50,
@@ -108,6 +123,14 @@ DEFAULT_CFG = dict(
     # (16 coeffs). Band 3 has zero Lambertian irradiance weight, so order 3
     # only sharpens the SPECULAR term. GT SH given as (9,3) is zero-padded.
     sh_order = 2,
+    # Source of the GGX specular zonal-band weights h_l in shade_ct_sh:
+    # "analytic" (closed form, correct at every roughness — default) or "lut"
+    # (the shipped uniform table, bit-identical to the pre-2026-08 behaviour but
+    # under-resolved below roughness ~0.08, where its low-r knots collapse toward 0
+    # and its lerp gives a staircase dh/dr). Datasets rendered with one mode are an
+    # exact inverse crime only when decomposed with the SAME mode; set "lut" to
+    # reproduce / decompose datasets rendered before the analytic default landed.
+    hl_mode = "analytic",
     # integer stride for downsampling images + GT maps before optimization
     # (nearest/strided, keeps GT crisp). 1 = full resolution.
     downsample = 1,

@@ -138,6 +138,90 @@ def _lut_lookup(lut: torch.Tensor, roughness: torch.Tensor) -> torch.Tensor:
     return lut[idx_lo] + t * (lut[idx_lo + 1] - lut[idx_lo])  # (..., C)
 
 
+def ggx_sh_bands_analytic(
+    roughness: torch.Tensor,
+    n_bands:   int = 3,
+) -> torch.Tensor:
+    """Closed-form GGX zonal-SH band weights h_0..h_{n_bands-1}. (...,) -> (..., n_bands).
+
+    A drop-in, LUT-free replacement for `_lut_lookup(_compute_ggx_sh_lut(...), r)`. It
+    evaluates the SAME integral
+
+        h_l = 2π ∫₀^{π/2} D_GGX(cos(θ/2), α) P_l(cosθ) sinθ dθ,   α = roughness²,
+
+    in CLOSED FORM instead of interpolating a uniform-in-roughness table of numerically
+    integrated knots. The table is under-resolved where it matters most: the GGX lobe has
+    width ~α = r², so the 512-knot roughness grid (and the uniform-θ trapezoid that built
+    each knot) both miss the lobe below r ~ 0.08 — a knot at r = 0.002 evaluates to ~0.02
+    instead of the correct ~4, a >100x cliff between adjacent knots that the lerp then
+    blends through. The lerp also makes h piecewise-LINEAR, so dh/dr is a staircase in the
+    very variable being optimized. The closed form has neither defect (verified to 1.3e-4
+    of a 2^20-sample GGX-importance-sampled reference across r ∈ [0, 1], all four bands).
+
+    Substituting u = cosθ turns each band into  h ∝ ∫₀¹ P_l(u)/(b + c u)² du  with b = 1+e,
+    c = e-1, e = α². Those integrals have elementary closed forms; band 0 is stable
+    everywhere (h_0 = 4/(1+e) → 2 at r=1, → 4 at r=0), while bands 1..3 hit a removable 0/0
+    as c → 0 (r → 1) and are switched to their Taylor series in x = 1-e for x < 1e-2.
+
+    FLOAT64 IS DELIBERATE. The closed form is not fp32-safe near r = 1 (catastrophic
+    cancellation in the 1/c^k terms) nor near r = 0 (1/e in the r→0 branch). Evaluating in
+    float64 and casting back — including through the backward pass — fixes both at
+    negligible cost (h_l is (..., n_bands); the render einsums are far larger).
+    """
+    r = roughness.double()
+    e = (r * r) * (r * r)                       # α² = r⁴
+    x = 1.0 - e                                 # → 0 as r → 1
+    lo = e < 1e-12                              # r → 0: delta limit, all bands → 4
+    hi = x < 1e-2                               # r → 1: closed form is 0/0, use series
+    # Clamp e so the dead branches of the torch.where below never divide by zero — a
+    # nan/inf in an unused branch survives the backward pass and poisons the gradient.
+    ec = e.clamp(min=1e-12, max=1.0 - 1e-2)
+    b, c = 1.0 + ec, ec - 1.0
+    bc = b + c                                  # 2·ec
+    Lg = torch.log(bc) - torch.log(b)           # ln(2e/(1+e))
+    J0 = 1.0 / (b * bc)
+    J1 = (Lg - c / bc) / (c * c)
+    four = torch.full_like(e, 4.0)
+
+    bands = [torch.where(lo, four, 4.0 / (1.0 + e))]                  # h_0 (exact, stable)
+    if n_bands >= 2:
+        h1c = 8.0 * ec * J1
+        h1s = 1.0 + x * (2.0 / 3 + x * (11.0 / 24 + x * (13.0 / 40 + x * 19.0 / 80)))
+        bands.append(torch.where(lo, four, torch.where(hi, h1s, h1c)))  # h_1
+    if n_bands >= 3:
+        J2 = (1.0 - (2.0 * b / c) * Lg + b / bc) / (c * c)
+        h2c = 4.0 * ec * (3.0 * J2 - J0)
+        h2s = x * (1.0 / 4 + x * (13.0 / 40 + x * (13.0 / 40 + x * 83.0 / 280)))
+        bands.append(torch.where(lo, four, torch.where(hi, h2s, h2c)))  # h_2
+    if n_bands >= 4:
+        J3 = (-2.0 * b + 0.5 * c + (3.0 * b * b / c) * Lg - b * b / bc) / (c ** 3)
+        h3c = 4.0 * ec * (5.0 * J3 - 3.0 * J1)
+        h3s = -0.25 + x * x * (1.0 / 8 + x * (51.0 / 280 + x * 909.0 / 4480))
+        bands.append(torch.where(lo, four, torch.where(hi, h3s, h3c)))  # h_3
+    return torch.stack(bands, dim=-1).to(roughness.dtype)
+
+
+def ggx_sh_bands(
+    roughness: torch.Tensor,     # (...,)  perceptual roughness in [0, 1]
+    hl_mode:   str = "analytic",
+    lut:       Optional[torch.Tensor] = None,
+    n_bands:   int = 3,
+) -> torch.Tensor:
+    """GGX zonal-SH band weights h_l via `hl_mode`, as (..., n_bands).
+
+    "analytic" — closed form (`ggx_sh_bands_analytic`); correct at every roughness. Default.
+    "lut"      — the shipped uniform table (`_lut_lookup`); reproduces the previous shading
+                 bit-for-bit. Requires a `lut` (fetched from `_get_ggx_sh_lut` if None).
+    """
+    if hl_mode == "analytic":
+        return ggx_sh_bands_analytic(roughness, n_bands=n_bands)
+    if hl_mode == "lut":
+        if lut is None:
+            lut = _get_ggx_sh_lut(roughness.device, n_bands=n_bands)
+        return _lut_lookup(lut, roughness)
+    raise ValueError(f"unknown hl_mode {hl_mode!r} (expected 'analytic' or 'lut')")
+
+
 # `_get_ggx_sh_lut` is imported directly by the optimizer and by several notebooks, so
 # it is public API in practice; expose it under a public name and keep the old one as
 # an alias so existing call sites keep working.

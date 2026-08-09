@@ -35,3 +35,5 @@ out/
 node_modules/
 .vercel/
 *.tsbuildinfo
+
+local_datasets/

@@ -98,8 +98,12 @@ def _sphere_normals(res):
     return n, mask
 
 
-def build_scene(device="cuda"):
-    """Deterministic (images, geometry, GT maps, SH lights). Pure function of SEED."""
+def build_scene(device="cuda", hl_mode="analytic"):
+    """Deterministic (images, geometry, GT maps, SH lights). Pure function of SEED.
+
+    `hl_mode` selects the specular band source used to synthesise the observations; it
+    must match the cases' cfg for the run to be a true inverse crime (the pipeline/optimizer
+    default is "analytic")."""
     from idr.data.geometry import make_proxy_geometry
     from idr.render import shade_ct_sh
     from idr.render.brdf import _get_ggx_sh_lut
@@ -133,7 +137,7 @@ def build_scene(device="cuda"):
         with torch.no_grad():
             px = shade_ct_sh(V_m, N_m, to_m(albedo, 3),
                              torch.from_numpy(c).to(device),
-                             to_m(metal, 1), to_m(rough, 1), lut=lut)
+                             to_m(metal, 1), to_m(rough, 1), lut=lut, hl_mode=hl_mode)
         img = np.zeros((RES * RES, 3), np.float32)
         img[fm.cpu().numpy()] = px.float().cpu().numpy()
         images.append(img.reshape(RES, RES, 3))
@@ -167,10 +171,10 @@ def write_scene(dest=SCENE):
     return dest
 
 
-def load_inputs(device="cuda"):
+def load_inputs(device="cuda", hl_mode="analytic"):
     """Geometry + images shared by every optimizer-level case."""
     from idr.data.geometry import make_proxy_geometry
-    sc = build_scene(device)
+    sc = build_scene(device, hl_mode=hl_mode)
     Nhw, frag, mhw, cam = make_proxy_geometry(sc["normals"], sc["mask"], 60.0, 2.0,
                                               device, torch.float32)
     return dict(images=sc["images"][:N_TRAIN], sh=sc["sh"][:N_TRAIN],
@@ -189,9 +193,11 @@ def _env_geometry():
 
 # ── the case matrix ──────────────────────────────────────────────────────────
 def case_ct_sh(inp, optimizer="LBFGS", sh_order=2, solver=None, n_img=None,
-               varpro_space=None, n_inner_rho=0):
+               varpro_space=None, n_inner_rho=0, hl_mode=None):
     from idr.optim.models.ct_sh import _optimize_ct_sh
     cfg = _base_cfg(optimizer=optimizer, sh_order=sh_order)
+    if hl_mode is not None:
+        cfg["hl_mode"] = hl_mode
     if varpro_space is not None:
         # VarPro eliminates the lighting each iteration, so a handful of outer steps
         # already exercises the whole path (design -> active set -> Woodbury -> per-pixel
@@ -288,7 +294,7 @@ CASES = {
           lambda i: case_ct_sh(i, optimizer="LM", solver="cg")),
     "I": ("ct_sh LM  schur   (exact per-pixel elimination)",
           lambda i: case_ct_sh(i, optimizer="LM", solver="schur")),
-    "D": ("ct_sh LBFGS SH3   (order-3 basis + LUT band 3)", lambda i: case_ct_sh(i, sh_order=3)),
+    "D": ("ct_sh LBFGS SH3   (order-3 basis + analytic band 3)", lambda i: case_ct_sh(i, sh_order=3)),
     "E": ("ct_env LBFGS      (env branch)", case_ct_env),
     "F": ("phong_sh LBFGS    (phong branch)", case_phong_sh),
     "G": ("phong_env LBFGS   (phong env branch)", case_phong_env),
@@ -300,6 +306,8 @@ CASES = {
           lambda i: case_ct_sh(i, optimizer="VARPRO", varpro_space="natural",
                                n_inner_rho=10)),
     "H": ("decompose_scene   (pipeline: IO+metrics+artifacts)", case_pipeline),
+    "M": ("ct_sh LBFGS SH2   (hl_mode=lut, shipped-table specular path)",
+          lambda i: case_ct_sh(i, hl_mode="lut")),
 }
 
 

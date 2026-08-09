@@ -37,7 +37,7 @@ from idr.optim.lm.problem import build_lm_solver
 from idr.optim.varpro.problem import build_varpro_solver
 from idr.config import _CT_SH_PARAMS
 from idr.render import shade_ct_sh
-from idr.render.brdf import _get_ggx_sh_lut, _lut_lookup
+from idr.render.brdf import _get_ggx_sh_lut, _lut_lookup, ggx_sh_bands
 from idr.render.sh import _sh_basis, _sh_irradiance
 from idr.render.ops import _norm
 
@@ -62,6 +62,7 @@ def _optimize_ct_sh(
     val_images:   Optional[list] = None,
     val_sh_coeffs: Optional[list] = None,
     init_maps:    Optional[dict] = None,
+    light_prior:  Optional[np.ndarray] = None,
     wandb_step_offset: int = 0,
     wandb_phase:  Optional[int] = None,
 ) -> tuple:
@@ -86,6 +87,7 @@ def _optimize_ct_sh(
         raise ValueError(f"sh_order must be 2 or 3, got {_sh_ord}")
     n_sh = (_sh_ord + 1) ** 2                     # 9 or 16
     _diffuse_fresnel = bool(cfg.get("diffuse_fresnel", True))
+    _hl_mode = str(cfg.get("hl_mode", "analytic"))
     _n_log = N_imgs if cfg.get("wandb_max_images") is None else min(N_imgs, int(cfg["wandb_max_images"]))
 
     def _pad_sh(arr):
@@ -307,6 +309,16 @@ def _optimize_ct_sh(
     _step = [0]
     _loss_ml = [torch.zeros((), device=dev, dtype=ftype)]
     _loss_mb = [torch.zeros((), device=dev, dtype=ftype)]
+    _loss_box = [torch.zeros((), device=dev, dtype=ftype)]
+    _loss_lp = [torch.zeros((), device=dev, dtype=ftype)]
+    # Lighting-prior reference (padded per image to n_sh), if one was supplied — either as
+    # the `light_prior` keyword or via cfg["light_prior"] (so it rides along in a cfg dict).
+    _lp_ref = light_prior if light_prior is not None else cfg.get("light_prior", None)
+    _light_prior_t = None
+    if _lp_ref is not None:
+        _light_prior_t = torch.stack([
+            torch.from_numpy(_pad_sh(np.asarray(_lp_ref[k], np.float32))).to(dev, ftype)
+            for k in range(N_imgs)])
     _recon_rmse = [0.0]           # per-image recon RMSE/MAE, stashed by _forward
     _recon_mae  = [0.0]
 
@@ -325,6 +337,7 @@ def _optimize_ct_sh(
         metallic_m  = metallic.reshape(-1, 1)[flat_mask]               # (M, 1)
         roughness_m = roughness.reshape(-1, 1)[flat_mask]               # (M, 1)
         met_m_true  = metallic_m                                       # for regularisation
+        rou_m_true  = roughness_m                                      # (pre-warmup, for box penalty)
         if _spec_warmup:
             metallic_m  = albedo_m.new_zeros(albedo_m.shape[0], 1)
             roughness_m = albedo_m.new_ones(albedo_m.shape[0], 1)
@@ -345,7 +358,10 @@ def _optimize_ct_sh(
             k_d = (1.0 - F) * k_d                                      # (M, 3)
 
         # ── specular SH filter B (roughness-dependent, recomputed each step) ─
-        Bvals = _lut_lookup(lut, roughness_m.squeeze(-1))              # (M, n_bands)
+        # Band source follows cfg["hl_mode"]; must match the data generator + final
+        # shadings/relight so recon_rmse tracks the data loss (the inverse crime).
+        Bvals = ggx_sh_bands(roughness_m.squeeze(-1), _hl_mode, lut,
+                             n_bands=_sh_ord + 1)                      # (M, n_bands)
         _bp = [Bvals[..., 0:1],
                Bvals[..., 1:2].expand(-1, 3),
                Bvals[..., 2:3].expand(-1, 5)]
@@ -392,9 +408,37 @@ def _optimize_ct_sh(
         )
         loss_metallic_l1       = frac * cfg.get("lambda_metallic_l1",       0.0) * met_m_true.abs().mean()
         loss_metallic_binarize = frac * cfg.get("lambda_metallic_binarize",  0.0) * (met_m_true * (1.0 - met_m_true)).mean()
+        # Soft box constraint: squared hinge penalty for material values outside [0, 1].
+        # Keeps natural-space (identity-transform) albedo/metallic/roughness physical
+        # without a sigmoid's vanishing gradient at the bounds. Zero under sigmoid.
+        _lam_box = cfg.get("lambda_box", 0.0)
+        def _box(x):
+            return (torch.relu(-x) ** 2 + torch.relu(x - 1.0) ** 2).mean()
+        loss_box = frac * _lam_box * (_box(albedo_m) + _box(met_m_true) + _box(rou_m_true))
+        # Lighting prior: ||sh - reference||^2 if a reference was given, else an SH-smoothness
+        # prior shrinking the non-DC (directional) coefficients toward 0.
+        _lam_lp = cfg.get("lambda_light_prior", 0.0)
+        if _lam_lp:
+            if _light_prior_t is not None:
+                _ref = _light_prior_t if idx is None else _light_prior_t[idx]
+                loss_light = frac * _lam_lp * ((sh_sel - _ref) ** 2).mean()
+            else:
+                loss_light = frac * _lam_lp * (sh_sel[:, 1:, :] ** 2).mean()
+        else:
+            loss_light = sh_sel.new_zeros(())
+        # Monochrome-light prior: push each image's SH toward achromatic (R=G=B) so colour
+        # is explained by albedo, not the lighting (nvdiffrec-style white-balance).
+        _lam_mono = cfg.get("lambda_light_mono", 0.0)
+        if _lam_mono:
+            loss_light = loss_light + frac * _lam_mono * (
+                (sh_sel - sh_sel.mean(dim=-1, keepdim=True)) ** 2).mean()
         _loss_ml[0] = loss_metallic_l1.detach()
         _loss_mb[0] = loss_metallic_binarize.detach()
-        return loss_data + loss_sparse + loss_white + loss_tv + loss_metallic_l1 + loss_metallic_binarize, loss_data, loss_sparse, loss_white, loss_tv
+        _loss_box[0] = loss_box.detach()
+        _loss_lp[0] = loss_light.detach()
+        return (loss_data + loss_sparse + loss_white + loss_tv
+                + loss_metallic_l1 + loss_metallic_binarize + loss_box + loss_light,
+                loss_data, loss_sparse, loss_white, loss_tv)
 
     def _forward_components():
         with torch.no_grad():
@@ -405,7 +449,8 @@ def _optimize_ct_sh(
             for k in range(N_imgs):
                 _, comps = shade_ct_sh(view_m, N_m, albedo_m, sh_coeffs[k],
                                        metallic_m, roughness_m, lut=lut,
-                                       diffuse_fresnel=_diffuse_fresnel, return_components=True)
+                                       diffuse_fresnel=_diffuse_fresnel, hl_mode=_hl_mode,
+                                       return_components=True)
                 result.append(comps)
         return result
 
@@ -474,7 +519,8 @@ def _optimize_ct_sh(
         with torch.no_grad():
             for k in range(_val_imgs_m.shape[0]):
                 recon = shade_ct_sh(view_m, N_m, ab_m, _val_sh[k],
-                                    met_m, rou_m, lut=lut, diffuse_fresnel=_diffuse_fresnel)
+                                    met_m, rou_m, lut=lut, diffuse_fresnel=_diffuse_fresnel,
+                                    hl_mode=_hl_mode)
                 d = recon - _val_imgs_m[k]
                 rs.append(float(d.pow(2).mean().sqrt()))
                 ms.append(float(d.abs().mean()))
@@ -609,7 +655,8 @@ def _optimize_ct_sh(
         for k in range(N_imgs):
             albedo_m = albedo_t2.reshape(-1, 3)[flat_mask]
             recon_m  = shade_ct_sh(view_m, N_m, albedo_m, sh_coeffs[k],
-                                   met_m, rou_m, lut=lut, diffuse_fresnel=_diffuse_fresnel)
+                                   met_m, rou_m, lut=lut, diffuse_fresnel=_diffuse_fresnel,
+                                   hl_mode=_hl_mode)
             s = albedo_t2.new_zeros(H, W, 3)
             s.reshape(-1, 3)[flat_mask] = recon_m
             s *= mask_t

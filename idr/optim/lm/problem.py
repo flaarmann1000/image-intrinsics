@@ -38,6 +38,7 @@ def build_lm_solver(
     current chunk fraction so the residual scaling tracks the loss scaling.
     """
     _lm_names = [n for n in ("albedo", "sh", "metallic", "roughness") if n in named_params]
+    _hl_mode = str(cfg.get("hl_mode", "analytic"))
     _M = int(flat_mask.sum())
     _denom = float(N_imgs * _M * 3)    # so sum(r^2) over ALL images == loss_data
 
@@ -59,7 +60,7 @@ def build_lm_solver(
         met_m = met_hw.reshape(-1, 1)[flat_mask]
         rou_m = rou_hw.reshape(-1, 1)[flat_mask]
         rec = torch.stack([
-            shade_ct_sh(view_m, N_m, ab_m, sh_c[k], met_m, rou_m, lut=lut,
+            shade_ct_sh(view_m, N_m, ab_m, sh_c[k], met_m, rou_m, lut=lut, hl_mode=_hl_mode,
                         diffuse_fresnel=_diffuse_fresnel)
             for k in idx.tolist()])                       # (n, M, 3)
         resid = rec - _imgs_m[idx]
@@ -145,7 +146,7 @@ def build_lm_solver(
         me = _fwd_metallic(met_r, tr_met)
         ro = _fwd_roughness(rou_r, tr_rou)
         return shade_ct_sh(v[None], n[None], ab[None], sh_k, me[None], ro[None],
-                           lut=lut, diffuse_fresnel=_diffuse_fresnel)[0] * _inv_sd
+                           lut=lut, diffuse_fresnel=_diffuse_fresnel, hl_mode=_hl_mode)[0] * _inv_sd
 
     _jac_px = torch.func.vmap(
         torch.func.jacrev(_px_fn, argnums=(0, 1, 2, 3)),
@@ -164,7 +165,7 @@ def build_lm_solver(
         with torch.no_grad():
             rec = shade_ct_sh(view_m, N_m, _fwd_albedo(ab_m, tr_ab), sh_c[k],
                               _fwd_metallic(me_m, tr_met), _fwd_roughness(ro_m, tr_rou),
-                              lut=lut, diffuse_fresnel=_diffuse_fresnel)
+                              lut=lut, diffuse_fresnel=_diffuse_fresnel, hl_mode=_hl_mode)
             r_k = (rec - _imgs_m[k]) * _inv_sd                       # (M, 3)
         Ja, Jm, Jr, Js = _jac_px(ab_m, me_m, ro_m, sh_c[k], view_m, N_m)
         Jpix = torch.cat([Ja, Jm, Jr], dim=-1)[..., _local_t]        # (M, 3, npix)
@@ -270,7 +271,7 @@ def build_lm_solver(
             for k in idx.tolist():
                 with torch.no_grad():
                     rec = shade_ct_sh(view_m, N_m, ab_f, sh_c[k], me_f, ro_f,
-                                      lut=lut, diffuse_fresnel=_diffuse_fresnel)
+                                      lut=lut, diffuse_fresnel=_diffuse_fresnel, hl_mode=_hl_mode)
                     r_k = (rec - _imgs_m[k]) * _inv_sd                  # (M, 3)
                     loss += float(r_k.pow(2).sum())
                 Ja, Jm, Jr, Js = _jac_px(ab_m, me_m, ro_m, sh_c[k], view_m, N_m)

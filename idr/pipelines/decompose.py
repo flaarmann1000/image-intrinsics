@@ -186,6 +186,11 @@ def decompose_scene(
 
     # ── optional strided downsampling (nearest: GT maps/mask stay crisp) ──────
     _ds = int(cfg.get("downsample", 1) or 1)
+    # Keep the full-res normals/mask: the proxy geometry is built full-res and
+    # strided (stride=_ds) so the view vectors match a full-res render of the
+    # scene rather than the coarse grid — otherwise the recomputed rays drift
+    # sub-pixel and inject a specular error that scales with the stride.
+    _full_normals_np, _full_mask_np = scene["normals_np"], scene["mask_np"]
     if _ds > 1:
         for k in ("normals_np", "mask_np", "albedo_np", "metallic_np", "roughness_np"):
             scene[k] = np.ascontiguousarray(scene[k][::_ds, ::_ds])
@@ -203,8 +208,8 @@ def decompose_scene(
         light_keys = light_keys[:n_images]
 
     normals_hw, frag_pos_hw, mask_hw, cam_pos = make_proxy_geometry(
-        scene["normals_np"], mask_np,
-        fov_deg=fov_deg, cam_dist=cam_dist, device=device, dtype=torch_dtype,
+        _full_normals_np, _full_mask_np,
+        fov_deg=fov_deg, cam_dist=cam_dist, device=device, dtype=torch_dtype, stride=_ds,
     )
 
     gt_metallic  = scene["metallic_np"]   # (H, W, 1)
@@ -434,7 +439,8 @@ def decompose_scene(
                 if shader == "ct_sh":
                     sh_t = torch.from_numpy(_pad_sh_final(v_sh)).to(device, torch_dtype)
                     recon = shade_ct_sh(_V, _N, _ab, sh_t, _me, _ro, lut=_lut,
-                                        diffuse_fresnel=_dfres)
+                                        diffuse_fresnel=_dfres,
+                                        hl_mode=str(cfg.get("hl_mode", "analytic")))
                 else:
                     env_pix = np.maximum(build_sh_basis(env_dirs) @ np.asarray(v_sh, np.float32), 0.0)
                     recon = shade_ct_env(

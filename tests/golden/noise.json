@@ -32,5 +32,61 @@
   "light": 0.0,
   "mat_a": 0.0,
   "mat_b": 0.0
+ },
+ "A": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "B": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "C": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "D": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "E": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "F": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "G": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
+ },
+ "M": {
+  "albedo": 0.0,
+  "history": 0.0,
+  "light": 0.0,
+  "mat_a": 0.0,
+  "mat_b": 0.0
  }
 }

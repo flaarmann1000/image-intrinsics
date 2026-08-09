@@ -63,10 +63,11 @@ class Relighter:
     they are shared by every frame and every intrinsics variant."""
 
     def __init__(self, normals_np, mask_np, device="cuda", dtype=torch.float32,
-                 diffuse_fresnel=True):
+                 diffuse_fresnel=True, hl_mode="analytic"):
         self.H, self.W = normals_np.shape[:2]
         self.mask_np = mask_np
         self.diffuse_fresnel = diffuse_fresnel
+        self.hl_mode = hl_mode
         n, f, m, cam = make_proxy_geometry(normals_np, mask_np, 60.0, 2.0, device, dtype)
         self.fm = m.reshape(-1)
         self.N = n.reshape(-1, 3)[self.fm]
@@ -85,7 +86,8 @@ class Relighter:
             px = shade_ct_sh(self.V, self.N, self._m(intr["albedo"], 3),
                              torch.from_numpy(np.asarray(sh, np.float32)).to(self.device, self.dtype),
                              self._m(intr["metallic"], 1), self._m(intr["roughness"], 1),
-                             lut=self.lut, diffuse_fresnel=self.diffuse_fresnel)
+                             lut=self.lut, diffuse_fresnel=self.diffuse_fresnel,
+                             hl_mode=self.hl_mode)
         out = np.zeros((self.H * self.W, 3), np.float32)
         out[self._fm_np] = px.float().cpu().numpy()
         return out.reshape(self.H, self.W, 3)

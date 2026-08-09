@@ -266,6 +266,7 @@ def build_varpro_solver(cfg, albedo_param, sh_coeffs, metallic_raw, roughness_ra
     terms" block, so the geometry has exactly one definition in the codebase.
     """
     geom = VarProGeometry(AY=AY, Y_R=Y_R, NdotV=NdotV, front=front, lut=lut,
-                          sh_order=sh_order, diffuse_fresnel=diffuse_fresnel)
+                          sh_order=sh_order, diffuse_fresnel=diffuse_fresnel,
+                          hl_mode=str(cfg.get("hl_mode", "analytic")))
     return VarProSolver(geom, albedo_param, sh_coeffs, metallic_raw, roughness_raw,
                         flat_mask, imgs_m, (tr_ab, tr_met, tr_rou), cfg, dev, ftype)
