@@ -172,6 +172,15 @@ def decompose_scene(
     double            = cfg_overrides.pop("double",            double)
     n_images          = cfg_overrides.pop("n_images",          n_images)
 
+    # External warm-start (ct_sh only): natural-space maps
+    # {"albedo","sh","metallic","roughness"} that seed the optimizer's init, exactly like a
+    # curriculum phase hands off to the next — but supplied from OUTSIDE the call, e.g. from
+    # an earlier LBFGS run's saved estimates. This lets a VarPro polish continue from a saved
+    # LBFGS result instead of re-running LBFGS as a curriculum phase. Popped before the cfg
+    # merge so it never lands in the wandb config or the run name. A curriculum, if also
+    # given, overwrites this after its phases run.
+    init_maps_ext     = cfg_overrides.pop("init_maps", None)
+
     if opt_params is None and "opt_params" in cfg_overrides:
         _op = cfg_overrides.pop("opt_params")
         opt_params = frozenset(_op) if not isinstance(_op, frozenset) else _op
@@ -330,7 +339,7 @@ def decompose_scene(
     # maps to the next via init_maps; the main optimize below warm-starts from the
     # last phase. Lets us freeze groups / go SH1->SH2 / fit lighting on a pixel
     # subset first, all within the existing metrics + artifact pipeline.
-    _curr_init_maps = None
+    _curr_init_maps = init_maps_ext  # external warm-start seeds the first phase / the final run
     _wstep = 0                       # running wandb step offset across curriculum phases
     _curriculum = cfg.pop("curriculum", None)
     if shader == "ct_sh" and _curriculum:
@@ -474,8 +483,12 @@ def decompose_scene(
         sh_out_rescaled   = np.empty(0)
         env_maps_rescaled = env_maps_out * inv_scale
 
+    # Use np.subtract (not the `-` operator) for the albedo error: `albedo_scaled - gt_albedo`
+    # hit a numpy edge case that wrote the difference back INTO albedo_scaled in place,
+    # corrupting the saved albedo_scaled.npy into the signed albedo error. np.subtract into a
+    # fresh output leaves albedo_scaled intact.
     albedo_scaled = (albedo * scale).clip(0, 1)
-    albedo_err    = np.abs(albedo_scaled - gt_albedo) * mask_np[:, :, None]
+    albedo_err    = np.abs(np.subtract(albedo_scaled, gt_albedo)) * mask_np[:, :, None]
 
     mat_a_err = np.abs(mat_a - gt_metallic)
     mat_b_err = np.abs(mat_b - gt_roughness)

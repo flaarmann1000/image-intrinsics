@@ -22,8 +22,10 @@ def linear_to_srgb(img: np.ndarray) -> np.ndarray:
 def load_exr(path: Path) -> np.ndarray:
     """Load an EXR file as (H, W, 3) float32 linear-light RGB.
 
-    Tries imageio (requires imageio-freeimage or OpenEXR) then falls back to
-    OpenCV (cv2), which supports EXR natively on most platforms.
+    Tries imageio (requires imageio-freeimage or OpenEXR), then the OpenEXR v3 bindings
+    (`pip install OpenEXR` — the only EXR reader that ships wheels for very new CPythons,
+    where opencv-python is built without the EXR codec), then OpenCV (cv2). Raises only if
+    every reader is missing or fails.
     """
     path = Path(path)
     try:
@@ -33,13 +35,30 @@ def load_exr(path: Path) -> np.ndarray:
             img = np.stack([img] * 3, axis=-1)
         return img[:, :, :3]
     except Exception:
-        import cv2  # noqa: PLC0415
-        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
-        if img is None:
-            raise IOError(f"Could not read EXR (tried imageio and cv2): {path}")
+        pass
+    try:
+        import OpenEXR  # v3 numpy bindings; channels are grouped, e.g. {"RGB": ...}
+        ch = OpenEXR.File(str(path)).channels()
+        if "RGB" in ch:
+            img = np.asarray(ch["RGB"].pixels, np.float32)
+        elif "RGBA" in ch:
+            img = np.asarray(ch["RGBA"].pixels, np.float32)[:, :, :3]
+        elif all(k in ch for k in ("R", "G", "B")):
+            img = np.stack([np.asarray(ch[k].pixels, np.float32) for k in ("R", "G", "B")], -1)
+        else:                                            # single/unknown channel -> broadcast
+            img = np.asarray(next(iter(ch.values())).pixels, np.float32)
         if img.ndim == 2:
             img = np.stack([img] * 3, axis=-1)
-        return img[:, :, :3][:, :, ::-1].astype(np.float32)  # BGR→RGB
+        return img[:, :, :3]
+    except Exception:
+        pass
+    import cv2  # noqa: PLC0415
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
+    if img is None:
+        raise IOError(f"Could not read EXR (tried imageio, OpenEXR, cv2): {path}")
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    return img[:, :, :3][:, :, ::-1].astype(np.float32)  # BGR→RGB
 
 
 def load_scene(scene_dir: Path, no_shadow: bool = False, use_npy: bool = False,

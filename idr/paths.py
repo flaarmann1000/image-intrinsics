@@ -34,6 +34,10 @@ SYNTHETIC_DIR = RESULTS_DIR / "synthetic"
 SYNTHETIC_DATASET_DIR = SYNTHETIC_DIR / "dataset"
 SYNTHETIC_RUNS_DIR = SYNTHETIC_DIR / "runs"
 
+# SH3 decomposition study (scripts/sh3_decomposition_study.py): two optimizer setups
+# over the sh3 dataset's blender/ct ground variants, with per-run results.json.
+SH3_STUDY_DIR = RESULTS_DIR / "sh3_study"
+
 MIT_DIR = RESULTS_DIR / "mit"
 REAL_SCENE_DIR = RESULTS_DIR / "real_scene"
 IMPROVE_STUDY_DIR = RESULTS_DIR / "improve_study"
