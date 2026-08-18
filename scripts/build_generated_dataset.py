@@ -157,7 +157,9 @@ def discover_configs(domain_root):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--domains", nargs="+", default=None, help="default: all under gen_relit_sorted")
-    ap.add_argument("--configs", nargs="+", default=None, help="gen-cfg filter, e.g. cfg1 cfg5")
+    ap.add_argument("--configs", nargs="+", default=None,
+                    help="gen-cfg filter = the --postfix from comfy_relight_batch, "
+                         "e.g. cfg5 neg_shadow (default: all discovered)")
     ap.add_argument("--scenes", nargs="+", default=None, help="scene-name prefix filter")
     ap.add_argument("--out_canonical", type=Path, default=CANONICAL,
                     help="parent for <DOMAIN>_GENERATED outputs")

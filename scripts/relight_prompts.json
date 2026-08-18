@@ -1,84 +1,104 @@
 {
-  "_comment": "Lighting-variant prompts for scripts/comfy_relight_batch.py. The 'preamble' is prepended to every variant's 'prompt'. Keep the preamble strict so only illumination changes. 'name' becomes part of the output filename, so keep it filesystem-safe.",
-  "preamble": "Edit only the lighting of the input image. Preserve the exact same objects, geometry, dimensions, camera position, perspective, composition, materials, textures, colors, and background. Do not add, remove, replace, move, reshape, or restyle anything. Change only the illumination and resulting shadows.\n\n",
+  "_comment": "Lighting-variant prompts for scripts/comfy_relight_batch.py. Positive text = 'preamble' + variant 'prompt'. Negative text = 'negative_preamble' + variant 'negative' (both optional, default empty). To suppress shadows across a run, put e.g. 'shadows, cast shadows, hard shadows' in negative_preamble and pass --postfix neg_shadow. 'name' becomes part of the output filename, so keep it filesystem-safe.",
+  "preamble": "Edit only the lighting of the input image. Preserve the exact same objects, geometry, dimensions, camera position, perspective, composition, materials, textures, colors, and background. Do not add, remove, replace, move, reshape, or restyle anything. Change only the illumination.\n\n",
+  "negative_preamble": "",
   "variants": [
     {
       "name": "warm_sun_left",
-      "prompt": "Change only the lighting: warm late-afternoon sunlight entering from the left, strong directional key light, golden color temperature."
+      "prompt": "Change only the lighting: warm late-afternoon sunlight entering from the left, strong directional key light, golden color temperature.",
+      "negative": ""
     },
     {
       "name": "warm_sun_right",
-      "prompt": "Change only the lighting: warm late-afternoon sunlight entering from the right, strong directional key light, golden color temperature."
+      "prompt": "Change only the lighting: warm late-afternoon sunlight entering from the right, strong directional key light, golden color temperature.",
+      "negative": ""
     },
     {
       "name": "cool_overcast",
-      "prompt": "Change only the lighting: soft, diffuse, cool overcast daylight from above, no visible sun, low contrast, gentle shadows, neutral-to-blue color temperature."
+      "prompt": "Change only the lighting: soft, diffuse, cool overcast daylight from above, no visible sun, low contrast, gentle shadows, neutral-to-blue color temperature.",
+      "negative": ""
     },
     {
       "name": "harsh_noon",
-      "prompt": "Change only the lighting: harsh midday sun from directly overhead, bright specular highlights, neutral white daylight."
-    },    
-    {
-      "name" : "Flat ambient",
-      "prompt": "Relight with uniform, soft, shadowless ambient illumination at 5500K, as if the scene were in a large overcast diffuser. No directional light, no highlights."
+      "prompt": "Change only the lighting: harsh midday sun from directly overhead, bright specular highlights, neutral white daylight.",
+      "negative": ""
     },
     {
-      "name" : "Key NE high",
-      "prompt": "Relight with a single hard directional key light from the upper-right at approximately 45° elevation, 5500K daylight. No fill light."
+      "name": "Flat ambient",
+      "prompt": "Relight with uniform, soft, shadowless ambient illumination at 5500K, as if the scene were in a large overcast diffuser. No directional light, no highlights.",
+      "negative": ""
     },
     {
-      "name" : "Key NW high",
-      "prompt": "Relight with a single hard directional key light from the upper-left at approximately 45° elevation, 5500K daylight. No fill light."
+      "name": "Key NE high",
+      "prompt": "Relight with a single hard directional key light from the upper-right at approximately 45° elevation, 5500K daylight. No fill light.",
+      "negative": ""
     },
     {
-      "name" : "Key SE low",
-      "prompt": "Relight with a single hard directional key light from the lower-right at approximately 20° elevation, 5500K daylight. No fill light."
+      "name": "Key NW high",
+      "prompt": "Relight with a single hard directional key light from the upper-left at approximately 45° elevation, 5500K daylight. No fill light.",
+      "negative": ""
     },
     {
-      "name" : "Key SW low",
-      "prompt": "Relight with a single hard directional key light from the lower-left at approximately 20° elevation, 5500K daylight. No fill light."
+      "name": "Key SE low",
+      "prompt": "Relight with a single hard directional key light from the lower-right at approximately 20° elevation, 5500K daylight. No fill light.",
+      "negative": ""
     },
     {
-      "name" : "Top-down",
-      "prompt": "Relight with a single hard directional light from directly above, 5500K daylight."
+      "name": "Key SW low",
+      "prompt": "Relight with a single hard directional key light from the lower-left at approximately 20° elevation, 5500K daylight. No fill light.",
+      "negative": ""
     },
     {
-      "name" : "Bottom-up",
-      "prompt": "Relight with a single hard directional light from directly below, 5500K daylight."
+      "name": "Top-down",
+      "prompt": "Relight with a single hard directional light from directly above, 5500K daylight.",
+      "negative": ""
     },
     {
-      "name" : "Front (on-axis)",
-      "prompt": "Relight with a single hard light from the camera position, collocated with the viewer, 5500K."
+      "name": "Bottom-up",
+      "prompt": "Relight with a single hard directional light from directly below, 5500K daylight.",
+      "negative": ""
     },
     {
-      "name" : "Warm low-angle",
-      "prompt": "Relight with a single directional light from the right at approximately 15° elevation, warm 3200K tungsten color. No fill light."
+      "name": "Front (on-axis)",
+      "prompt": "Relight with a single hard light from the camera position, collocated with the viewer, 5500K.",
+      "negative": ""
     },
     {
-      "name" : "Cool low-angle",
-      "prompt": "Relight with a single directional light from the left at approximately 15° elevation, cool 7500K blue-sky color. No fill light."
+      "name": "Warm low-angle",
+      "prompt": "Relight with a single directional light from the right at approximately 15° elevation, warm 3200K tungsten color. No fill light.",
+      "negative": ""
     },
     {
-      "name" : "Bright ambient",
-      "prompt": "Relight with bright uniform ambient illumination at 5500K, approximately twice as bright as prompt 1, no directional component."
+      "name": "Cool low-angle",
+      "prompt": "Relight with a single directional light from the left at approximately 15° elevation, cool 7500K blue-sky color. No fill light.",
+      "negative": ""
     },
     {
-      "name" : "Combined NE+SW",
-      "prompt": "Relight with two hard directional lights simultaneously: one from the upper-right at 45° elevation (5500K) and one from the lower-left at 20° elevation (5500K). Both equal intensity."
+      "name": "Bright ambient",
+      "prompt": "Relight with bright uniform ambient illumination at 5500K, approximately twice as bright as prompt 1, no directional component.",
+      "negative": ""
+    },
+    {
+      "name": "Combined NE+SW",
+      "prompt": "Relight with two hard directional lights simultaneously: one from the upper-right at 45° elevation (5500K) and one from the lower-left at 20° elevation (5500K). Both equal intensity.",
+      "negative": ""
     }
   ],
   "outtakes": [
     {
-      "name" : "Dim ambient",
-      "prompt": "Relight with dim uniform ambient illumination at 5500K, approximately half as bright as prompt 1, no directional component."
+      "name": "Dim ambient",
+      "prompt": "Relight with dim uniform ambient illumination at 5500K, approximately half as bright as prompt 1, no directional component.",
+      "negative": ""
     },
     {
       "name": "night_lamp",
-      "prompt": "Change only the lighting: nighttime interior, a single warm artificial lamp as the only light source, dark ambient surroundings, pronounced falloff and warm pooled light near the lamp."
+      "prompt": "Change only the lighting: nighttime interior, a single warm artificial lamp as the only light source, dark ambient surroundings, pronounced falloff and warm pooled light near the lamp.",
+      "negative": ""
     },
     {
       "name": "moody_single_source",
-      "prompt": "Change only the lighting: dramatic low-key illumination from a single hard source at a steep angle, deep shadows, high contrast, cinematic chiaroscuro, neutral color temperature."
+      "prompt": "Change only the lighting: dramatic low-key illumination from a single hard source at a steep angle, deep shadows, high contrast, cinematic chiaroscuro, neutral color temperature.",
+      "negative": ""
     }
   ]
 }

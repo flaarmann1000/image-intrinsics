@@ -149,10 +149,12 @@ def main() -> None:
     # ---- prompt text ----
     cfg_prompts = json.loads(args.prompts.read_text())
     preamble = cfg_prompts.get("preamble", "")
+    negative_preamble = cfg_prompts.get("negative_preamble", "")
     variant = next((v for v in cfg_prompts["variants"] if v["name"] == args.variant), None)
     if variant is None:
         sys.exit(f"variant {args.variant!r} not in {args.prompts}")
     positive = preamble + variant["prompt"]
+    negative = negative_preamble + variant.get("negative", "")
 
     img2img = args.denoise < 1.0
     scale = args.megapixels > 0
@@ -212,7 +214,7 @@ def main() -> None:
     if scale:
         nodes[80]["widgets_values"] = ["nearest-exact", args.megapixels, 1]
     nodes[74]["widgets_values"] = [positive]      # positive prompt
-    nodes[67]["widgets_values"] = [""]            # negative
+    nodes[67]["widgets_values"] = [negative]      # negative prompt
     nodes[62]["widgets_values"] = [STEPS, w, h]   # width/height linked but listed
     nodes[61]["widgets_values"] = ["euler"]
     nodes[73]["widgets_values"] = [args.seed, "fixed"]

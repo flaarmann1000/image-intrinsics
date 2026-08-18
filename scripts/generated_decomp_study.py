@@ -4,7 +4,10 @@ scripts/generated_decomp_study.py — decompose the GENERATED relighting dataset
 (canonical/INFINITE_GENERATED/<gen_cfg>/<scene>, built by build_generated_dataset.py) and
 compare INCLUDING the source image as an extra observation vs NOT.
 
-For each (domain in {INFINITE, MIT}) x (generation config gen_cfg in {cfg1, cfg5}) x (scene) x
+gen_cfg is whatever --postfix was passed to comfy_relight_batch.py (e.g. cfg1, cfg5,
+neg_shadow); domains and gen_cfgs are both discovered dynamically, so any postfix works.
+
+For each (domain in {INFINITE, MIT, ...}) x (generation config gen_cfg) x (scene) x
 (source in {no_source, with_source}): build a temp scene whose observations are the relit images linearised to
 float (variant=exr), plus — for `with_source` — the linear source as a 17th observation; copy
 the TRUE GT maps (albedo/normals/roughness/metallic from INFINITE) as fixed geometry + eval
@@ -40,7 +43,8 @@ from canonical_decomp_batch import CONFIGS, BASE
 _CANON = REPO_ROOT / "local_datasets" / "canonical"
 # DEFAULT_CONFIG = "light_mono"
 DEFAULT_CONFIG = "metallic_l1_1e-2_tv1e-3_light_mono"
-SOURCES = ["no_source", "with_source"]
+# SOURCES = ["no_source", "with_source"]
+SOURCES = ["no_source"]
 # Per-domain default downsample, mirroring canonical_decomp_batch.py's per-dataset `ds`
 # (INFINITE=2, MIT-train=4). --downsample overrides for every domain.
 DOMAIN_DS = {"INFINITE": 2, "MIT": 4}

@@ -47,6 +47,25 @@ CFG = 5.0
 SAMPLER = "euler"
 IMAGE_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".webp"}
 
+CANONICAL = REPO / "local_datasets/canonical"
+GEN_SORTED = REPO / "local_datasets/gen_relit_sorted"
+
+
+def resolve_domain(scene: str) -> str | None:
+    """Domain (e.g. INFINITE / MIT) = the canonical GT set that contains <scene>.
+
+    Mirrors build_generated_dataset.py: canonical/<DOMAIN>/<scene> or
+    canonical/<DOMAIN>-train/<scene>. The '-train' suffix is stripped so the
+    sorted-output folder matches the existing gen_relit_sorted/<DOMAIN> naming.
+    """
+    if not CANONICAL.is_dir():
+        return None
+    for cand in sorted(CANONICAL.iterdir()):
+        if cand.is_dir() and (cand / scene).is_dir():
+            name = cand.name
+            return name[:-len("-train")] if name.endswith("-train") else name
+    return None
+
 
 def exr_to_png_bytes(path: Path) -> tuple[bytes, int, int]:
     """Load a linear-HDR EXR, tonemap to 8-bit sRGB PNG. Returns (png, w, h)."""
@@ -68,7 +87,7 @@ def image_to_png_bytes(path: Path) -> tuple[bytes, int, int]:
 
 def build_graph(image_name: str, positive: str, seed: int,
                 megapixels: float | None, filename_prefix: str,
-                cfg: float = CFG, denoise: float = 1.0) -> dict:
+                cfg: float = CFG, denoise: float = 1.0, negative: str = "") -> dict:
     """Flattened API-format Flux.2 Klein Image-Edit graph.
 
     node ids mirror the original workflow's inner node ids for traceability.
@@ -111,7 +130,7 @@ def build_graph(image_name: str, positive: str, seed: int,
         "74": {"class_type": "CLIPTextEncode",
                "inputs": {"text": positive, "clip": ["71", 0]}},
         "67": {"class_type": "CLIPTextEncode",
-               "inputs": {"text": "", "clip": ["71", 0]}},
+               "inputs": {"text": negative, "clip": ["71", 0]}},
         # reference conditioning (inlined subgraph): encode source, inject as ref latent
         "78": {"class_type": "VAEEncode",
                "inputs": {"pixels": pix, "vae": ["72", 0]}},
@@ -208,7 +227,12 @@ def main() -> None:
     ap.add_argument("--src", type=Path,
                     default=REPO / "local_datasets/generation_source")
     ap.add_argument("--out", type=Path,
-                    default=REPO / "local_datasets/generation_relit")
+                    default=REPO / "local_datasets/generation_relit",
+                    help="output root when --postfix is NOT set: <out>/<scene>/")
+    ap.add_argument("--postfix", default=None,
+                    help="name the sorted export folder. Writes to gen_relit_sorted/"
+                         "<DOMAIN>/generation_relit_<postfix>/<scene>/, with DOMAIN "
+                         "resolved per scene from canonical/ (INFINITE, MIT, ...).")
     ap.add_argument("--prompts", type=Path, default=REPO / "scripts/relight_prompts.json")
     ap.add_argument("--url", default="http://127.0.0.1:8188")
     ap.add_argument("--megapixels", type=float, default=0.0,
@@ -240,6 +264,7 @@ def main() -> None:
     base = args.url.rstrip("/")
     cfg = json.loads(args.prompts.read_text())
     preamble = cfg.get("preamble", "")
+    negative_preamble = cfg.get("negative_preamble", "")
     variants = cfg["variants"]
     if args.only:
         want = set(args.only)
@@ -268,13 +293,16 @@ def main() -> None:
         tag = ""
 
     client_id = uuid.uuid4().hex
-    args.out.mkdir(parents=True, exist_ok=True)
+    if not args.postfix:
+        args.out.mkdir(parents=True, exist_ok=True)
     total = len(srcs) * len(variants)
     mode = (f"img2img structure-lock (denoise={args.denoise}, cfg={args.cfg})"
             if args.denoise < 1.0 else f"reference-token regen (cfg={args.cfg})")
+    dest = (f"{GEN_SORTED}/<DOMAIN>/generation_relit_{args.postfix}/<scene>"
+            if args.postfix else f"{args.out}/<scene>")
     print(f"{len(srcs)} images x {len(variants)} variants = {total} generations")
     print(f"mode: {mode}")
-    print(f"server {base} | out {args.out}\n")
+    print(f"server {base} | out {dest}\n")
 
     done = 0
     for src in srcs:
@@ -288,9 +316,15 @@ def main() -> None:
         # at megapixels = w*h/1024**2; dropping the node is bit-identical and lets the
         # exported UI graph self-configure to any image that gets loaded into it.
         mp = args.megapixels if args.megapixels > 0 else None
+        if args.postfix:
+            domain = resolve_domain(stem)
+            if domain is None:
+                print(f"[--/--] {stem} -> SKIP: no domain in {CANONICAL} for this scene")
+                continue
+            out_dir = GEN_SORTED / domain / f"generation_relit_{args.postfix}" / stem
+        else:
+            out_dir = args.out / stem
         uploaded = upload_image(base, png, f"relight_src_{stem}.png")
-
-        out_dir = args.out / stem
         out_dir.mkdir(parents=True, exist_ok=True)
         for vi, v in enumerate(variants):
             done += 1
@@ -306,6 +340,7 @@ def main() -> None:
             graph = build_graph(
                 image_name=uploaded,
                 positive=preamble + v["prompt"],
+                negative=negative_preamble + v.get("negative", ""),
                 seed=int(seed),
                 megapixels=mp,
                 filename_prefix=f"relight/{stem}__{vname}{tag}",

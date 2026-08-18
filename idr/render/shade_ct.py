@@ -272,7 +272,9 @@ def _env_bilinear(env_pixels: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
     assert H * W == P, f"env_pixels ({P}) is not an equirect W=2H grid"
     x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
     u = (torch.atan2(z, x) / (2 * math.pi) + 0.5) * W - 0.5      # texel coords
-    v = (torch.acos(y.clamp(-1.0, 1.0)) / math.pi) * H - 0.5
+    # clamp INSIDE the poles (not [-1, 1]): d/dy acos(y) = -1/sqrt(1-y²) is -inf at y=±1, so a
+    # sampled direction hitting the pole backprops NaN (even through masked samples: 0 * nan = nan).
+    v = (torch.acos(y.clamp(-1.0 + 1e-6, 1.0 - 1e-6)) / math.pi) * H - 0.5
     u0 = torch.floor(u);  wu = (u - u0).unsqueeze(-1)
     v0 = torch.floor(v);  wv = (v - v0).unsqueeze(-1)
     iu0 = (u0.long() % W); iu1 = (iu0 + 1) % W                    # wrap in phi
@@ -320,8 +322,10 @@ def _spec_ggx_importance(
     xi2 = torch.frac(s * 0.6180339887498949)                 # (S,) golden ratio
 
     # GGX D sampling: cosθ_h = sqrt((1-ξ)/(1+(α²-1)ξ))
-    cos_th = ((1.0 - xi1) / (1.0 + (alpha2 - 1.0) * xi1)).clamp(min=0.0).sqrt()  # (M, S)
-    sin_th = (1.0 - cos_th ** 2).clamp(min=0.0).sqrt()
+    # clamp(min=1e-8) — NOT min=0: d/dx sqrt(x) is +inf at x=0, so a sqrt of a clamp-to-0 quantity
+    # backprops NaN at grazing angles (arg→0 as ξ→1 / cosθ_h→1); 1e-8 keeps the gradient finite.
+    cos_th = ((1.0 - xi1) / (1.0 + (alpha2 - 1.0) * xi1)).clamp(min=1e-8).sqrt()  # (M, S)
+    sin_th = (1.0 - cos_th ** 2).clamp(min=1e-8).sqrt()
     phi    = 2 * math.pi * xi2                                # (S,)
     Hvec = (sin_th * torch.cos(phi)).unsqueeze(-1) * t1.unsqueeze(1) \
          + (sin_th * torch.sin(phi)).unsqueeze(-1) * t2.unsqueeze(1) \
