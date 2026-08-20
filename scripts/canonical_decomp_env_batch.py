@@ -59,7 +59,7 @@ DATASET_IMG_BATCH = {"mit": 4}
 # (spec_importance=False, texel-grid Riemann sum) remains available as a faster, lower-fidelity
 # alternative.
 BASE_ENV = {**BASE, "shader": "ct_env", "tr_env": "softplus",
-            "spec_importance": True, "spec_samples": 64}
+            "spec_importance": True, "spec_samples": 32, "n_iter" : 100, "lbfgs_max_iter" : 20 }
 CONFIGS = {
     # "base":              {},                                   # GGX importance-sampled specular, softplus env
     # "grid":              dict(spec_importance=False),          # texel-grid Riemann sum (faster; aliases <0.3)
@@ -82,8 +82,14 @@ def _resolve_img_batch(ds_name, args):
 
 def build_cfg(config, spec, args):
     common = dict(double=False, diffuse_fresnel=True, gt_npy=True, use_npy=spec["use_npy"],
-                  downsample=(args.downsample or spec["ds"]), log_every=100)
-    return {**common, **BASE_ENV, **CONFIGS[config]}
+                  downsample=(args.downsample or spec["ds"]), log_every=10)
+    cfg = {**common, **BASE_ENV, **CONFIGS[config]}
+    # optional budget overrides (do NOT touch n_images/ds -> stays comparable with the SH runs)
+    for k in ("n_iter", "lbfgs_max_iter", "log_every", "spec_samples"):
+        v = getattr(args, k, None)
+        if v is not None:
+            cfg[k] = v
+    return cfg
 
 
 # ── one (scene, config) ───────────────────────────────────────────────────────
@@ -164,6 +170,13 @@ def build_parser():
                    help="gradient-accumulation chunk = images held on the graph at once "
                         "(result-identical; lowers peak GPU mem). None = per-dataset default "
                         "(%s); 0 = off." % DATASET_IMG_BATCH)
+    p.add_argument("--n_iter", type=int, default=None,
+                   help="outer LBFGS steps (default 500). Env converges early; lower it to cut runtime.")
+    p.add_argument("--lbfgs_max_iter", type=int, default=None,
+                   help="inner LBFGS iters per step (default 40). Biggest per-step-time lever; try 20.")
+    p.add_argument("--spec_samples", type=int, default=None,
+                   help="GGX importance samples (default 64). 32 ~halves the specular cost (env-only).")
+    p.add_argument("--log_every", type=int, default=None, help="log interval (default 25).")
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--force", action="store_true")
