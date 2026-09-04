@@ -21,7 +21,8 @@ from idr.optim.transforms import (
     _softplus_inv, _parse_transforms, _fwd_albedo, _fwd_metallic, _fwd_roughness,
     _fwd_shininess, _fwd_ks, _fwd_env, _init_albedo, _init_scalar, _init_map, _init_env,
 )
-from idr.optim.losses import _tv, _loss_fn, _sqrt_res, _tv_residuals
+from idr.optim.losses import (_tv, _loss_fn, _sqrt_res, _tv_residuals,
+                             build_seg_groups, segment_cohesion)
 # Imported as a MODULE, not by name: profile_decomposition.py swaps
 # idr.optim.steps._opt_step / ._make_optimizer at runtime to time each phase. A
 # `from ... import _opt_step` would bind the original at import time and silently
@@ -63,6 +64,7 @@ def _optimize_ct_sh(
     val_sh_coeffs: Optional[list] = None,
     init_maps:    Optional[dict] = None,
     light_prior:  Optional[np.ndarray] = None,
+    seg_labels_hw: Optional[np.ndarray] = None,
     wandb_step_offset: int = 0,
     wandb_phase:  Optional[int] = None,
 ) -> tuple:
@@ -103,6 +105,9 @@ def _optimize_ct_sh(
     fp_m      = frag_pos_hw.reshape(-1, 3)[flat_mask]
     view_m    = _norm(cam_pos.unsqueeze(0) - fp_m)
     lut       = _get_ggx_sh_lut(dev, n_bands=_sh_ord + 1).to(ftype)
+    _want_seg = bool(cfg.get("lambda_seg_metallic", 0.0) or cfg.get("lambda_seg_roughness", 0.0))
+    _seg_groups = (build_seg_groups(seg_labels_hw, flat_mask)
+                   if (seg_labels_hw is not None and _want_seg) else None)
     mask_t    = mask_hw.unsqueeze(-1).to(dev)
 
     learnable    = []
@@ -399,13 +404,24 @@ def _optimize_ct_sh(
         # sizes. Regularizer lambdas are absolute (not divided by N).
         loss_data = err.mean() * (n_sel / N_imgs)
 
-        loss_sparse = frac * cfg["lambda_sparse"] * _tv(albedo.permute(2, 0, 1))
-        loss_white  = frac * cfg["lambda_white"]  * (albedo.mean() - 0.5) ** 2
-        loss_tv     = frac * cfg["lambda_tv"] * (
-            _tv(albedo.permute(2, 0, 1)) +
-            _tv(metallic.permute(2, 0, 1)) +
-            _tv(roughness.permute(2, 0, 1))
-        )
+        # Per-channel TV. lambda_tv_{albedo,metallic,roughness} replace the old combined
+        # lambda_tv + lambda_sparse; each falls back to those legacy keys so old configs
+        # reproduce exactly. albedo TV lands in the loss_sparse slot (unchanged tuple).
+        _ltv = cfg.get("lambda_tv", 0.0)
+        _lta = cfg.get("lambda_tv_albedo")
+        _lta = _lta if _lta is not None else (cfg.get("lambda_sparse", 0.0) or _ltv)
+        _ltm = cfg.get("lambda_tv_metallic");   _ltm = _ltm if _ltm is not None else _ltv
+        _ltr = cfg.get("lambda_tv_roughness");  _ltr = _ltr if _ltr is not None else _ltv
+        loss_sparse = frac * _lta * _tv(albedo.permute(2, 0, 1))
+        loss_white  = frac * cfg["lambda_white"] * (albedo.mean() - 0.5) ** 2
+        loss_tv     = frac * (_ltm * _tv(metallic.permute(2, 0, 1))
+                              + _ltr * _tv(roughness.permute(2, 0, 1)))
+        # Segmentation cohesion: pull each classified pixel toward its SAM segment mean.
+        _lsm = cfg.get("lambda_seg_metallic", 0.0)
+        _lsr = cfg.get("lambda_seg_roughness", 0.0)
+        if _seg_groups is not None and (_lsm or _lsr):
+            loss_tv = loss_tv + frac * (_lsm * segment_cohesion(met_m_true, _seg_groups)
+                                        + _lsr * segment_cohesion(rou_m_true, _seg_groups))
         loss_metallic_l1       = frac * cfg.get("lambda_metallic_l1",       0.0) * met_m_true.abs().mean()
         loss_metallic_binarize = frac * cfg.get("lambda_metallic_binarize",  0.0) * (met_m_true * (1.0 - met_m_true)).mean()
         # Soft box constraint: squared hinge penalty for material values outside [0, 1].

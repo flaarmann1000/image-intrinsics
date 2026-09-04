@@ -19,7 +19,7 @@ from PIL import Image
 
 from idr.render import EnvMap, SHLighting, build_sh_basis, shade_ct_sh, shade_ct_env
 from idr.render.brdf import _get_ggx_sh_lut
-from idr.data.scene_io import load_scene
+from idr.data.scene_io import load_scene, linear_to_srgb
 from idr.data.geometry import make_proxy_geometry, _subsample_mask
 from idr.data.build import render_scene, render_3dfront_dataset
 from idr.optim.models.ct_sh import _optimize_ct_sh   # curriculum warm-start only
@@ -125,6 +125,25 @@ def make_run_name(
     )
 
 
+def _load_seg_labels(scene_dir, hw):
+    """segmentation.png (RGB, one colour per SAM mask, black=unlabeled) -> (H,W) int32
+    label map: contiguous class ids >= 0, or -1 where unlabeled. None if absent."""
+    p = Path(scene_dir) / "segmentation.png"
+    if not p.exists():
+        return None
+    rgb = np.asarray(Image.open(p).convert("RGB"))
+    if rgb.shape[:2] != tuple(hw):
+        rgb = np.asarray(Image.fromarray(rgb).resize((hw[1], hw[0]), Image.NEAREST))
+    flat = rgb.reshape(-1, 3).astype(np.int64)
+    codes = (flat[:, 0] << 16) | (flat[:, 1] << 8) | flat[:, 2]
+    labels = np.full(codes.shape, -1, np.int32)
+    fg = codes != 0                                   # black (0,0,0) -> unlabeled
+    if fg.any():
+        _, inv = np.unique(codes[fg], return_inverse=True)
+        labels[fg] = inv.astype(np.int32)
+    return labels.reshape(rgb.shape[:2])
+
+
 def decompose_scene(
     scene_dir: Path,
     out_dir: Path,
@@ -208,6 +227,11 @@ def decompose_scene(
         print(f"  [downsample] x{_ds} -> {scene['H']}x{scene['W']}")
 
     H, W = scene["H"], scene["W"]
+    # SAM segmentation labels for the cohesion prior (segmentation.png: one colour per
+    # mask, black = unlabeled). Loaded at GT res, strided to match the (downsampled) grid.
+    _seg_labels_hw = _load_seg_labels(scene_dir, _full_mask_np.shape[:2])
+    if _seg_labels_hw is not None and _ds > 1:
+        _seg_labels_hw = np.ascontiguousarray(_seg_labels_hw[::_ds, ::_ds])
     images     = scene["images"]
     light_keys = scene["light_keys"]
     mask_np    = scene["mask_np"]
@@ -388,6 +412,7 @@ def decompose_scene(
         gt_sh_coeffs=gt_sh_coeffs,
         gt_albedo=gt_albedo,
         opt_params=_eff_op_env if shader == "ct_env" else _eff_op_sh,
+        **({"seg_labels_hw": _seg_labels_hw} if shader in ("ct_sh", "ct_env") else {}),
         init_from_gt=init_from_gt,
         log_gradients=log_gradients,
         grad_log_dir=grad_log_dir,
@@ -553,7 +578,8 @@ def decompose_scene(
     np.save(out_dir / "roughness_err.npy", (mat_b_err * mask_np[:, :, None]).astype(np.float32))
 
     for k, (s, e, lk) in enumerate(zip(shadings, recon_err, light_keys)):
-        Image.fromarray((s.clip(0, 1) * 255).astype(np.uint8)).save(
+        # recon is LINEAR radiance; sRGB-encode the PNG preview (the .npy stays linear).
+        Image.fromarray((linear_to_srgb(s.clip(0, 1)) * 255).astype(np.uint8)).save(
             recon_dir / f"recon_{lk}.png")
         np.save(recon_dir / f"recon_{lk}.npy", s.astype(np.float32))
         Image.fromarray((e.mean(-1) * 255).clip(0, 255).astype(np.uint8)).save(

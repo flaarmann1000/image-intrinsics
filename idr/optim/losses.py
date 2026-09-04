@@ -47,3 +47,40 @@ def _tv_residuals(x, scale):
     rh = _sqrt_res(scale * (dh**2 + 1e-8).sqrt() / dh.numel())
     rw = _sqrt_res(scale * (dw**2 + 1e-8).sqrt() / dw.numel())
     return torch.cat([rh.reshape(-1), rw.reshape(-1)])
+
+
+# ── segmentation cohesion prior (SAM masks) ───────────────────────────────────
+def build_seg_groups(seg_labels_hw, flat_mask):
+    """Group the FOREGROUND pixels by SAM segment for the cohesion prior.
+
+    seg_labels_hw : (H, W) int array — class id >= 0, or -1 for unlabeled (black in
+                    segmentation.png). flat_mask : (H*W,) bool tensor (foreground).
+    Returns (seg_ids_m, classified_m, n_seg, counts) with labels remapped to contiguous
+    0..n_seg-1 over the classified foreground pixels, or None if nothing is classified.
+    """
+    dev = flat_mask.device
+    lab = torch.as_tensor(seg_labels_hw, dtype=torch.long, device=dev).reshape(-1)[flat_mask]  # (M,)
+    classified = lab >= 0
+    if not bool(classified.any()):
+        return None
+    uniq = torch.unique(lab[classified])
+    remap = torch.full((int(uniq.max().item()) + 1,), -1, dtype=torch.long, device=dev)
+    remap[uniq] = torch.arange(uniq.numel(), device=dev)
+    seg_ids = torch.zeros_like(lab)
+    seg_ids[classified] = remap[lab[classified]]
+    n_seg = int(uniq.numel())
+    counts = torch.bincount(seg_ids[classified], minlength=n_seg).clamp(min=1)
+    return seg_ids, classified, n_seg, counts
+
+
+def segment_cohesion(vals_m, groups):
+    """Mean squared deviation of each classified pixel from its OWN segment's current
+    mean (a soft "one value per object" pull). vals_m: (M,) or (M,1); groups from
+    build_seg_groups. Recomputed from live estimates every call, so pixels may disagree
+    with their object mean if the data demands it. Scaled as a mean (like `_tv`)."""
+    seg_ids, classified, n_seg, counts = groups
+    v = vals_m.reshape(-1)[classified]
+    ids = seg_ids[classified]
+    sums = torch.zeros(n_seg, dtype=v.dtype, device=v.device).scatter_add(0, ids, v)
+    means = sums / counts.to(v.dtype)
+    return ((v - means[ids]) ** 2).mean()

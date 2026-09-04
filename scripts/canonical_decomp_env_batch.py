@@ -66,6 +66,9 @@ CONFIGS = {
     # "samples128":        dict(spec_samples=128),               # finer importance sampling
     # "sigmoid":           dict(tr_metallic="sigmoid", tr_roughness="sigmoid"),   # bounded materials
     "metallic_l1_1e-2_tv1e-3": dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3),
+    "seg":               dict(lambda_seg_metallic=1e-2, lambda_seg_roughness=1e-2),
+    "seg_tv":            dict(lambda_seg_metallic=1e-2, lambda_seg_roughness=1e-2,
+                             lambda_tv_metallic=1e-3, lambda_tv_roughness=1e-3),
     # "metallic_l1_1e-2_tv1e-3_sigmoid": dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3,
                                             # tr_metallic="sigmoid", tr_roughness="sigmoid"),
 }

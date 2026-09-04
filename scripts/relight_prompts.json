@@ -1,7 +1,7 @@
 {
   "_comment": "Lighting-variant prompts for scripts/comfy_relight_batch.py. Positive text = 'preamble' + variant 'prompt'. Negative text = 'negative_preamble' + variant 'negative' (both optional, default empty). To suppress shadows across a run, put e.g. 'shadows, cast shadows, hard shadows' in negative_preamble and pass --postfix neg_shadow. 'name' becomes part of the output filename, so keep it filesystem-safe.",
   "preamble": "Edit only the lighting of the input image. Preserve the exact same objects, geometry, dimensions, camera position, perspective, composition, materials, textures, colors, and background. Do not add, remove, replace, move, reshape, or restyle anything. Change only the illumination.\n\n",
-  "negative_preamble": "",
+  "negative_preamble": "shadow, light",
   "variants": [
     {
       "name": "warm_sun_left",

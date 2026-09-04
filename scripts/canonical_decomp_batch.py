@@ -69,7 +69,8 @@ DATASETS = {
 }
 # Default set to run (point_no_shadow is available but opt-in via --datasets).
 # DEFAULT_DATASETS = ["ct_sh_env", "point", "point_no_shadow", "infinite", "mit"]
-DEFAULT_DATASETS = ["infinite"]
+DEFAULT_DATASETS = ["ct_sh_env", "point", "infinite", "mit"]
+# DEFAULT_DATASETS = ["infinite"]
 
 # ── configs (BASE + one-change ablations) ─────────────────────────────────────
 BASE = dict(shader="ct_sh", optimizer="LBFGS", n_iter=500, lbfgs_max_iter=40, sh_order=3,
@@ -77,23 +78,58 @@ BASE = dict(shader="ct_sh", optimizer="LBFGS", n_iter=500, lbfgs_max_iter=40, sh
 VARPRO_POLISH = dict(optimizer="VARPRO", n_iter=200, varpro_space="natural",
                      varpro_lam_init=1e-4, varpro_lam_ceiling=1e10, varpro_n_inner_rho=0)
 CONFIGS = {
-    "base":              {},
-    "sigmoid":           dict(tr_albedo="sigmoid", tr_metallic="sigmoid", tr_roughness="sigmoid"),
-    "sh2":               dict(sh_order=2),
-    "light_mono":        dict(lambda_light_mono=1e-3),
+    "noreg":             {},   # no regularization (BASE only) — the "without reg" baseline
+    # "base":              {},
+    # "sigmoid":           dict(tr_albedo="sigmoid", tr_metallic="sigmoid", tr_roughness="sigmoid"),
+    # "sh2":               dict(sh_order=2),
+    # "light_mono":        dict(lambda_light_mono=1e-3),
     #"varpro":            "VARPRO",                         # special: warm-start from base
-    "tv1e-5":            dict(lambda_tv=1e-5),
-    "tv1e-4":            dict(lambda_tv=1e-4),
-    "metallic_binarize": dict(lambda_metallic_binarize=1e-4),
-    "metallic_l1_1e-3":  dict(lambda_metallic_l1=1e-3),
-    "metallic_l1_1e-2":  dict(lambda_metallic_l1=1e-2),
-    "metallic_l1_1e-2_tv1e-3":         dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3),
-    "metallic_l1_1e-2_tv1e-3_light_mono":         dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3, lambda_light_mono=1e-3),
-    "metallic_l1_1e-2_tv1e-3_light_mono_sh2":         dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3, lambda_light_mono=1e-3, sh_order=2),
-    "metallic_l1_1e-2_tv1e-3_sigmoid": dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3,
-                                            tr_albedo="sigmoid", tr_metallic="sigmoid",
-                                            tr_roughness="sigmoid"),
-    "sparse":            dict(lambda_sparse=1e-4),
+    # "tv1e-5":            dict(lambda_tv=1e-5),
+    # "tv1e-4":            dict(lambda_tv=1e-4),
+    # "metallic_binarize": dict(lambda_metallic_binarize=1e-4),
+    # "metallic_l1_1e-3":  dict(lambda_metallic_l1=1e-3),
+    # "metallic_l1_1e-2":  dict(lambda_metallic_l1=1e-2),
+    # "metallic_l1_1e-2_tv1e-3":         dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3),
+    # "metallic_l1_1e-2_tv1e-3_light_mono":         dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3, lambda_light_mono=1e-3),
+    # "metallic_l1_1e-2_tv1e-3_light_mono_sh2":         dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3, lambda_light_mono=1e-3, sh_order=2),
+    # "metallic_l1_1e-2_tv1e-3_sigmoid": dict(lambda_metallic_l1=1e-2, lambda_tv=1e-3,
+                                            # tr_albedo="sigmoid", tr_metallic="sigmoid",
+                                            # tr_roughness="sigmoid"),
+    # "sparse":            dict(lambda_sparse=1e-4),
+    # SAM-segment cohesion (segmentation.png) on metallic+roughness; TV split per material
+    # (lambda_tv_metallic/roughness; albedo TV via lambda_tv_albedo). black = unlabeled = TV-only.
+    # "seg":               dict(lambda_seg_metallic=1e-2, lambda_seg_roughness=1e-2),
+    # "seg_tv":            dict(lambda_seg_metallic=1e-2, lambda_seg_roughness=1e-2,
+                            #  lambda_tv_metallic=1e-3, lambda_tv_roughness=1e-3),
+    # "metallic_l1_1e-2_seg_tv": dict(lambda_metallic_l1=1e-2, lambda_seg_metallic=1e-2,
+                            #  lambda_seg_roughness=1e-2, lambda_tv_metallic=1e-3, lambda_tv_roughness=1e-3),
+    "metallic_l1_seg_tv_all_light_mono": dict(
+                            lambda_metallic_l1=1e-2, 
+                            lambda_seg_metallic=1e-1, lambda_seg_roughness=1e-1, 
+                            lambda_tv_metallic=1e-2, lambda_tv_roughness=1e-2, lambda_tv_albedo=1e-2,
+                            lambda_light_mono=1e-2),
+    # "metallic_l1_tv_all_light_mono": dict(
+    #                         lambda_metallic_l1=1e-2,                             
+    #                         lambda_tv_metallic=1e-2, lambda_tv_roughness=1e-2, lambda_tv_albedo=1e-2,
+    #                         lambda_light_mono=1e-2),
+    # "metallic_l1_seg_tv_albedo_light_mono": dict(
+    #                         lambda_metallic_l1=1e-2, 
+    #                         lambda_seg_metallic=1e-1, lambda_seg_roughness=1e-1, 
+    #                         lambda_tv_albedo=1e-2,
+    #                         lambda_light_mono=1e-2),
+    # "metallic_l1_seg_tv_metallic_roughness_light_mono": dict(
+    #                         lambda_metallic_l1=1e-2, 
+    #                         lambda_seg_metallic=1e-1, lambda_seg_roughness=1e-1, 
+    #                         lambda_tv_metallic=1e-2, lambda_tv_roughness=1e-2,
+    #                         lambda_light_mono=1e-2),
+    # "seg_tv_all_light_mono": dict(                            
+    #                         lambda_seg_metallic=1e-1, lambda_seg_roughness=1e-1, 
+    #                         lambda_tv_metallic=1e-2, lambda_tv_roughness=1e-2, lambda_tv_albedo=1e-2,
+    #                         lambda_light_mono=1e-2),
+    # "metallic_l1_seg_tv_all": dict(
+    #                         lambda_metallic_l1=1e-2, 
+    #                         lambda_seg_metallic=1e-1, lambda_seg_roughness=1e-1, 
+    #                         lambda_tv_metallic=1e-2, lambda_tv_roughness=1e-2, lambda_tv_albedo=1e-2),
 }
 
 _WANDB_PROJECT, _WANDB_ENTITY = "canonical-decomp", "DLVC-intrinsics"

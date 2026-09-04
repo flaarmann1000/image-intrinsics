@@ -78,6 +78,14 @@ DEFAULT_CFG = dict(
     lambda_sparse  = 0.0,
     lambda_white   = 0.0,
     lambda_tv      = 0.0,
+    # per-channel TV weights (replace lambda_tv+lambda_sparse); None -> fall back to
+    # lambda_sparse/lambda_tv so legacy configs reproduce exactly.
+    lambda_tv_albedo    = None,
+    lambda_tv_metallic  = None,
+    lambda_tv_roughness = None,
+    # SAM-segment cohesion: pull each classified pixel toward its class mean (metallic/roughness)
+    lambda_seg_metallic  = 0.0,
+    lambda_seg_roughness = 0.0,
     sbatch         = 64,
     log_every      = 20,
     loss           = "L2",
